@@ -1,0 +1,133 @@
+{
+  "gravity": 3.4335,
+  "physics_engine": "pymunk",
+  "materials": [
+    {
+      "id": "wood",
+      "density": 0.7,
+      "weight": 1.0,
+      "fragility": 0.45,
+      "toughness": 1.2,
+      "damping": 0.35
+    },
+    {
+      "id": "concrete",
+      "density": 2.4,
+      "weight": 1.35,
+      "fragility": 0.15,
+      "toughness": 3.5,
+      "damping": 0.55
+    },
+    {
+      "id": "dirt",
+      "density": 1.2,
+      "weight": 1.1,
+      "fragility": 0.65,
+      "toughness": 0.7,
+      "damping": 0.4
+    },
+    {
+      "id": "bush_leaves",
+      "density": 0.15,
+      "weight": 0.35,
+      "fragility": 0.95,
+      "toughness": 0.15,
+      "damping": 0.1
+    },
+    {
+      "id": "bush_branch",
+      "density": 0.55,
+      "weight": 0.8,
+      "fragility": 0.55,
+      "toughness": 0.85,
+      "damping": 0.3
+    },
+    {
+      "id": "sheet_metal",
+      "density": 7.8,
+      "weight": 0.55,
+      "fragility": 0.35,
+      "toughness": 2.1,
+      "damping": 0.28
+    },
+    {
+      "id": "girder",
+      "density": 7.85,
+      "weight": 1.4,
+      "fragility": 0.12,
+      "toughness": 4.2,
+      "damping": 0.5
+    },
+    {
+      "id": "water",
+      "density": 1.0,
+      "weight": 1.0,
+      "fragility": 1.0,
+      "toughness": 0.05,
+      "damping": 0.05
+    }
+  ],
+  "projectiles": [
+    {
+      "id": "slug",
+      "mass": 0.06,
+      "speed": 3.2,
+      "radius": 0.0025,
+      "base_damage": 10.0,
+      "penetration": 0.4,
+      "gravity_scale": 1.0,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "kinetic",
+      "tags": [
+        "default",
+        "ballistic"
+      ]
+    },
+    {
+      "id": "spike",
+      "mass": 0.04,
+      "speed": 4.5,
+      "radius": 0.0018,
+      "base_damage": 8.0,
+      "penetration": 0.65,
+      "gravity_scale": 0.85,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "kinetic",
+      "tags": [
+        "ap"
+      ]
+    },
+    {
+      "id": "shredder",
+      "mass": 0.05,
+      "speed": 2.8,
+      "radius": 0.003,
+      "base_damage": 7.0,
+      "penetration": 0.25,
+      "gravity_scale": 1.0,
+      "splash_radius": 0.006,
+      "splash_falloff": 1.4,
+      "effect": "shred",
+      "tags": [
+        "anti_foliage"
+      ]
+    },
+    {
+      "id": "impact_charge",
+      "mass": 0.12,
+      "speed": 2.0,
+      "radius": 0.004,
+      "base_damage": 18.0,
+      "penetration": 0.15,
+      "gravity_scale": 1.15,
+      "splash_radius": 0.012,
+      "splash_falloff": 1.1,
+      "effect": "explosive",
+      "tags": [
+        "aoe"
+      ]
+    }
+  ]
+}

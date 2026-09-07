@@ -17,6 +17,9 @@
 #include <string>
 #include <vector>
 
+#include "destruction.hpp"
+#include "materials.hpp"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -24,9 +27,27 @@
 static constexpr int WIDTH = 1280;
 static constexpr int HEIGHT = 720;
 static constexpr int MAX_FRAMES = 2;
-static constexpr int WORLD_W = 48;
-static constexpr int WORLD_H = 24;
-static constexpr int WORLD_D = 48;
+// Internal 3D render scale (downscale for fill-rate). Presented upscaled with bitcrush look in shader.
+static constexpr float RENDER_SCALE = 0.5f;
+static constexpr float DEFAULT_FOV_DEG = 101.5f; // 70 * 1.45 fisheye default
+static constexpr int INTERNAL_W = 640;  // WIDTH * 0.5
+static constexpr int INTERNAL_H = 360;  // HEIGHT * 0.5
+
+// Unit voxel grid: 1000x smaller than original 1.0 blocks. Every solid is 1x1x1 voxels
+// (no stretched planes). Impact / destruction use integer grid indices only.
+static constexpr float VOXEL_SIZE = 0.001f;    // == materials.hpp kVoxelSize
+static constexpr int CHUNK_SIZE = 32;         // voxels per chunk axis
+static constexpr int CHUNKS_X = 6;            // warehouse + river bank
+static constexpr int CHUNKS_Y = 2;            // height for walls/roof girders
+static constexpr int CHUNKS_Z = 5;            // extended depth for river slice
+static constexpr int WORLD_W = CHUNKS_X * CHUNK_SIZE; // 160
+static constexpr int WORLD_H = CHUNKS_Y * CHUNK_SIZE; // 64
+static constexpr int WORLD_D = CHUNKS_Z * CHUNK_SIZE; // 128
+static constexpr int VOXELS_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
+
+// Warehouse layout in unit voxels (grid space)
+static constexpr int DIRT_MARGIN = 10;        // dirt apron around building
+static constexpr int SLAB_THICK = 2;          // concrete floor thickness (voxels)
 
 struct Vec3 {
     float x = 0, y = 0, z = 0;
@@ -95,15 +116,27 @@ struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
     float cr, cg, cb;
+    float mat; // 0 solid, 1 water (shader tide)
 };
 
 struct FrameUBO {
     float viewProj[16];
-    float lightDir[3];
-    float _pad0;
+    float sunDir[3];
+    float timeOfDay;       // 0..1  (night default ~0.88)
     float camPos[3];
     float time;
+    float moonDir[3];
+    float moonIntensity;
+    float moonColor[3];
+    float ambientScale;
+    float bulbPos[4][4];   // xyz, intensity
+    float bulbColor[4][4]; // rgb, radius
 };
+
+// Time system
+static float g_timeOfDay = 0.88f; // night
+static float g_timeScale = 0.0f;  // frozen night unless changed
+static bool g_isNight = true;
 
 struct QueueFamilyIndices {
     int graphics = -1;
@@ -122,10 +155,36 @@ static int g_height = HEIGHT;
 static bool g_keys[256]{};
 static bool g_mouseDown = false;
 static int g_mouseX = 0, g_mouseY = 0, g_lastMouseX = 0, g_lastMouseY = 0;
-static float g_yaw = 0.6f;
-static float g_pitch = 0.45f;
-static float g_dist = 42.0f;
-static Vec3 g_target(WORLD_W * 0.5f, 6.0f, WORLD_D * 0.5f);
+// Free-float first-person POV camera (radians)
+static float g_yaw = 0.0f;          // 0 = looking toward -Z
+static float g_pitch = -0.28f; // slightly down with higher fisheye POV
+static float g_moveSpeed = 0.06f;   // world units/sec at 0.001 voxel scale
+static float g_lookSens = 0.0035f;
+// Spawn on dirt apron, looking into warehouse bay.
+static Vec3 g_camPos(
+    WORLD_W * VOXEL_SIZE * 0.5f,
+    0.0261f,  // default eye height ~45% higher
+    WORLD_D * VOXEL_SIZE + 0.025f);
+
+// Projectile destruction state (g_chunks assigned after Chunk type exists)
+struct Chunk;
+static std::vector<Chunk>* g_chunks = nullptr;
+static std::vector<ProjectileDef> g_projDefs;
+static std::vector<ProjectileRuntime> g_projectiles;
+static int g_activeProjIndex = 0; // cycles slug/spike/shredder/charge
+static bool g_meshDirty = false;
+static bool g_firePressed = false;
+
+// Player character as unit-voxel body on the cubic grid (impact/current sampling).
+static int g_playerGX = 0, g_playerGY = 0, g_playerGZ = 0;
+static float g_playerBaseWeight = 1.0f;
+static float g_playerWeight = 1.0f;
+static float g_currentForce = 0.0f;
+static Vec3 g_currentDir = {1.0f, 0.0f, 0.0f}; // river flows +X
+static bool g_currentTriggered = false;
+static bool g_fullySubmerged = false;
+static int g_touchingWaterUnits = 0;
+static int g_characterUnitCount = 0;
 
 static VkInstance g_instance = VK_NULL_HANDLE;
 static VkSurfaceKHR g_surface = VK_NULL_HANDLE;
@@ -161,6 +220,30 @@ static VkSemaphore g_imageAvailable[MAX_FRAMES]{};
 static VkSemaphore g_renderFinished[MAX_FRAMES]{};
 static VkFence g_inFlight[MAX_FRAMES]{};
 static size_t g_frame = 0;
+static Mat4 g_viewProjCull{};
+static uint32_t g_drawnChunks = 0;
+static uint32_t g_culledChunks = 0;
+static constexpr double TARGET_HZ = 120.0;
+static constexpr double TARGET_FRAME_SEC = 1.0 / TARGET_HZ;
+static LARGE_INTEGER g_qpcFreq{};
+static LARGE_INTEGER g_qpcLast{};
+static bool g_qpcInit = false;
+// Sky tile system: pixel-grid hemisphere + moon light-source sprite
+static VkBuffer g_skyTileVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_skyTileMem = VK_NULL_HANDLE;
+static void* g_skyTileMapped = nullptr;
+static uint32_t g_skyTileVertexCount = 0;
+static Vec3 g_moonWorldPos = {0, 0, 0};
+static Vec3 g_moonDirWorld = {0.32f, 0.82f, -0.48f}; // fixed sky bearing (light source)
+static float g_moonTileSize = 0.034f;
+static float g_skyRadius = 0.55f;
+static constexpr int SKY_SEG_U = 28; // azimuth tiles
+static constexpr int SKY_SEG_V = 14; // elevation tiles (hemisphere)
+static double g_frameMsSum = 0.0;
+static double g_frameMsMin = 1e9;
+static double g_frameMsMax = 0.0;
+static int g_frameMsCount = 0;
+static int g_framePaceHits = 0;
 
 static std::string g_exeDir;
 
@@ -235,180 +318,351 @@ static void endOneTime(VkCommandBuffer cmd) {
     vkFreeCommandBuffers(g_device, g_cmdPool, 1, &cmd);
 }
 
-// ---- voxel mesh ----
+// ---- fine voxel + chunk system (sharp face vertices) ----
 enum class Block : uint8_t {
     Air = 0,
-    Grass,
     Dirt,
-    Stone,
-    Water,
-    Sand,
+    Concrete,
+    SheetMetal,
+    Girder,
     Wood,
-    Leaves,
-    Body,
-    Shirt,
-    Pants,
-    Skin,
-    Hair,
-    Accent
+    WoodDark,
+    Water,        // still unit cubes; may occupy WATER_CELL multi-cell clumps
+    WaterCurrent, // moving water source (same visual, current sampling)
+    Moon,         // cool emissive crescent grid
+    LightBulb     // warm emissive indoor bulbs
+};
+
+// Water is painted as slightly larger *logical* cells (2x2x2 unit cubes) for volume/tide.
+static constexpr int WATER_CELL = 2;
+
+static MaterialId blockMaterial(Block b) {
+    switch (b) {
+    case Block::Dirt: return MaterialId::Dirt;
+    case Block::Concrete: return MaterialId::Concrete;
+    case Block::SheetMetal: return MaterialId::SheetMetal;
+    case Block::Girder: return MaterialId::Girder;
+    case Block::Wood: return MaterialId::Wood;
+    case Block::WoodDark: return MaterialId::BushBranch;
+    case Block::Water:
+    case Block::WaterCurrent: return MaterialId::Water;
+    case Block::Moon:
+    case Block::LightBulb: return MaterialId::Air; // emissive, no impact mass
+    default: return MaterialId::Air;
+    }
+}
+
+static bool isWaterBlock(Block b) {
+    return b == Block::Water || b == Block::WaterCurrent;
+}
+
+struct Chunk {
+    int cx = 0, cy = 0, cz = 0; // chunk coords
+    std::vector<Block> voxels;  // CHUNK_SIZE^3
+    std::vector<Vertex> mesh;   // sharp unique face verts
+    bool dirty = true;
+    uint32_t firstVertex = 0;
+    uint32_t vertexCount = 0;
+    bool wasVisible = true;
 };
 
 static Vec3 blockColor(Block b) {
     switch (b) {
-    case Block::Grass:  return {0.30f, 0.72f, 0.28f};
-    case Block::Dirt:   return {0.45f, 0.30f, 0.16f};
-    case Block::Stone:  return {0.55f, 0.55f, 0.58f};
-    case Block::Water:  return {0.20f, 0.45f, 0.85f};
-    case Block::Sand:   return {0.86f, 0.78f, 0.52f};
-    case Block::Wood:   return {0.42f, 0.26f, 0.12f};
-    case Block::Leaves: return {0.18f, 0.55f, 0.22f};
-    case Block::Body:   return {0.25f, 0.45f, 0.85f};
-    case Block::Shirt:  return {0.85f, 0.25f, 0.22f};
-    case Block::Pants:  return {0.18f, 0.22f, 0.40f};
-    case Block::Skin:   return {0.92f, 0.74f, 0.58f};
-    case Block::Hair:   return {0.12f, 0.08f, 0.05f};
-    case Block::Accent: return {0.95f, 0.80f, 0.15f};
-    default:            return {1, 0, 1};
+    case Block::Dirt:         return {0.28f, 0.20f, 0.12f};
+    case Block::Concrete:     return {0.40f, 0.40f, 0.42f};
+    case Block::SheetMetal:   return {0.48f, 0.50f, 0.52f};
+    case Block::Girder:       return {0.28f, 0.10f, 0.08f};
+    case Block::Wood:         return {0.34f, 0.22f, 0.12f};
+    case Block::WoodDark:     return {0.32f, 0.18f, 0.08f};
+    case Block::Water:        return {0.12f, 0.28f, 0.42f};
+    case Block::WaterCurrent: return {0.10f, 0.35f, 0.48f};
+    case Block::Moon:         return {0.75f, 0.80f, 0.90f};
+    case Block::LightBulb:    return {1.00f, 0.75f, 0.45f};
+    default:                  return {1, 0, 1};
     }
 }
 
-static inline int idx(int x, int y, int z) {
-    return (y * WORLD_D + z) * WORLD_W + x;
+static inline int chunkIndex(int cx, int cy, int cz) {
+    return (cy * CHUNKS_Z + cz) * CHUNKS_X + cx;
 }
 
-static bool inBounds(int x, int y, int z) {
+static inline int localIndex(int lx, int ly, int lz) {
+    return (ly * CHUNK_SIZE + lz) * CHUNK_SIZE + lx;
+}
+
+static bool worldInBounds(int x, int y, int z) {
     return x >= 0 && y >= 0 && z >= 0 && x < WORLD_W && y < WORLD_H && z < WORLD_D;
 }
 
 static float hashNoise(int x, int z) {
-    uint32_t n = static_cast<uint32_t>(x * 374761393 + z * 668265263);
+    uint32_t n = static_cast<uint32_t>(x * 374761393u + z * 668265263u);
     n = (n ^ (n >> 13)) * 1274126177u;
     n ^= n >> 16;
-    return (n & 0xFFFF) / 65535.0f;
+    return (n & 0xFFFFu) / 65535.0f;
 }
 
-static void setBlock(std::vector<Block>& w, int x, int y, int z, Block b) {
-    if (inBounds(x, y, z)) w[idx(x, y, z)] = b;
+static float valueNoise(int x, int z) {
+    // cheap multi-octave for micro-terrain
+    float n = 0.0f;
+    n += hashNoise(x, z) * 1.0f;
+    n += hashNoise(x / 2, z / 2) * 2.0f;
+    n += hashNoise(x / 4, z / 4) * 4.0f;
+    n += hashNoise(x / 8, z / 8) * 6.0f;
+    return n / 13.0f;
 }
 
-static Block getBlock(const std::vector<Block>& w, int x, int y, int z) {
-    if (!inBounds(x, y, z)) return Block::Air;
-    return w[idx(x, y, z)];
+static Block getWorldBlock(const std::vector<Chunk>& chunks, int x, int y, int z) {
+    if (!worldInBounds(x, y, z)) return Block::Air;
+    int cx = x / CHUNK_SIZE;
+    int cy = y / CHUNK_SIZE;
+    int cz = z / CHUNK_SIZE;
+    int lx = x - cx * CHUNK_SIZE;
+    int ly = y - cy * CHUNK_SIZE;
+    int lz = z - cz * CHUNK_SIZE;
+    return chunks[chunkIndex(cx, cy, cz)].voxels[localIndex(lx, ly, lz)];
 }
 
-static void placeTree(std::vector<Block>& w, int x, int z) {
-    int base = 0;
+static void setWorldBlock(std::vector<Chunk>& chunks, int x, int y, int z, Block b) {
+    if (!worldInBounds(x, y, z)) return;
+    int cx = x / CHUNK_SIZE;
+    int cy = y / CHUNK_SIZE;
+    int cz = z / CHUNK_SIZE;
+    int lx = x - cx * CHUNK_SIZE;
+    int ly = y - cy * CHUNK_SIZE;
+    int lz = z - cz * CHUNK_SIZE;
+    chunks[chunkIndex(cx, cy, cz)].voxels[localIndex(lx, ly, lz)] = b;
+    chunks[chunkIndex(cx, cy, cz)].dirty = true;
+}
+
+static int groundHeight(const std::vector<Chunk>& chunks, int x, int z) {
     for (int y = WORLD_H - 1; y >= 0; --y) {
-        Block b = getBlock(w, x, y, z);
-        if (b == Block::Grass || b == Block::Dirt || b == Block::Sand) {
-            base = y + 1;
-            break;
-        }
+        Block b = getWorldBlock(chunks, x, y, z);
+        if (b != Block::Air) return y;
     }
-    if (base <= 0 || base + 6 >= WORLD_H) return;
-    int h = 4 + static_cast<int>(hashNoise(x + 3, z + 7) * 3.0f);
-    for (int i = 0; i < h; ++i) setBlock(w, x, base + i, z, Block::Wood);
-    int top = base + h;
-    for (int dy = -2; dy <= 2; ++dy) {
+    return 0;
+}
+
+// Fill a solid axis-aligned box with unit voxels (inclusive).
+static void fillBox(std::vector<Chunk>& chunks, int x0, int y0, int z0,
+                    int x1, int y1, int z1, Block b) {
+    if (x0 > x1) std::swap(x0, x1);
+    if (y0 > y1) std::swap(y0, y1);
+    if (z0 > z1) std::swap(z0, z1);
+    for (int z = z0; z <= z1; ++z)
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x)
+                setWorldBlock(chunks, x, y, z, b);
+}
+
+// Vertical I-beam girder (unit voxels only): flanges + web.
+static void placeGirderColumn(std::vector<Chunk>& chunks, int cx, int zc,
+                              int y0, int y1) {
+    for (int y = y0; y <= y1; ++y) {
+        // web
+        setWorldBlock(chunks, cx, y, zc, Block::Girder);
+        setWorldBlock(chunks, cx, y, zc + 1, Block::Girder);
+        // flanges
         for (int dx = -2; dx <= 2; ++dx) {
-            for (int dz = -2; dz <= 2; ++dz) {
-                if (std::abs(dx) + std::abs(dy) + std::abs(dz) > 4) continue;
-                if (dx == 0 && dz == 0 && dy <= 0) continue;
-                setBlock(w, x + dx, top + dy, z + dz, Block::Leaves);
-            }
+            setWorldBlock(chunks, cx + dx, y, zc - 1, Block::Girder);
+            setWorldBlock(chunks, cx + dx, y, zc + 2, Block::Girder);
         }
     }
 }
 
-static void placeCharacter(std::vector<Block>& w, int ox, int oz) {
-    // Find ground
-    int gy = 1;
-    for (int y = WORLD_H - 1; y >= 0; --y) {
-        Block b = getBlock(w, ox, y, oz);
-        if (b != Block::Air && b != Block::Water && b != Block::Leaves) {
-            gy = y + 1;
-            break;
+// Horizontal I-beam along X at fixed y,z.
+static void placeGirderBeamX(std::vector<Chunk>& chunks, int x0, int x1, int y, int zc) {
+    for (int x = x0; x <= x1; ++x) {
+        setWorldBlock(chunks, x, y, zc, Block::Girder);
+        setWorldBlock(chunks, x, y, zc + 1, Block::Girder);
+        for (int dy = -2; dy <= 2; ++dy) {
+            setWorldBlock(chunks, x, y + dy, zc - 1, Block::Girder);
+            setWorldBlock(chunks, x, y + dy, zc + 2, Block::Girder);
+        }
+    }
+}
+
+// Horizontal I-beam along Z.
+static void placeGirderBeamZ(std::vector<Chunk>& chunks, int z0, int z1, int y, int xc) {
+    for (int z = z0; z <= z1; ++z) {
+        setWorldBlock(chunks, xc, y, z, Block::Girder);
+        setWorldBlock(chunks, xc + 1, y, z, Block::Girder);
+        for (int dy = -2; dy <= 2; ++dy) {
+            setWorldBlock(chunks, xc - 1, y + dy, z, Block::Girder);
+            setWorldBlock(chunks, xc + 2, y + dy, z, Block::Girder);
+        }
+    }
+}
+
+// Sheet-metal wall panel: 1-voxel-thick unit cubes (corrugation via alternate offset).
+static void placeSheetWallX(std::vector<Chunk>& chunks, int x, int y0, int y1, int z0, int z1) {
+    for (int z = z0; z <= z1; ++z) {
+        for (int y = y0; y <= y1; ++y) {
+            int xo = x + ((z + y) & 1); // slight corrugation still unit voxels
+            setWorldBlock(chunks, xo, y, z, Block::SheetMetal);
+        }
+    }
+}
+
+static void placeSheetWallZ(std::vector<Chunk>& chunks, int z, int y0, int y1, int x0, int x1) {
+    for (int x = x0; x <= x1; ++x) {
+        for (int y = y0; y <= y1; ++y) {
+            int zo = z + ((x + y) & 1);
+            setWorldBlock(chunks, x, y, zo, Block::SheetMetal);
+        }
+    }
+}
+
+// Wooden crate made of unit voxels.
+static void placeCrate(std::vector<Chunk>& chunks, int x0, int y0, int z0, int s) {
+    fillBox(chunks, x0, y0, z0, x0 + s - 1, y0 + s - 1, z0 + s - 1, Block::Wood);
+    // darker edge frame
+    for (int i = 0; i < s; ++i) {
+        setWorldBlock(chunks, x0 + i, y0, z0, Block::WoodDark);
+        setWorldBlock(chunks, x0 + i, y0, z0 + s - 1, Block::WoodDark);
+        setWorldBlock(chunks, x0, y0, z0 + i, Block::WoodDark);
+        setWorldBlock(chunks, x0 + s - 1, y0, z0 + i, Block::WoodDark);
+        setWorldBlock(chunks, x0 + i, y0 + s - 1, z0, Block::WoodDark);
+        setWorldBlock(chunks, x0 + i, y0 + s - 1, z0 + s - 1, Block::WoodDark);
+    }
+}
+
+// Simple warehouse map: dirt apron, concrete slab, sheet-metal walls,
+// red-oxide girder frame — every element is unit voxels on the impact grid.
+static std::vector<Chunk> buildWarehouseMap() {
+    std::vector<Chunk> chunks(CHUNKS_X * CHUNKS_Y * CHUNKS_Z);
+    for (int cy = 0; cy < CHUNKS_Y; ++cy)
+        for (int cz = 0; cz < CHUNKS_Z; ++cz)
+            for (int cx = 0; cx < CHUNKS_X; ++cx) {
+                Chunk& c = chunks[chunkIndex(cx, cy, cz)];
+                c.cx = cx; c.cy = cy; c.cz = cz;
+                c.voxels.assign(VOXELS_PER_CHUNK, Block::Air);
+                c.dirty = true;
+            }
+
+    // 1) Dirt apron (single unit layer under map - keeps occupancy grid, fewer faces)
+    fillBox(chunks, 0, 0, 0, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
+
+    const int bx0 = DIRT_MARGIN;
+    const int bz0 = DIRT_MARGIN;
+    const int bx1 = WORLD_W - 1 - DIRT_MARGIN;
+    const int bz1 = WORLD_D - 1 - DIRT_MARGIN;
+    const int wallH = 40;          // wall height in unit voxels
+    const int roofY = 1 + wallH;   // underside of roof beams
+
+    // 2) Concrete slab (multi-voxel thick — not a stretched plane).
+    fillBox(chunks, bx0, 1, bz0, bx1, 1 + SLAB_THICK - 1, bz1, Block::Concrete);
+
+    // Outer dirt remains as apron (already filled); clear building footprint dirt top under slab already overwritten.
+
+    // 3) Girder columns at corners and mid-span (I-beam unit voxels).
+    const int colsX[] = { bx0 + 2, (bx0 + bx1) / 2, bx1 - 3 };
+    const int colsZ[] = { bz0 + 2, (bz0 + bz1) / 2, bz1 - 3 };
+    for (int ix = 0; ix < 3; ++ix)
+        for (int iz = 0; iz < 3; ++iz)
+            placeGirderColumn(chunks, colsX[ix], colsZ[iz], 1 + SLAB_THICK, roofY);
+
+    // 4) Roof girder grid (unit I-beams).
+    for (int iz = 0; iz < 3; ++iz)
+        placeGirderBeamX(chunks, bx0 + 2, bx1 - 2, roofY, colsZ[iz]);
+    for (int ix = 0; ix < 3; ++ix)
+        placeGirderBeamZ(chunks, bz0 + 2, bz1 - 2, roofY, colsX[ix]);
+
+    // 5) Sheet-metal walls — 1-voxel-thick unit panels (open bay on +Z front).
+    placeSheetWallX(chunks, bx0, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // -X wall
+    placeSheetWallX(chunks, bx1, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // +X wall
+    placeSheetWallZ(chunks, bz0, 1 + SLAB_THICK, roofY - 1, bx0, bx1);           // -Z back wall
+    // Front (+Z): partial side wings, open center doorway
+    placeSheetWallZ(chunks, bz1, 1 + SLAB_THICK, roofY - 1, bx0, bx0 + 35);
+    placeSheetWallZ(chunks, bz1, 1 + SLAB_THICK, roofY - 1, bx1 - 35, bx1);
+    // Door lintel strip of sheet metal
+    placeSheetWallZ(chunks, bz1, roofY - 8, roofY - 1, bx0 + 36, bx1 - 36);
+
+    // 6) Roof sheet deck: unit metal cubes on top of beams (not a single quad).
+    for (int z = bz0; z <= bz1; ++z)
+        for (int x = bx0; x <= bx1; ++x) {
+            // skip every other for light vents still unit cubes
+            if (((x + z) & 3) == 0) continue;
+            setWorldBlock(chunks, x, roofY + 3, z, Block::SheetMetal);
+        }
+
+    // 7) A few unit-voxel crates inside for material variety / targets.
+    placeCrate(chunks, bx0 + 20, 1 + SLAB_THICK, bz0 + 24, 8);
+    placeCrate(chunks, bx0 + 40, 1 + SLAB_THICK, bz0 + 30, 10);
+    placeCrate(chunks, bx1 - 30, 1 + SLAB_THICK, bz0 + 20, 8);
+
+    // 7b) Warm light bulbs inside (unit voxels hanging near roof girders).
+    {
+        const int by = roofY - 2;
+        auto bulb = [&](int x, int z) {
+            setWorldBlock(chunks, x, by, z, Block::LightBulb);
+            setWorldBlock(chunks, x, by - 1, z, Block::LightBulb);
+            // small cage
+            setWorldBlock(chunks, x + 1, by, z, Block::Girder);
+            setWorldBlock(chunks, x - 1, by, z, Block::Girder);
+        };
+        bulb((bx0 + bx1) / 2, (bz0 + bz1) / 2);
+        bulb(bx0 + 28, bz0 + 28);
+        bulb(bx1 - 28, bz0 + 32);
+        bulb((bx0 + bx1) / 2, bz1 - 18);
+    }
+
+    // 7c) Moon light-source sky tile anchor (sprite drawn as billboard; light via UBO moonDir).
+    {
+        const int mx = WORLD_W / 2 + 24;
+        const int mz = 6;
+        const int my = WORLD_H - 6;
+        g_moonWorldPos = Vec3((mx + 0.5f) * VOXEL_SIZE, (my + 0.5f) * VOXEL_SIZE, (mz + 0.5f) * VOXEL_SIZE);
+        // Single unit voxel anchor (optional debug marker); main visual is sky tile sprite.
+        setWorldBlock(chunks, mx, my, mz, Block::Moon);
+    }
+
+    // 8) River slice beyond +Z apron: WATER_CELL (2x2) unit cubes, deep channel with current.
+    // Dirt bank extends; carve channel and fill water/current.
+    {
+        const int riverZ0 = bz1 + 2;
+        const int riverZ1 = WORLD_D - 3;
+        const int riverX0 = 8;
+        const int riverX1 = WORLD_W - 9;
+        // Ensure dirt banks around river
+        fillBox(chunks, 0, 0, riverZ0 - 2, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
+        // Deep channel center (unit voxels stacked)
+        const int surfaceY = 4;
+        const int deepY0 = 0;
+        const int deepY1 = surfaceY; // depth includes surface
+        for (int z = riverZ0; z <= riverZ1; ++z) {
+            for (int x = riverX0; x <= riverX1; ++x) {
+                // banks stay dirt; channel interior
+                bool channel = (x > riverX0 + 4 && x < riverX1 - 4);
+                if (!channel) continue;
+                // deeper mid-stream trench
+                int localDeep = surfaceY;
+                int mid = (riverX0 + riverX1) / 2;
+                int dist = std::abs(x - mid);
+                if (dist < 6) localDeep = surfaceY + 5;      // deepest
+                else if (dist < 12) localDeep = surfaceY + 2;
+                for (int y = 0; y <= localDeep && y < WORLD_H; ++y) {
+                    // place as WATER_CELL clumps: still unit cubes on grid
+                    Block wb = (dist < 10 && y <= localDeep) ? Block::WaterCurrent : Block::Water;
+                    setWorldBlock(chunks, x, y, z, wb);
+                    // thicken visually with adjacent unit cells (larger water voxels)
+                    // WATER_CELL clumps only on even layers to cut fill-rate
+                    if ((y & 1) == 0 && (x % WATER_CELL) == 0 && (z % WATER_CELL) == 0) {
+                        for (int dz = 0; dz < WATER_CELL; ++dz)
+                            for (int dx = 0; dx < WATER_CELL; ++dx)
+                                if (dx || dz) setWorldBlock(chunks, x + dx, y, z + dz, wb);
+                    }
+                }
+            }
         }
     }
 
-    auto put = [&](int x, int y, int z, Block b) { setBlock(w, ox + x, gy + y, oz + z, b); };
-
-    // Legs
-    put(0, 0, 0, Block::Pants); put(0, 1, 0, Block::Pants);
-    put(2, 0, 0, Block::Pants); put(2, 1, 0, Block::Pants);
-    // Torso
-    for (int y = 2; y <= 4; ++y)
-        for (int x = 0; x <= 2; ++x)
-            put(x, y, 0, Block::Shirt);
-    put(1, 3, 0, Block::Accent); // belt buckle-ish
-    // Arms
-    put(-1, 3, 0, Block::Skin); put(-1, 4, 0, Block::Shirt);
-    put(3, 3, 0, Block::Skin);  put(3, 4, 0, Block::Shirt);
-    // Head
-    for (int y = 5; y <= 6; ++y)
-        for (int x = 0; x <= 2; ++x)
-            for (int z = -1; z <= 0; ++z)
-                put(x, y, z, Block::Skin);
-    // Hair
-    for (int x = 0; x <= 2; ++x)
-        for (int z = -1; z <= 0; ++z)
-            put(x, 7, z, Block::Hair);
-    put(0, 6, -1, Block::Hair);
-    put(2, 6, -1, Block::Hair);
-    // Eyes
-    put(0, 6, -1, Block::Stone);
-    put(2, 6, -1, Block::Stone);
+    return chunks;
 }
 
-static std::vector<Block> buildWorld() {
-    std::vector<Block> w(WORLD_W * WORLD_H * WORLD_D, Block::Air);
-
-    for (int z = 0; z < WORLD_D; ++z) {
-        for (int x = 0; x < WORLD_W; ++x) {
-            float n1 = hashNoise(x, z);
-            float n2 = hashNoise(x * 3, z * 2);
-            float n3 = hashNoise(x + 50, z + 20);
-            int h = 3 + static_cast<int>(n1 * 4.0f + n2 * 3.0f + n3 * 2.0f);
-
-            // Gentle basin for a pond near center
-            float cx = x - WORLD_W * 0.5f;
-            float cz = z - WORLD_D * 0.35f;
-            float pond = std::sqrt(cx * cx + cz * cz);
-            bool inPond = pond < 7.5f;
-
-            if (inPond) h = 2;
-
-            for (int y = 0; y <= h; ++y) {
-                Block b = Block::Stone;
-                if (y == h) b = inPond ? Block::Sand : (h < 5 ? Block::Sand : Block::Grass);
-                else if (y >= h - 2) b = Block::Dirt;
-                else b = Block::Stone;
-                setBlock(w, x, y, z, b);
-            }
-            if (inPond) {
-                for (int y = h + 1; y <= 3; ++y) setBlock(w, x, y, z, Block::Water);
-            }
-        }
-    }
-
-    // Scatter trees
-    for (int i = 0; i < 28; ++i) {
-        int x = 4 + static_cast<int>(hashNoise(i * 17, 9) * (WORLD_W - 8));
-        int z = 4 + static_cast<int>(hashNoise(i * 31, 13) * (WORLD_D - 8));
-        float cx = x - WORLD_W * 0.5f;
-        float cz = z - WORLD_D * 0.35f;
-        if (std::sqrt(cx * cx + cz * cz) < 9.0f) continue;
-        placeTree(w, x, z);
-    }
-
-    // Voxel character near center-front
-    placeCharacter(w, WORLD_W / 2 - 1, WORLD_D / 2 + 4);
-    return w;
-}
-
-static void emitFace(std::vector<Vertex>& out, float x, float y, float z,
-                     int face, const Vec3& color) {
-    // face: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
+// Sharp vertex face emit: 6 unique verts/face (2 tris), hard face normals, no sharing.
+static void emitSharpFace(std::vector<Vertex>& out, int ix, int iy, int iz,
+                          int face, const Vec3& color, float mat = 0.0f) {
+    // unit cube corners in voxel space, scaled to world by VOXEL_SIZE
     static const float F[6][4][3] = {
         {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
         {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
@@ -420,56 +674,268 @@ static void emitFace(std::vector<Vertex>& out, float x, float y, float z,
     static const float N[6][3] = {
         {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
     };
+    // CCW when viewed from outside, matching Vulkan front-face CCW + Y-flip proj
     static const int IDX[6] = {0, 1, 2, 0, 2, 3};
+    static const float faceShade[6] = {0.82f, 0.68f, 1.0f, 0.52f, 0.90f, 0.74f};
 
-    // Slight per-face shading baked into color for readability even without lights
-    float faceShade[6] = {0.85f, 0.70f, 1.0f, 0.55f, 0.90f, 0.75f};
+    const float ox = ix * VOXEL_SIZE;
+    const float oy = iy * VOXEL_SIZE;
+    const float oz = iz * VOXEL_SIZE;
     Vec3 c = color * faceShade[face];
 
     for (int i = 0; i < 6; ++i) {
         const float* p = F[face][IDX[i]];
         out.push_back(Vertex{
-            x + p[0], y + p[1], z + p[2],
+            ox + p[0] * VOXEL_SIZE,
+            oy + p[1] * VOXEL_SIZE,
+            oz + p[2] * VOXEL_SIZE,
             N[face][0], N[face][1], N[face][2],
-            c.x, c.y, c.z
+            c.x, c.y, c.z,
+            mat
         });
     }
 }
 
-static std::vector<Vertex> meshWorld(const std::vector<Block>& w) {
-    std::vector<Vertex> verts;
-    verts.reserve(200000);
+static void meshChunk(Chunk& chunk, const std::vector<Chunk>& chunks) {
+    chunk.mesh.clear();
+    chunk.mesh.reserve(4096);
     const int ox[6] = {1,-1,0,0,0,0};
     const int oy[6] = {0,0,1,-1,0,0};
     const int oz[6] = {0,0,0,0,1,-1};
 
-    for (int y = 0; y < WORLD_H; ++y) {
-        for (int z = 0; z < WORLD_D; ++z) {
-            for (int x = 0; x < WORLD_W; ++x) {
-                Block b = getBlock(w, x, y, z);
+    const int baseX = chunk.cx * CHUNK_SIZE;
+    const int baseY = chunk.cy * CHUNK_SIZE;
+    const int baseZ = chunk.cz * CHUNK_SIZE;
+
+    for (int ly = 0; ly < CHUNK_SIZE; ++ly) {
+        for (int lz = 0; lz < CHUNK_SIZE; ++lz) {
+            for (int lx = 0; lx < CHUNK_SIZE; ++lx) {
+                Block b = chunk.voxels[localIndex(lx, ly, lz)];
                 if (b == Block::Air) continue;
+                int x = baseX + lx, y = baseY + ly, z = baseZ + lz;
                 Vec3 col = blockColor(b);
-                // Water slightly darker/translucent look via color only
-                if (b == Block::Water) col = col * 0.85f;
+
                 for (int f = 0; f < 6; ++f) {
-                    Block nb = getBlock(w, x + ox[f], y + oy[f], z + oz[f]);
-                    bool occluded = nb != Block::Air &&
-                                    !(b != Block::Water && nb == Block::Water) &&
-                                    !(b == Block::Water && nb != Block::Air && nb != Block::Water);
-                    // Show face if neighbor is air, or solid next to water, or water surface
-                    if (nb == Block::Air || (b != Block::Water && nb == Block::Water)) {
-                        emitFace(verts, static_cast<float>(x), static_cast<float>(y),
-                                 static_cast<float>(z), f, col);
-                    } else if (!occluded && b == Block::Water && nb == Block::Air) {
-                        emitFace(verts, static_cast<float>(x), static_cast<float>(y),
-                                 static_cast<float>(z), f, col);
+                    Block nb = getWorldBlock(chunks, x + ox[f], y + oy[f], z + oz[f]);
+                    // Unit-cube face exposed only against empty grid cells.
+                    bool expose = false;
+                    if (isWaterBlock(b)) {
+                        expose = (nb == Block::Air) || (!isWaterBlock(nb) && nb != Block::Air);
+                        // show water surface against air only for clearer tide paint
+                        expose = (nb == Block::Air);
+                    } else {
+                        expose = (nb == Block::Air) || isWaterBlock(nb);
                     }
+                    if (!expose) continue;
+                    float mat = 0.0f;
+                    if (isWaterBlock(b)) mat = 1.0f;
+                    else if (b == Block::LightBulb) mat = 2.0f;
+                    else if (b == Block::Moon) mat = 3.0f;
+                    emitSharpFace(chunk.mesh, x, y, z, f, col, mat);
                 }
             }
         }
     }
+    chunk.dirty = false;
+}
+
+static std::vector<Vertex> meshAllChunks(std::vector<Chunk>& chunks) {
+    std::vector<Vertex> verts;
+    verts.reserve(400000);
+    uint32_t cursor = 0;
+    for (auto& c : chunks) {
+        if (c.dirty) meshChunk(c, chunks);
+        c.firstVertex = cursor;
+        c.vertexCount = static_cast<uint32_t>(c.mesh.size());
+        if (!c.mesh.empty())
+            verts.insert(verts.end(), c.mesh.begin(), c.mesh.end());
+        cursor += c.vertexCount;
+    }
     return verts;
 }
+
+struct Frustum { float p[6][4]; };
+
+static void normalizePlane(float pl[4]) {
+    float l = std::sqrt(pl[0]*pl[0] + pl[1]*pl[1] + pl[2]*pl[2]);
+    if (l > 1e-8f) { pl[0]/=l; pl[1]/=l; pl[2]/=l; pl[3]/=l; }
+}
+
+static Frustum frustumFromVP(const Mat4& vp) {
+    const float* m = vp.m;
+    Frustum f{};
+    float raw[6][4] = {
+        { m[3]+m[0], m[7]+m[4], m[11]+m[8],  m[15]+m[12] },
+        { m[3]-m[0], m[7]-m[4], m[11]-m[8],  m[15]-m[12] },
+        { m[3]+m[1], m[7]+m[5], m[11]+m[9],  m[15]+m[13] },
+        { m[3]-m[1], m[7]-m[5], m[11]-m[9],  m[15]-m[13] },
+        { m[3]+m[2], m[7]+m[6], m[11]+m[10], m[15]+m[14] },
+        { m[3]-m[2], m[7]-m[6], m[11]-m[10], m[15]-m[14] },
+    };
+    for (int i = 0; i < 6; ++i) {
+        for (int k = 0; k < 4; ++k) f.p[i][k] = raw[i][k];
+        normalizePlane(f.p[i]);
+    }
+    return f;
+}
+
+static bool aabbVisible(const Frustum& f, float minx, float miny, float minz,
+                        float maxx, float maxy, float maxz) {
+    for (int i = 0; i < 6; ++i) {
+        const float* pl = f.p[i];
+        float px = pl[0] > 0 ? maxx : minx;
+        float py = pl[1] > 0 ? maxy : miny;
+        float pz = pl[2] > 0 ? maxz : minz;
+        if (pl[0]*px + pl[1]*py + pl[2]*pz + pl[3] < 0.0f) return false;
+    }
+    return true;
+}
+
+static void chunkWorldAABB(const Chunk& c, float& minx, float& miny, float& minz,
+                           float& maxx, float& maxy, float& maxz) {
+    minx = c.cx * CHUNK_SIZE * VOXEL_SIZE;
+    miny = c.cy * CHUNK_SIZE * VOXEL_SIZE;
+    minz = c.cz * CHUNK_SIZE * VOXEL_SIZE;
+    maxx = minx + CHUNK_SIZE * VOXEL_SIZE;
+    maxy = miny + CHUNK_SIZE * VOXEL_SIZE;
+    maxz = minz + CHUNK_SIZE * VOXEL_SIZE;
+    const float pad = VOXEL_SIZE * 2.0f;
+    minx -= pad; miny -= pad; minz -= pad;
+    maxx += pad; maxy += pad; maxz += pad;
+}
+
+// true => not seen (skip draw)
+static bool chunkNotSeen(const Chunk& c, const Frustum& fr, const Vec3& eye, const Vec3& forward) {
+    if (c.vertexCount == 0) return true;
+    float minx,miny,minz,maxx,maxy,maxz;
+    chunkWorldAABB(c, minx,miny,minz,maxx,maxy,maxz);
+    if (!aabbVisible(fr, minx,miny,minz, maxx,maxy,maxz)) return true;
+    float cx = 0.5f*(minx+maxx), cy = 0.5f*(miny+maxy), cz = 0.5f*(minz+maxz);
+    Vec3 to = Vec3(cx,cy,cz) - eye;
+    float ext = 0.5f * std::sqrt((maxx-minx)*(maxx-minx)+(maxy-miny)*(maxy-miny)+(maxz-minz)*(maxz-minz));
+    if (to.dot(forward) < -ext) return true;
+    return false;
+}
+
+static void paceFrame120() {
+    if (!g_qpcInit) {
+        QueryPerformanceFrequency(&g_qpcFreq);
+        QueryPerformanceCounter(&g_qpcLast);
+        g_qpcInit = true;
+        return;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed = double(now.QuadPart - g_qpcLast.QuadPart) / double(g_qpcFreq.QuadPart);
+    double frameMs = elapsed * 1000.0;
+    if (g_frameMsCount >= 15) {
+        g_frameMsSum += frameMs;
+        if (frameMs < g_frameMsMin) g_frameMsMin = frameMs;
+        if (frameMs > g_frameMsMax) g_frameMsMax = frameMs;
+        if (frameMs <= (TARGET_FRAME_SEC * 1000.0) + 0.85) ++g_framePaceHits;
+    }
+    ++g_frameMsCount;
+    if (elapsed < TARGET_FRAME_SEC) {
+        for (;;) {
+            QueryPerformanceCounter(&now);
+            elapsed = double(now.QuadPart - g_qpcLast.QuadPart) / double(g_qpcFreq.QuadPart);
+            if (elapsed >= TARGET_FRAME_SEC) break;
+            double remain = TARGET_FRAME_SEC - elapsed;
+            if (remain > 0.002) {
+                DWORD ms = (DWORD)((remain - 0.0007) * 1000.0);
+                if (ms > 0) Sleep(ms);
+            }
+        }
+    }
+    QueryPerformanceCounter(&g_qpcLast);
+}
+
+static void ensureSkyTileBuffer() {
+    if (g_skyTileVB) return;
+    // hemisphere tiles + moon sprite quad
+    const uint32_t skyQuads = SKY_SEG_U * SKY_SEG_V;
+    g_skyTileVertexCount = skyQuads * 6u + 6u;
+    VkDeviceSize size = sizeof(Vertex) * g_skyTileVertexCount;
+    createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_skyTileVB, g_skyTileMem);
+    vkMapMemory(g_device, g_skyTileMem, 0, size, 0, &g_skyTileMapped);
+}
+
+static Vec3 skyDir(float u, float v) {
+    // u,v in [0,1]: azimuth full circle, elevation horizon->zenith (+ a little below)
+    const float az = u * static_cast<float>(M_PI) * 2.0f;
+    const float el = (0.08f + v * 0.92f) * static_cast<float>(M_PI) * 0.5f; // ~0..90deg+)
+    const float ce = std::cos(el);
+    return Vec3(std::cos(az) * ce, std::sin(el), std::sin(az) * ce).normalized();
+}
+
+static void updateMoonSkyTile() {
+    ensureSkyTileBuffer();
+    Vertex* verts = reinterpret_cast<Vertex*>(g_skyTileMapped);
+    Vec3 eye = g_camPos;
+    g_moonDirWorld = g_moonDirWorld.normalized();
+    g_moonWorldPos = eye + g_moonDirWorld * (g_skyRadius * 0.92f);
+
+    auto putSky = [&](Vertex& dst, const Vec3& p, float u, float v, float tileU, float tileV) {
+        Vec3 n = (eye - p).normalized(); // inward
+        dst.px = p.x; dst.py = p.y; dst.pz = p.z;
+        dst.nx = n.x; dst.ny = n.y; dst.nz = n.z;
+        // cr/cg = local tile UV for pixel grid; cb packs sky elevation 0..1
+        dst.cr = tileU; dst.cg = tileV; dst.cb = v;
+        dst.mat = 4.0f; // sky tile
+    };
+
+    uint32_t wi = 0;
+    for (int sv = 0; sv < SKY_SEG_V; ++sv) {
+        float v0 = static_cast<float>(sv) / static_cast<float>(SKY_SEG_V);
+        float v1 = static_cast<float>(sv + 1) / static_cast<float>(SKY_SEG_V);
+        for (int su = 0; su < SKY_SEG_U; ++su) {
+            float u0 = static_cast<float>(su) / static_cast<float>(SKY_SEG_U);
+            float u1 = static_cast<float>(su + 1) / static_cast<float>(SKY_SEG_U);
+            Vec3 p00 = eye + skyDir(u0, v0) * g_skyRadius;
+            Vec3 p10 = eye + skyDir(u1, v0) * g_skyRadius;
+            Vec3 p11 = eye + skyDir(u1, v1) * g_skyRadius;
+            Vec3 p01 = eye + skyDir(u0, v1) * g_skyRadius;
+            // CCW from inside camera
+            putSky(verts[wi++], p00, u0, v0, 0.0f, 0.0f);
+            putSky(verts[wi++], p10, u1, v0, 1.0f, 0.0f);
+            putSky(verts[wi++], p11, u1, v1, 1.0f, 1.0f);
+            putSky(verts[wi++], p00, u0, v0, 0.0f, 0.0f);
+            putSky(verts[wi++], p11, u1, v1, 1.0f, 1.0f);
+            putSky(verts[wi++], p01, u0, v1, 0.0f, 1.0f);
+        }
+    }
+
+    // Moon light-source sprite (mat=3), camera-facing at moon bearing
+    Vec3 to = g_moonDirWorld;
+    Vec3 worldUp(0, 1, 0);
+    Vec3 right = to.cross(worldUp);
+    if (right.length() < 1e-5f) right = Vec3(1, 0, 0);
+    right = right.normalized();
+    Vec3 up = right.cross(to).normalized();
+    float size = g_moonTileSize;
+    Vec3 c = g_moonWorldPos;
+    Vec3 m0 = c + (right * -1.0f + up * -1.0f) * size;
+    Vec3 m1 = c + (right *  1.0f + up * -1.0f) * size;
+    Vec3 m2 = c + (right *  1.0f + up *  1.0f) * size;
+    Vec3 m3 = c + (right * -1.0f + up *  1.0f) * size;
+    Vec3 mn = (eye - c).normalized();
+    auto putMoon = [&](Vertex& dst, const Vec3& p, float u, float v) {
+        dst.px = p.x; dst.py = p.y; dst.pz = p.z;
+        dst.nx = mn.x; dst.ny = mn.y; dst.nz = mn.z;
+        dst.cr = u; dst.cg = v; dst.cb = 1.0f;
+        dst.mat = 3.0f;
+    };
+    putMoon(verts[wi++], m0, 0, 0);
+    putMoon(verts[wi++], m1, 1, 0);
+    putMoon(verts[wi++], m2, 1, 1);
+    putMoon(verts[wi++], m0, 0, 0);
+    putMoon(verts[wi++], m2, 1, 1);
+    putMoon(verts[wi++], m3, 0, 1);
+    g_skyTileVertexCount = wi;
+}
+
 
 // ---- Win32 ----
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -483,8 +949,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
-            g_width = std::max(1, LOWORD(lParam));
-            g_height = std::max(1, HIWORD(lParam));
+            g_width = std::max(1, static_cast<int>(LOWORD(lParam)));
+            g_height = std::max(1, static_cast<int>(HIWORD(lParam)));
             g_resized = true;
         }
         return 0;
@@ -494,19 +960,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_running = false;
             PostQuitMessage(0);
         }
+        if (wParam == 'F') g_firePressed = true;
+        if (wParam == '1') g_activeProjIndex = 0;
+        if (wParam == '2') g_activeProjIndex = 1;
+        if (wParam == '3') g_activeProjIndex = 2;
+        if (wParam == '4') g_activeProjIndex = 3;
+        if (wParam == 'R' && !g_projDefs.empty())
+            g_activeProjIndex = (g_activeProjIndex + 1) % static_cast<int>(g_projDefs.size());
         return 0;
     case WM_KEYUP:
         if (wParam < 256) g_keys[wParam] = false;
         return 0;
     case WM_LBUTTONDOWN:
         g_mouseDown = true;
-        g_lastMouseX = LOWORD(lParam);
-        g_lastMouseY = HIWORD(lParam);
+        g_lastMouseX = static_cast<short>(LOWORD(lParam));
+        g_lastMouseY = static_cast<short>(HIWORD(lParam));
         SetCapture(hwnd);
         return 0;
     case WM_LBUTTONUP:
         g_mouseDown = false;
         ReleaseCapture();
+        return 0;
+    case WM_RBUTTONDOWN:
+        g_firePressed = true;
         return 0;
     case WM_MOUSEMOVE:
         g_mouseX = static_cast<short>(LOWORD(lParam));
@@ -514,17 +990,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_mouseDown) {
             int dx = g_mouseX - g_lastMouseX;
             int dy = g_mouseY - g_lastMouseY;
-            g_yaw += dx * 0.005f;
-            g_pitch += dy * 0.005f;
-            g_pitch = std::max(0.05f, std::min(1.45f, g_pitch));
+            g_yaw += dx * g_lookSens;
+            g_pitch -= dy * g_lookSens; // drag up = look up
+            const float lim = static_cast<float>(M_PI) * 0.49f;
+            g_pitch = std::max(-lim, std::min(lim, g_pitch));
             g_lastMouseX = g_mouseX;
             g_lastMouseY = g_mouseY;
         }
         return 0;
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        g_dist *= (delta > 0) ? 0.9f : 1.1f;
-        g_dist = std::max(8.0f, std::min(90.0f, g_dist));
+        g_moveSpeed *= (delta > 0) ? 1.1f : 0.9f;
+        g_moveSpeed = std::max(0.01f, std::min(0.25f, g_moveSpeed));
         return 0;
     }
     default:
@@ -548,7 +1025,7 @@ static void createWindow() {
     RECT r{0, 0, WIDTH, HEIGHT};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExA(
-        0, wc.lpszClassName, "Voxel Vulkan Engine (Clang)",
+        0, wc.lpszClassName, "Voxel FPS 0.0 — WASD fly | LMB look | RMB/F fire | 1-4/R ammo | Esc",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
@@ -678,8 +1155,14 @@ static VkPresentModeKHR choosePresentMode() {
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_phys, g_surface, &count, nullptr);
     std::vector<VkPresentModeKHR> modes(count);
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_phys, g_surface, &count, modes.data());
-    for (auto m : modes)
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) return m;
+    auto has = [&](VkPresentModeKHR want) {
+        for (auto m : modes) if (m == want) return true;
+        return false;
+    };
+    // Mailbox/immediate for high-refresh; FIFO locks to display (120Hz panels).
+    if (has(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
+    if (has(VK_PRESENT_MODE_FIFO_RELAXED_KHR)) return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -959,15 +1442,16 @@ static void createPipeline() {
     bind.stride = sizeof(Vertex);
     bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    VkVertexInputAttributeDescription attrs[3]{};
+    VkVertexInputAttributeDescription attrs[4]{};
     attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, px)};
     attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, nx)};
     attrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, cr)};
+    attrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT, offsetof(Vertex, mat)};
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &bind;
-    vi.vertexAttributeDescriptionCount = 3;
+    vi.vertexAttributeDescriptionCount = 4;
     vi.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -979,7 +1463,7 @@ static void createPipeline() {
 
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_BACK_BIT;
+rs.cullMode = VK_CULL_MODE_NONE; // sky dome + moon billboard + world
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
@@ -989,9 +1473,16 @@ static void createPipeline() {
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE;
     ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState blendAtt{};
+    blendAtt.blendEnable = VK_TRUE;
+    blendAtt.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAtt.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAtt.colorBlendOp = VK_BLEND_OP_ADD;
+    blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
     blendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
@@ -1060,6 +1551,20 @@ static void createSync() {
 }
 
 static void uploadMesh(const std::vector<Vertex>& verts) {
+    if (verts.empty()) {
+        g_vertexCount = 0;
+        return;
+    }
+    vkDeviceWaitIdle(g_device);
+    if (g_vertexBuffer) {
+        vkDestroyBuffer(g_device, g_vertexBuffer, nullptr);
+        g_vertexBuffer = VK_NULL_HANDLE;
+    }
+    if (g_vertexMem) {
+        vkFreeMemory(g_device, g_vertexMem, nullptr);
+        g_vertexMem = VK_NULL_HANDLE;
+    }
+
     g_vertexCount = static_cast<uint32_t>(verts.size());
     VkDeviceSize size = sizeof(Vertex) * verts.size();
 
@@ -1085,6 +1590,116 @@ static void uploadMesh(const std::vector<Vertex>& verts) {
     vkFreeMemory(g_device, stagingMem, nullptr);
 }
 
+static Vec3 cameraForward();
+
+static void destroyVoxelAt(int x, int y, int z) {
+    if (!g_chunks || !worldInBounds(x, y, z)) return;
+    Block b = getWorldBlock(*g_chunks, x, y, z);
+    if (b == Block::Air) return;
+    setWorldBlock(*g_chunks, x, y, z, Block::Air);
+    g_meshDirty = true;
+}
+
+static void applySplash(int cx, int cy, int cz, float radius, float energy,
+                        const ProjectileDef& def) {
+    if (!g_chunks || radius <= 0.0f) return;
+    int r = std::max(1, static_cast<int>(radius / VOXEL_SIZE) + 1);
+    for (int dz = -r; dz <= r; ++dz)
+        for (int dy = -r; dy <= r; ++dy)
+            for (int dx = -r; dx <= r; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                int x = cx + dx, y = cy + dy, z = cz + dz;
+                if (!worldInBounds(x, y, z)) continue;
+                float dist = std::sqrt(float(dx * dx + dy * dy + dz * dz)) * VOXEL_SIZE;
+                if (dist > radius) continue;
+                float fall = std::pow(std::max(0.0f, 1.0f - dist / radius), def.splashFalloff);
+                Block b = getWorldBlock(*g_chunks, x, y, z);
+                MaterialId mat = blockMaterial(b);
+                if (mat == MaterialId::Air) continue;
+                float e = energy * fall * 0.65f * effectMultiplier(def.effect, mat);
+                float thr = breakEnergyThreshold(mat);
+                if (e >= thr * 0.8f) destroyVoxelAt(x, y, z);
+            }
+}
+
+static void fireProjectile() {
+    if (!g_chunks) return;
+    ProjectileDef def = findProjectile(g_projDefs,
+        g_projDefs.empty() ? "slug" :
+        g_projDefs[std::min(g_activeProjIndex, static_cast<int>(g_projDefs.size()) - 1)].id);
+    if (!g_projDefs.empty())
+        def = g_projDefs[std::min(g_activeProjIndex, static_cast<int>(g_projDefs.size()) - 1)];
+
+    Vec3 fwd = cameraForward();
+    ProjectileRuntime p;
+    p.def = def;
+    p.px = g_camPos.x + fwd.x * 0.03f;
+    p.py = g_camPos.y + fwd.y * 0.03f;
+    p.pz = g_camPos.z + fwd.z * 0.03f;
+    p.vx = fwd.x * def.speed;
+    p.vy = fwd.y * def.speed;
+    p.vz = fwd.z * def.speed;
+    p.energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f);
+    p.alive = true;
+    g_projectiles.push_back(p);
+}
+
+static void updateProjectiles(float dt) {
+    if (!g_chunks) return;
+    for (auto& p : g_projectiles) {
+        if (!p.alive) continue;
+        // Gravity (matches Python WORLD_GRAVITY * gravity_scale)
+        p.vy -= kWorldGravity * p.def.gravityScale * dt;
+
+        const int steps = 4;
+        const float sdt = dt / static_cast<float>(steps);
+        for (int s = 0; s < steps && p.alive; ++s) {
+            p.px += p.vx * sdt;
+            p.py += p.vy * sdt;
+            p.pz += p.vz * sdt;
+
+            int ix = static_cast<int>(std::floor(p.px / VOXEL_SIZE));
+            int iy = static_cast<int>(std::floor(p.py / VOXEL_SIZE));
+            int iz = static_cast<int>(std::floor(p.pz / VOXEL_SIZE));
+            if (!worldInBounds(ix, iy, iz)) {
+                // allow mild overshoot above world; kill if far
+                if (p.py < -0.5f || p.py > 2.0f ||
+                    p.px < -0.5f || p.px > WORLD_W * VOXEL_SIZE + 0.5f ||
+                    p.pz < -0.5f || p.pz > WORLD_D * VOXEL_SIZE + 0.5f) {
+                    p.alive = false;
+                }
+                continue;
+            }
+
+            Block b = getWorldBlock(*g_chunks, ix, iy, iz);
+            MaterialId mat = blockMaterial(b);
+            if (mat == MaterialId::Air) continue;
+
+            float e = p.energy * effectMultiplier(p.def.effect, mat);
+            if (resolveVoxelHit(mat, e, p.def.penetration)) {
+                destroyVoxelAt(ix, iy, iz);
+                applySplash(ix, iy, iz, p.def.splashRadius, p.energy, p.def);
+                p.energy = e;
+                if (p.def.effect == "explosive" || p.energy < 0.05f) p.alive = false;
+            } else {
+                p.energy = e;
+                // embed / stop
+                p.alive = false;
+            }
+        }
+    }
+    g_projectiles.erase(
+        std::remove_if(g_projectiles.begin(), g_projectiles.end(),
+                       [](const ProjectileRuntime& p) { return !p.alive; }),
+        g_projectiles.end());
+
+    if (g_meshDirty) {
+        auto mesh = meshAllChunks(*g_chunks);
+        uploadMesh(mesh);
+        g_meshDirty = false;
+    }
+}
+
 static void recreateSwapchain() {
     vkDeviceWaitIdle(g_device);
     destroySwapchainObjects();
@@ -1100,7 +1715,7 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     vkBeginCommandBuffer(cmd, &bi);
 
     VkClearValue clears[2]{};
-    clears[0].color = {{0.45f, 0.70f, 0.95f, 1.0f}}; // sky
+    clears[0].color = {{0.03f, 0.035f, 0.05f, 1.0f}}; // night sky
     clears[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -1113,7 +1728,11 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 
+    // Full swapchain viewport. Bitcrush in fragment shader provides the downscale/crunch look
+    // without a second pass; RENDER_SCALE documents intended internal scale for future offscreen RT.
     VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
     viewport.width = static_cast<float>(g_extent.width);
     viewport.height = static_cast<float>(g_extent.height);
     viewport.minDepth = 0.0f;
@@ -1121,6 +1740,7 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     vkCmdSetViewport(cmd, 0, 1, &viewport);
 
     VkRect2D scissor{};
+    scissor.offset = {0, 0};
     scissor.extent = g_extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
@@ -1128,60 +1748,199 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexBuffer, &off);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelineLayout, 0, 1,
                             &g_descSets[frameIndex], 0, nullptr);
-    vkCmdDraw(cmd, g_vertexCount, 1, 0, 0);
+
+    // Not-seen rendering: frustum + behind-camera cull per chunk
+    g_drawnChunks = 0;
+    g_culledChunks = 0;
+    if (g_chunks && g_vertexBuffer != VK_NULL_HANDLE) {
+        Frustum fr = frustumFromVP(g_viewProjCull);
+        Vec3 eye = g_camPos;
+        Vec3 forward = cameraForward();
+        for (auto& c : *g_chunks) {
+            if (chunkNotSeen(c, fr, eye, forward)) {
+                ++g_culledChunks;
+                c.wasVisible = false;
+                continue;
+            }
+            c.wasVisible = true;
+            if (c.vertexCount == 0) continue;
+            vkCmdDraw(cmd, c.vertexCount, 1, c.firstVertex, 0);
+            ++g_drawnChunks;
+        }
+    } else if (g_vertexCount > 0) {
+        vkCmdDraw(cmd, g_vertexCount, 1, 0, 0);
+        g_drawnChunks = 1;
+    }
+
+// Pixel sky dome + moon light-source sprite (drawn after world; sky verts forced to far Z)
+    if (g_skyTileVB != VK_NULL_HANDLE && g_skyTileVertexCount > 0) {
+        VkDeviceSize mo = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_skyTileVB, &mo);
+        vkCmdDraw(cmd, g_skyTileVertexCount, 1, 0, 0);
+    }
+
     vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);
 }
 
-static void updateCamera(float dt) {
-    float speed = 18.0f * dt;
-    Vec3 forward = {
-        std::sin(g_yaw) * std::cos(g_pitch),
-        0.0f,
-        -std::cos(g_yaw) * std::cos(g_pitch)
-    };
-    forward = forward.normalized();
-    Vec3 right = forward.cross({0, 1, 0}).normalized();
+// Character body as unit voxels relative to feet grid position (for submersion tests).
+static const int kCharUnits[][3] = {
+    // legs
+    {0,0,0},{1,0,0},{0,1,0},{1,1,0}, {3,0,0},{4,0,0},{3,1,0},{4,1,0},
+    // torso
+    {0,2,0},{1,2,0},{2,2,0},{3,2,0},{4,2,0},
+    {0,3,0},{1,3,0},{2,3,0},{3,3,0},{4,3,0},
+    {0,4,0},{1,4,0},{2,4,0},{3,4,0},{4,4,0},
+    // head
+    {1,5,0},{2,5,0},{3,5,0},{1,6,0},{2,6,0},{3,6,0},
+};
+static constexpr int kCharUnitCount = sizeof(kCharUnits) / sizeof(kCharUnits[0]);
 
-    if (g_keys['W'] || g_keys[VK_UP]) g_target = g_target + forward * speed;
-    if (g_keys['S'] || g_keys[VK_DOWN]) g_target = g_target - forward * speed;
-    if (g_keys['A'] || g_keys[VK_LEFT]) g_target = g_target - right * speed;
-    if (g_keys['D'] || g_keys[VK_RIGHT]) g_target = g_target + right * speed;
-    if (g_keys[VK_SPACE] || g_keys['E']) g_target.y += speed;
-    if (g_keys[VK_CONTROL] || g_keys['Q']) g_target.y -= speed;
+struct SubmersionInfo {
+    int touching = 0;
+    int total = kCharUnitCount;
+    int currentTouching = 0;
+    bool anyCurrent = false;
+    bool fullySubmerged = false;
+};
+
+static SubmersionInfo sampleCharacterWater(const std::vector<Chunk>& chunks, int gx, int gy, int gz) {
+    SubmersionInfo info;
+    info.total = kCharUnitCount;
+    for (int i = 0; i < kCharUnitCount; ++i) {
+        int x = gx + kCharUnits[i][0];
+        int y = gy + kCharUnits[i][1];
+        int z = gz + kCharUnits[i][2];
+        Block b = getWorldBlock(chunks, x, y, z);
+        if (isWaterBlock(b)) {
+            info.touching++;
+            if (b == Block::WaterCurrent) {
+                info.currentTouching++;
+                info.anyCurrent = true;
+            }
+        }
+    }
+    info.fullySubmerged = (info.touching >= info.total);
+    return info;
 }
 
-static Vec3 eyeFromOrbit() {
-    return {
-        g_target.x + g_dist * std::sin(g_yaw) * std::cos(g_pitch),
-        g_target.y + g_dist * std::sin(g_pitch),
-        g_target.z + g_dist * std::cos(g_yaw) * std::cos(g_pitch)
-    };
+// Basic current function: how many character units touch moving water.
+static void updatePlayerCurrentAndWeight(float dt) {
+    if (!g_chunks) return;
+    // Sync grid feet from camera (fly-cam proxy for character model).
+    g_playerGX = static_cast<int>(std::floor(g_camPos.x / VOXEL_SIZE)) - 2;
+    g_playerGY = static_cast<int>(std::floor(g_camPos.y / VOXEL_SIZE)) - 1;
+    g_playerGZ = static_cast<int>(std::floor(g_camPos.z / VOXEL_SIZE)) - 1;
+    auto info = sampleCharacterWater(*g_chunks, g_playerGX, g_playerGY, g_playerGZ);
+    g_touchingWaterUnits = info.touching;
+    g_characterUnitCount = info.total;
+    g_currentTriggered = info.anyCurrent && info.touching > 0;
+    g_fullySubmerged = info.fullySubmerged;
+
+    float ratio = (info.total > 0) ? (float)info.touching / (float)info.total : 0.0f;
+    // Weight rules:
+    // - current triggered => weight doubles
+    // - fully submerged => weight halves (of current value)
+    g_playerWeight = g_playerBaseWeight;
+    if (g_currentTriggered) g_playerWeight *= 2.0f;
+    if (g_fullySubmerged) g_playerWeight *= 0.5f;
+
+    // Current force from moving water contacts; doubles if fully submerged in current.
+    float baseForce = 0.035f * ((info.total > 0) ? (float)info.currentTouching / (float)info.total : 0.0f);
+    if (info.fullySubmerged && info.anyCurrent) baseForce *= 2.0f;
+    g_currentForce = baseForce;
+
+    if (g_currentForce > 0.0f && g_playerWeight > 1e-4f) {
+        // Acceleration ~ force / weight along river +X
+        float acc = g_currentForce / g_playerWeight;
+        g_camPos.x += g_currentDir.x * acc * dt;
+        g_camPos.y += g_currentDir.y * acc * dt;
+        g_camPos.z += g_currentDir.z * acc * dt;
+    }
+    (void)ratio;
+}
+
+static Vec3 cameraForward() {
+    // Yaw around +Y, pitch around local X. Forward is free-float (includes vertical).
+    const float cp = std::cos(g_pitch);
+    return Vec3(
+        std::sin(g_yaw) * cp,
+        std::sin(g_pitch),
+        -std::cos(g_yaw) * cp
+    ).normalized();
+}
+
+static Vec3 cameraRight() {
+    return cameraForward().cross(Vec3(0, 1, 0)).normalized();
+}
+
+static void updateCamera(float dt) {
+    // Sprint with Shift
+    float speed = g_moveSpeed * dt;
+    if (g_keys[VK_SHIFT]) speed *= 2.25f;
+
+    Vec3 fwd = cameraForward();
+    Vec3 right = cameraRight();
+    // Keep strafe level so A/D feels like float-strafe, not roll
+    Vec3 flatRight = Vec3(right.x, 0.0f, right.z).normalized();
+    if (flatRight.length() < 1e-4f) flatRight = Vec3(1, 0, 0);
+
+    if (g_keys['W'] || g_keys[VK_UP]) g_camPos = g_camPos + fwd * speed;
+    if (g_keys['S'] || g_keys[VK_DOWN]) g_camPos = g_camPos - fwd * speed;
+    if (g_keys['A'] || g_keys[VK_LEFT]) g_camPos = g_camPos - flatRight * speed;
+    if (g_keys['D'] || g_keys[VK_RIGHT]) g_camPos = g_camPos + flatRight * speed;
+    if (g_keys[VK_SPACE] || g_keys['E']) g_camPos.y += speed;
+    if (g_keys[VK_CONTROL] || g_keys['Q']) g_camPos.y -= speed;
 }
 
 static void updateUBO(uint32_t frameIndex, float timeSec) {
-    Vec3 eye = eyeFromOrbit();
+    Vec3 eye = g_camPos;
+    Vec3 center = g_camPos + cameraForward();
     float aspect = g_extent.height > 0
                        ? static_cast<float>(g_extent.width) / static_cast<float>(g_extent.height)
                        : 1.0f;
-    Mat4 proj = Mat4::perspective(50.0f * static_cast<float>(M_PI) / 180.0f, aspect, 0.1f, 250.0f);
-    Mat4 view = Mat4::lookAt(eye, g_target, {0, 1, 0});
+    Mat4 proj = Mat4::perspective(DEFAULT_FOV_DEG * static_cast<float>(M_PI) / 180.0f, aspect, 0.0005f, 5.0f);
+    Mat4 view = Mat4::lookAt(eye, center, {0, 1, 0});
     Mat4 vp = proj * view;
+
+    g_isNight = g_timeOfDay > 0.7f || g_timeOfDay < 0.25f;
+    g_viewProjCull = vp;
 
     FrameUBO ubo{};
     std::memcpy(ubo.viewProj, vp.m, sizeof(vp.m));
-    ubo.lightDir[0] = -0.45f;
-    ubo.lightDir[1] = -1.0f;
-    ubo.lightDir[2] = -0.35f;
-    ubo.camPos[0] = eye.x;
-    ubo.camPos[1] = eye.y;
-    ubo.camPos[2] = eye.z;
+    // sun mostly off at night
+    ubo.sunDir[0] = 0.2f; ubo.sunDir[1] = -1.0f; ubo.sunDir[2] = 0.15f;
+    ubo.timeOfDay = g_timeOfDay;
+    ubo.camPos[0] = eye.x; ubo.camPos[1] = eye.y; ubo.camPos[2] = eye.z;
     ubo.time = timeSec;
+// Moon sprite is the scene light source: light comes from moon sky bearing
+    {
+        Vec3 L = g_moonDirWorld.normalized(); // direction toward moon from origin-ish
+        // Shader uses normalize(-moonDir) as light vector, so moonDir points toward surface from moon
+        ubo.moonDir[0] = -L.x; ubo.moonDir[1] = -L.y; ubo.moonDir[2] = -L.z;
+    }
+    ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
+    ubo.moonColor[0] = 0.62f; ubo.moonColor[1] = 0.72f; ubo.moonColor[2] = 0.95f;
+    ubo.ambientScale = g_isNight ? 0.65f : 1.0f;
+
+    // Warm bulbs (world-space); match warehouse placements roughly
+    auto setBulb = [&](int i, float x, float y, float z, float inten, float r, float g, float b, float radius) {
+        ubo.bulbPos[i][0] = x; ubo.bulbPos[i][1] = y; ubo.bulbPos[i][2] = z; ubo.bulbPos[i][3] = inten;
+        ubo.bulbColor[i][0] = r; ubo.bulbColor[i][1] = g; ubo.bulbColor[i][2] = b; ubo.bulbColor[i][3] = radius;
+    };
+    // Convert grid guesses to world using VOXEL_SIZE
+    setBulb(0, WORLD_W * 0.5f * VOXEL_SIZE, 0.040f, WORLD_D * 0.35f * VOXEL_SIZE, 1.8f, 1.0f, 0.72f, 0.42f, 0.09f);
+    setBulb(1, 0.038f, 0.040f, 0.038f, 1.4f, 1.0f, 0.7f, 0.4f, 0.07f);
+    setBulb(2, 0.12f, 0.040f, 0.042f, 1.4f, 1.0f, 0.68f, 0.38f, 0.07f);
+    setBulb(3, WORLD_W * 0.5f * VOXEL_SIZE, 0.040f, 0.095f, 1.2f, 1.0f, 0.75f, 0.45f, 0.08f);
+
     std::memcpy(g_uboMapped[frameIndex], &ubo, sizeof(ubo));
 }
 
+
 static void drawFrame(float timeSec, float dt) {
     updateCamera(dt);
+    updatePlayerCurrentAndWeight(dt);
 
     vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
 
@@ -1196,6 +1955,7 @@ static void drawFrame(float timeSec, float dt) {
 
     vkResetFences(g_device, 1, &g_inFlight[g_frame]);
     updateUBO(static_cast<uint32_t>(g_frame), timeSec);
+    updateMoonSkyTile();
     recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1224,6 +1984,7 @@ static void drawFrame(float timeSec, float dt) {
         fail("present failed");
     }
     g_frame = (g_frame + 1) % MAX_FRAMES;
+    paceFrame120();
 }
 
 static void cleanup() {
@@ -1250,6 +2011,16 @@ static void cleanup() {
         g_renderFinished[i] = VK_NULL_HANDLE;
         g_inFlight[i] = VK_NULL_HANDLE;
     }
+if (g_skyTileVB) {
+        if (g_skyTileMapped) { vkUnmapMemory(g_device, g_skyTileMem); g_skyTileMapped = nullptr; }
+        vkDestroyBuffer(g_device, g_skyTileVB, nullptr);
+        g_skyTileVB = VK_NULL_HANDLE;
+    }
+    if (g_skyTileMem) {
+        vkFreeMemory(g_device, g_skyTileMem, nullptr);
+        g_skyTileMem = VK_NULL_HANDLE;
+    }
+    g_skyTileVertexCount = 0;
     if (g_vertexBuffer) vkDestroyBuffer(g_device, g_vertexBuffer, nullptr);
     if (g_vertexMem) vkFreeMemory(g_device, g_vertexMem, nullptr);
     if (g_cmdPool) vkDestroyCommandPool(g_device, g_cmdPool, nullptr);
@@ -1282,7 +2053,7 @@ static std::string getExeDir() {
 
 // Optional headless-ish smoke test: run N frames then quit if --smoke
 static bool g_smoke = false;
-static int g_smokeFrames = 120;
+static int g_smokeFrames = 300;
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
     std::string cmd = cmdLine ? cmdLine : "";
@@ -1304,16 +2075,30 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createPipeline();
         createSync();
 
-        auto world = buildWorld();
-        auto mesh = meshWorld(world);
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "Voxel mesh vertices: %zu\n", mesh.size());
+        auto chunks = buildWarehouseMap();
+        g_chunks = &chunks;
+
+        // Load Python-exported projectile defs (gravity + effects)
+        g_projDefs = loadProjectileDefs(g_exeDir + "\\projectiles.json");
+        if (g_projDefs.empty())
+            g_projDefs = loadProjectileDefs(g_exeDir + "\\..\\data\\projectiles.json");
+        if (g_projDefs.empty()) {
+            // Fallback if export not run yet
+            g_projDefs.push_back(ProjectileDef{});
+        }
+
+        auto mesh = meshAllChunks(chunks);
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "Chunks=%dx%dx%d voxel=%.4f verts=%zu projs=%zu\n",
+                      CHUNKS_X, CHUNKS_Y, CHUNKS_Z, VOXEL_SIZE, mesh.size(), g_projDefs.size());
         OutputDebugStringA(msg);
         uploadMesh(mesh);
 
         auto start = std::chrono::steady_clock::now();
         auto last = start;
         int frames = 0;
+        int destroysApprox = 0;
 
         MSG msgWin{};
         while (g_running) {
@@ -1327,10 +2112,29 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             auto now = std::chrono::steady_clock::now();
             float dt = std::chrono::duration<float>(now - last).count();
             last = now;
+            if (dt > 0.05f) dt = 0.05f;
             float t = std::chrono::duration<float>(now - start).count();
 
-            // Slow auto-orbit so smoke test shows motion without input
-            if (g_smoke) g_yaw += dt * 0.35f;
+            // Functional smoke path: fly + fire gravity projectile into world
+if (g_smoke) {
+                // Orbit and tilt up so sky tiles + moon light source are in frame
+                g_yaw += dt * 0.20f;
+                g_pitch = 0.42f;
+            }
+
+            if (g_firePressed) {
+                fireProjectile();
+                g_firePressed = false;
+            }
+
+            const bool wasDirty = g_meshDirty;
+            updateProjectiles(dt);
+            if (wasDirty || g_meshDirty) { /* remesh happens inside updateProjectiles */ }
+            // Count live projectile impacts indirectly via remesh flag consumption
+            static int lastVertCount = -1;
+            if (lastVertCount >= 0 && static_cast<int>(g_vertexCount) < lastVertCount)
+                destroysApprox += (lastVertCount - static_cast<int>(g_vertexCount)) / 6;
+            lastVertCount = static_cast<int>(g_vertexCount);
 
             drawFrame(t, dt);
             ++frames;
@@ -1341,12 +2145,38 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         }
 
         vkDeviceWaitIdle(g_device);
+        g_chunks = nullptr;
 
         // Write success marker for smoke tests
         if (g_smoke) {
             std::string outPath = g_exeDir + "\\smoke_ok.txt";
             std::ofstream out(outPath);
-            out << "frames=" << frames << "\nvertices=" << g_vertexCount << "\n";
+            out << "frames=" << frames << "\nvertices=" << g_vertexCount
+                << "\ncam=" << g_camPos.x << "," << g_camPos.y << "," << g_camPos.z
+                << "\nyaw=" << g_yaw << "\npitch=" << g_pitch
+                << "\nprojectiles_loaded=" << g_projDefs.size()
+                << "\ngravity=" << kWorldGravity
+                << "\nremesh_events=" << destroysApprox
+                << "\nwater_touch=" << g_touchingWaterUnits << "/" << g_characterUnitCount
+                << "\ncurrent=" << (g_currentTriggered ? 1 : 0)
+                << "\nsubmerged=" << (g_fullySubmerged ? 1 : 0)
+                << "\nweight=" << g_playerWeight
+                << "\ncurrent_force=" << g_currentForce
+                << "\nrender_scale=" << RENDER_SCALE
+                << "\ndrawn_chunks=" << g_drawnChunks
+                << "\nculled_chunks=" << g_culledChunks
+                << "\navg_frame_ms=" << (g_frameMsCount > 15 ? (g_frameMsSum / double(g_frameMsCount - 15)) : -1.0)
+                << "\nmin_frame_ms=" << (g_frameMsMin < 1e8 ? g_frameMsMin : -1.0)
+                << "\nmax_frame_ms=" << g_frameMsMax
+                << "\npace_hits=" << g_framePaceHits
+                << "\nsteady_frames=" << (g_frameMsCount > 15 ? (g_frameMsCount - 15) : 0)
+<< "\ntarget_hz=" << TARGET_HZ
+                << "\nlock_ok=" << ((g_frameMsCount > 40) && ((g_frameMsSum / double(g_frameMsCount - 15)) <= 9.0) ? 1 : 0)
+                << "\nsky_tiles=" << (SKY_SEG_U * SKY_SEG_V)
+                << "\nsky_verts=" << g_skyTileVertexCount
+                << "\nmoon_light=" << (g_isNight ? 1 : 0)
+                << "\nmoon_dir=" << g_moonDirWorld.x << "," << g_moonDirWorld.y << "," << g_moonDirWorld.z
+                << "\n";
         }
     } catch (const std::exception& e) {
         MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);
