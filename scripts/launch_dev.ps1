@@ -1,42 +1,159 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
+<#
+.SYNOPSIS
+  Development launcher: Build | Painter | Engine | smokes | UI.
+.DESCRIPTION
+  Single entry for voxel engine + painter workflows. Painter bitcrush 32x is
+  display/export only; occupancy stays cubic unit cells (VOXEL_SIZE=0.001).
+
+.PARAMETER Action
+  Build         - scripts/build.ps1 (engine)
+  Painter       - scripts/build_painter.ps1 (compile + SmokeMain)
+  Engine        - scripts/run.ps1
+  SmokeEngine   - scripts/demo.ps1 -SkipInteractive
+  SmokePainter  - scripts/smoke_painter.ps1 (-> build_painter.ps1)
+  SmokeAll      - painter smoke then engine smoke
+  Ui            - scripts/run_painter_ui.ps1 if present, else Painter
+  Help          - print usage
+  (empty)       - interactive menu
+#>
 param(
-  [ValidateSet("Build","Painter","Engine","SmokeEngine","SmokePainter","SmokeAll","Ui","Help")]
-  [string]$Action = "Help"
+  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokePainter", "SmokeAll", "Ui", "Help", "")]
+  [string]$Action = "",
+
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$PassThru
 )
+
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
+if (-not $Root) { $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
 $Scripts = $PSScriptRoot
 
-switch ($Action) {
-  "Help" {
-    Write-Host @"
+function Invoke-RepoScript {
+  param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [string[]]$ScriptArgs = @()
+  )
+  $path = Join-Path $Scripts $Name
+  if (-not (Test-Path $path)) {
+    throw "Missing script: $path"
+  }
+  Write-Host "== $Name $($ScriptArgs -join ' ') ==" -ForegroundColor Cyan
+  if ($ScriptArgs.Count -gt 0) {
+    & $path @ScriptArgs
+  } else {
+    & $path
+  }
+  return $LASTEXITCODE
+}
+
+function Show-Help {
+  Write-Host @"
 launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokePainter|SmokeAll|Ui>
   Build         - engine build.ps1
   Painter       - build_painter.ps1 (core smoke)
   Engine        - run.ps1 interactive
   SmokeEngine   - demo.ps1 -SkipInteractive
-  SmokePainter  - build_painter.ps1
-  SmokeAll      - engine + painter smokes
+  SmokePainter  - smoke_painter.ps1 / build_painter.ps1
+  SmokeAll      - painter + engine smokes
   Ui            - run_painter_ui.ps1 if present else Painter
+  Help          - this text
+
+Cubic unit voxels only (VOXEL_SIZE=0.001). Bitcrush 32x is display/export only.
 "@
-  }
-  "Build" { & (Join-Path $Scripts "build.ps1"); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-  "Painter" { & (Join-Path $Scripts "build_painter.ps1"); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-  "Engine" { & (Join-Path $Scripts "run.ps1"); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-  "SmokeEngine" {
-    & (Join-Path $Scripts "demo.ps1") -SkipInteractive
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  }
-  "SmokePainter" { & (Join-Path $Scripts "build_painter.ps1"); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-  "SmokeAll" {
-    & (Join-Path $Scripts "build_painter.ps1"); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & (Join-Path $Scripts "demo.ps1") -SkipInteractive; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "SMOKE_ALL_OK" -ForegroundColor Green
-  }
-  "Ui" {
-    $ui = Join-Path $Scripts "run_painter_ui.ps1"
-    if (Test-Path $ui) { & $ui; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-    else { & (Join-Path $Scripts "build_painter.ps1"); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+}
+
+function Show-Menu {
+  Write-Host ""
+  Write-Host "======== VOXEL DEV LAUNCHER ========" -ForegroundColor Magenta
+  Write-Host " 1  Build          engine (scripts/build.ps1)"
+  Write-Host " 2  Painter        build_painter.ps1 (core smoke)"
+  Write-Host " 3  Engine         interactive engine (scripts/run.ps1)"
+  Write-Host " 4  SmokeEngine    demo.ps1 -SkipInteractive"
+  Write-Host " 5  SmokePainter   smoke_painter.ps1"
+  Write-Host " 6  SmokeAll       painter + engine smokes"
+  Write-Host " 7  Ui             run_painter_ui.ps1 (or Painter)"
+  Write-Host " h  Help"
+  Write-Host " q  Quit"
+  Write-Host "------------------------------------"
+  Write-Host "RULES: cubic unit voxels only (VOXEL_SIZE=0.001); bitcrush 32x is display-only." -ForegroundColor DarkGray
+  $choice = Read-Host "Select"
+  switch -Regex ($choice) {
+    "^1$" { return "Build" }
+    "^2$" { return "Painter" }
+    "^3$" { return "Engine" }
+    "^4$" { return "SmokeEngine" }
+    "^5$" { return "SmokePainter" }
+    "^6$" { return "SmokeAll" }
+    "^7$" { return "Ui" }
+    "^[hH]$" { return "Help" }
+    "^[qQ]$" { return "Quit" }
+    default {
+      Write-Host "Unknown selection: $choice" -ForegroundColor Yellow
+      return "Quit"
+    }
   }
 }
-exit 0
+
+function Invoke-Action {
+  param([string]$Name)
+  switch ($Name) {
+    "Help" {
+      Show-Help
+      return 0
+    }
+    "Build" {
+      return Invoke-RepoScript -Name "build.ps1"
+    }
+    "Painter" {
+      return Invoke-RepoScript -Name "build_painter.ps1"
+    }
+    "Engine" {
+      if ($PassThru -and $PassThru.Count -gt 0) {
+        return Invoke-RepoScript -Name "run.ps1" -ScriptArgs $PassThru
+      }
+      return Invoke-RepoScript -Name "run.ps1"
+    }
+    "SmokeEngine" {
+      return Invoke-RepoScript -Name "demo.ps1" -ScriptArgs @("-SkipInteractive")
+    }
+    "SmokePainter" {
+      $smoke = Join-Path $Scripts "smoke_painter.ps1"
+      if (Test-Path $smoke) {
+        return Invoke-RepoScript -Name "smoke_painter.ps1"
+      }
+      return Invoke-RepoScript -Name "build_painter.ps1"
+    }
+    "SmokeAll" {
+      $p = Invoke-Action -Name "SmokePainter"
+      if ($p -ne 0) { return $p }
+      $e = Invoke-Action -Name "SmokeEngine"
+      if ($e -ne 0) { return $e }
+      Write-Host "SMOKE_ALL_OK" -ForegroundColor Green
+      return 0
+    }
+    "Ui" {
+      $ui = Join-Path $Scripts "run_painter_ui.ps1"
+      if (Test-Path $ui) {
+        return Invoke-RepoScript -Name "run_painter_ui.ps1"
+      }
+      Write-Host "run_painter_ui.ps1 missing; falling back to Painter" -ForegroundColor Yellow
+      return Invoke-Action -Name "Painter"
+    }
+    "Quit" { return 0 }
+    default {
+      Write-Host "Unknown Action: $Name" -ForegroundColor Red
+      Show-Help
+      return 1
+    }
+  }
+}
+
+if (-not $Action) {
+  $Action = Show-Menu
+}
+
+$code = Invoke-Action -Name $Action
+if ($null -eq $code) { $code = 0 }
+exit $code

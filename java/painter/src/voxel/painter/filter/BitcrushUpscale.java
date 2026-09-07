@@ -4,9 +4,13 @@ import java.awt.image.BufferedImage;
 
 /**
  * Display/export filter: nearest-neighbor upscale then color bitcrush.
- * Does not modify voxel occupancy grids.
+ * <p>
+ * Does <strong>not</strong> modify voxel occupancy grids. Canonical geometry remains
+ * cubic unit cells ({@code VOXEL_SIZE = 0.001}, 1×1×1 integer cells). Never bake
+ * crushed pixels back into painter/engine occupancy.
  */
 public final class BitcrushUpscale {
+    /** Default nearest-neighbor scale for painter preview/export. */
     public static final int DEFAULT_SCALE = 32;
     /** Approximate 4-bit/channel crush via 16 quantization levels. */
     public static final int DEFAULT_BITS_PER_CHANNEL = 4;

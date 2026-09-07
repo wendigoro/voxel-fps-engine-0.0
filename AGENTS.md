@@ -22,17 +22,20 @@ When changing scale, materials, or launch flow, update:
 | Engine build | `.\launch.ps1 -Action Build` |
 | Engine run | `.\launch.ps1 -Action Engine` |
 | Engine smoke | `.\launch.ps1 -Action SmokeEngine` |
-| Painter UI | `.\launch.ps1 -Action Painter` (or `Ui`) |
-| Painter smoke | `.\launch.ps1 -Action SmokePainter` |
+| Painter build/smoke | `.\launch.ps1 -Action Painter` or `SmokePainter` |
+| Painter UI | `.\launch.ps1 -Action Ui` (`scripts/run_painter_ui.ps1`) |
 | All smokes | `.\launch.ps1 -Action SmokeAll` |
+
+`SmokePainter` / `Painter` run `scripts/build_painter.ps1` (or `smoke_painter.ps1` wrapper). Expect `build/painter/painter_smoke_ok.txt`.
 
 ## Ownership notes (painter workstream)
 
 | Area | Path |
 |------|------|
-| Filter / bitcrush | `java/painter/src/voxel/painter/filter/*` |
+| Filter / bitcrush | `java/painter/src/voxel/painter/filter/*` (`BitcrushUpscale`, `PngExport`) |
 | Painter smoke entry | `java/painter/src/voxel/painter/SmokeMain.java` |
 | Dev launcher | `scripts/launch_dev.ps1`, root `launch.ps1` |
-| Painter smoke script | `scripts/smoke_painter.ps1` |
-| Grid / format | `java/painter/src/voxel/painter/grid/*` (sibling agent) |
-| Swing UI | `java/painter/src/voxel/painter/ui/*` (sibling agent) |
+| Painter build/smoke | `scripts/build_painter.ps1`, `scripts/smoke_painter.ps1` |
+| Painter UI launch | `scripts/run_painter_ui.ps1` |
+| Grid / format | `java/painter/src/voxel/painter/grid/*` |
+| Swing UI | `java/painter/src/voxel/painter/ui/*` |

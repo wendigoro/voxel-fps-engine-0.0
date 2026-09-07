@@ -55,12 +55,14 @@ Use repo scripts so paths stay consistent:
 | Script | Purpose |
 |--------|---------|
 | `launch.ps1` | Root entry → `scripts/launch_dev.ps1` (also legacy `-Build`/`-Run`/`-SmokeOnly`) |
-| `scripts/launch_dev.ps1` | Dev menu / `-Action Build\|Painter\|Engine\|SmokeEngine\|SmokePainter\|SmokeAll\|Ui` |
+| `scripts/launch_dev.ps1` | Dev menu / `-Action Build\|Painter\|Engine\|SmokeEngine\|SmokePainter\|SmokeAll\|Ui\|Help` |
 | `scripts/build.ps1` | Export Python defs + compile engine |
+| `scripts/build_painter.ps1` | Compile Java painter + run `voxel.painter.SmokeMain` |
+| `scripts/smoke_painter.ps1` | Painter smoke wrapper → `build_painter.ps1` |
+| `scripts/run_painter_ui.ps1` | Build painter then launch `voxel.painter.ui.PainterApp` |
 | `scripts/run.ps1` | Launch interactive engine |
 | `scripts/demo.ps1` | Full demo: export, build, smoke test, optional interactive |
-| `scripts/smoke_painter.ps1` | Compile Java painter + run `voxel.painter.SmokeMain` |
 
 Working directory for the engine executable is always `build/` so `projectiles.json` and shaders resolve next to the binary.
 
-Painter classes compile to `build/painter/`; painter smoke artifacts land under `build/painter_smoke/`.
+Painter classes compile to `build/painter/`; painter smoke OK file is `build/painter/painter_smoke_ok.txt`. Optional crushed preview PNGs may also be written under `build/painter/` (display-only; never occupancy).
