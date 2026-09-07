@@ -51,6 +51,12 @@ if (-not (Test-Path (Join-Path $Build "voxel_engine.exe"))) { throw "voxel_engin
 
 # Ensure runtime JSON sits beside exe
 Copy-Item (Join-Path $Root "data\projectiles.json") (Join-Path $Build "projectiles.json") -Force
+$weaponsSrc = Join-Path $Root "data\weapons"
+$weaponsDst = Join-Path $Build "weapons"
+if (Test-Path $weaponsSrc) {
+  New-Item -ItemType Directory -Force -Path $weaponsDst | Out-Null
+  Copy-Item (Join-Path $weaponsSrc "*") $weaponsDst -Force -Recurse
+}
 
 $exe = Get-Item (Join-Path $Build "voxel_engine.exe")
 Write-Host "BUILD_OK $($exe.FullName) ($([math]::Round($exe.Length/1KB)) KB)" -ForegroundColor Green

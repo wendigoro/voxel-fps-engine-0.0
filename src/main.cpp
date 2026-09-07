@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -171,9 +172,22 @@ struct Chunk;
 static std::vector<Chunk>* g_chunks = nullptr;
 static std::vector<ProjectileDef> g_projDefs;
 static std::vector<ProjectileRuntime> g_projectiles;
-static int g_activeProjIndex = 0; // cycles slug/spike/shredder/charge
+static int g_activeProjIndex = 0; // cycles slug/spike/shredder/charge (R)
 static bool g_meshDirty = false;
 static bool g_firePressed = false;
+
+// Weapon assembly runtime (loaded from data/weapons/*.weapon.json)
+static std::vector<WeaponDef> g_weapons;
+static int g_activeWeaponIndex = 0;
+static int g_activeCaliberIndex = 1; // 0 light 1 medium 2 heavy 3 energy_beam (keys 1-4)
+static const char* kCaliberIds[4] = {"light", "medium", "heavy", "energy_beam"};
+static float g_fireCooldown = 0.0f;
+static std::string g_lastAmmoId = "medium_ball";
+static std::string g_lastCaliber = "medium";
+static bool g_lastHitscan = false;
+static std::string g_lastWeaponId = "none";
+static int g_hitscanShots = 0;
+static int g_ballisticShots = 0;
 
 // Player character as unit-voxel body on the cubic grid (impact/current sampling).
 static int g_playerGX = 0, g_playerGY = 0, g_playerGZ = 0;
@@ -961,12 +975,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             PostQuitMessage(0);
         }
         if (wParam == 'F') g_firePressed = true;
-        if (wParam == '1') g_activeProjIndex = 0;
-        if (wParam == '2') g_activeProjIndex = 1;
-        if (wParam == '3') g_activeProjIndex = 2;
-        if (wParam == '4') g_activeProjIndex = 3;
+        // 1-4: caliber / ammo cycle (light medium heavy energy_beam)
+        if (wParam == '1') { g_activeCaliberIndex = 0; g_activeProjIndex = 0; }
+        if (wParam == '2') { g_activeCaliberIndex = 1; g_activeProjIndex = 1; }
+        if (wParam == '3') { g_activeCaliberIndex = 2; g_activeProjIndex = 2; }
+        if (wParam == '4') { g_activeCaliberIndex = 3; g_activeProjIndex = 3; }
+        // R: keep legacy projectile-def cycle
         if (wParam == 'R' && !g_projDefs.empty())
             g_activeProjIndex = (g_activeProjIndex + 1) % static_cast<int>(g_projDefs.size());
+        // V: cycle loaded weapons when multiple exports exist
+        if (wParam == 'V' && !g_weapons.empty())
+            g_activeWeaponIndex = (g_activeWeaponIndex + 1) % static_cast<int>(g_weapons.size());
         return 0;
     case WM_KEYUP:
         if (wParam < 256) g_keys[wParam] = false;
@@ -1025,7 +1044,7 @@ static void createWindow() {
     RECT r{0, 0, WIDTH, HEIGHT};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExA(
-        0, wc.lpszClassName, "Voxel FPS 0.0 — WASD fly | LMB look | RMB/F fire | 1-4/R ammo | Esc",
+        0, wc.lpszClassName, "Voxel FPS 0.0 — WASD fly | LMB look | RMB/F fire | 1-4 caliber | R proj | V weapon | Esc",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
@@ -1615,21 +1634,149 @@ static void applySplash(int cx, int cy, int cz, float radius, float energy,
                 float fall = std::pow(std::max(0.0f, 1.0f - dist / radius), def.splashFalloff);
                 Block b = getWorldBlock(*g_chunks, x, y, z);
                 MaterialId mat = blockMaterial(b);
-                if (mat == MaterialId::Air) continue;
+                if (mat == MaterialId::Air || mat == MaterialId::Plexiglass) continue;
                 float e = energy * fall * 0.65f * effectMultiplier(def.effect, mat);
                 float thr = breakEnergyThreshold(mat);
                 if (e >= thr * 0.8f) destroyVoxelAt(x, y, z);
             }
 }
 
-static void fireProjectile() {
-    if (!g_chunks) return;
-    ProjectileDef def = findProjectile(g_projDefs,
-        g_projDefs.empty() ? "slug" :
-        g_projDefs[std::min(g_activeProjIndex, static_cast<int>(g_projDefs.size()) - 1)].id);
-    if (!g_projDefs.empty())
-        def = g_projDefs[std::min(g_activeProjIndex, static_cast<int>(g_projDefs.size()) - 1)];
+static WeaponDef activeWeaponOrDefault() {
+    if (!g_weapons.empty()) {
+        int i = std::min(g_activeWeaponIndex, static_cast<int>(g_weapons.size()) - 1);
+        return g_weapons[i];
+    }
+    return defaultWeaponDef();
+}
 
+static std::string activeCaliberId(const WeaponDef& w) {
+    // Hotkey caliber override (1-4) takes priority for fire tests / play.
+    if (g_activeCaliberIndex >= 0 && g_activeCaliberIndex < 4)
+        return kCaliberIds[g_activeCaliberIndex];
+    if (!w.ammo.caliber.empty()) return w.ammo.caliber;
+    return w.caliber.empty() ? std::string("medium") : w.caliber;
+}
+
+static float fireCooldownForHandling(float handling) {
+    // Higher handling → faster follow-up. Clamp for playability at micro scale.
+    return std::max(0.05f, 0.40f - handling * 0.018f);
+}
+
+static void applyRecoilKick(const WeaponDef& w) {
+    // Minimal camera kick from bolt/chamber recoil stat (+ weight damps slightly).
+    const float damp = 1.0f / (1.0f + std::max(0.0f, w.weight) * 0.08f);
+    const float kick = w.recoil * 0.0011f * damp;
+    g_pitch += kick;
+    g_yaw += kick * 0.35f;
+    const float lim = static_cast<float>(M_PI) * 0.49f;
+    g_pitch = std::max(-lim, std::min(lim, g_pitch));
+}
+
+// Unit-grid DDA ray (Amanatides & Woo). Hitscan/energy only — gravity_scale=0 path.
+static int fireHitscanRay(const ProjectileDef& def, float energyScale) {
+    if (!g_chunks) return 0;
+    Vec3 fwd = cameraForward();
+    // Start slightly forward of camera in world space.
+    float ox = (g_camPos.x + fwd.x * 0.02f) / VOXEL_SIZE;
+    float oy = (g_camPos.y + fwd.y * 0.02f) / VOXEL_SIZE;
+    float oz = (g_camPos.z + fwd.z * 0.02f) / VOXEL_SIZE;
+    float dx = fwd.x, dy = fwd.y, dz = fwd.z;
+    // Avoid zero-direction components for DDA.
+    const float eps = 1e-8f;
+    if (std::fabs(dx) < eps) dx = (dx < 0.0f ? -eps : eps);
+    if (std::fabs(dy) < eps) dy = (dy < 0.0f ? -eps : eps);
+    if (std::fabs(dz) < eps) dz = (dz < 0.0f ? -eps : eps);
+
+    int ix = static_cast<int>(std::floor(ox));
+    int iy = static_cast<int>(std::floor(oy));
+    int iz = static_cast<int>(std::floor(oz));
+
+    const int stepX = dx > 0.0f ? 1 : -1;
+    const int stepY = dy > 0.0f ? 1 : -1;
+    const int stepZ = dz > 0.0f ? 1 : -1;
+
+    // World-space distance to cross one unit voxel on each axis.
+    const float tDeltaX = VOXEL_SIZE / std::fabs(dx);
+    const float tDeltaY = VOXEL_SIZE / std::fabs(dy);
+    const float tDeltaZ = VOXEL_SIZE / std::fabs(dz);
+
+    // tMax: world distance along ray to next voxel boundary on each axis.
+    float tMaxX = (stepX > 0)
+        ? ((static_cast<float>(ix) + 1.0f - ox) / dx) * VOXEL_SIZE
+        : ((ox - static_cast<float>(ix)) / -dx) * VOXEL_SIZE;
+    float tMaxY = (stepY > 0)
+        ? ((static_cast<float>(iy) + 1.0f - oy) / dy) * VOXEL_SIZE
+        : ((oy - static_cast<float>(iy)) / -dy) * VOXEL_SIZE;
+    float tMaxZ = (stepZ > 0)
+        ? ((static_cast<float>(iz) + 1.0f - oz) / dz) * VOXEL_SIZE
+        : ((oz - static_cast<float>(iz)) / -dz) * VOXEL_SIZE;
+
+    float energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f) * energyScale;
+    // Energy beams still use kineticEnergy scale; mass is tiny but baseDamage carries power.
+    if (def.gravityScale <= 0.0f)
+        energy = std::max(energy, def.baseDamage * 1.5f * energyScale);
+
+    const float maxDist = 1.75f; // world units (~1750 unit voxels)
+    float traveled = 0.0f;
+    int breaks = 0;
+    const int maxSteps = static_cast<int>(maxDist / VOXEL_SIZE) + 2;
+
+    for (int step = 0; step < maxSteps; ++step) {
+        if (worldInBounds(ix, iy, iz)) {
+            Block b = getWorldBlock(*g_chunks, ix, iy, iz);
+            MaterialId mat = blockMaterial(b);
+            if (mat != MaterialId::Air) {
+                float e = energy * effectMultiplier(def.effect, mat);
+                if (resolveVoxelHit(mat, e, def.penetration)) {
+                    destroyVoxelAt(ix, iy, iz);
+                    applySplash(ix, iy, iz, def.splashRadius, energy, def);
+                    energy = e;
+                    ++breaks;
+                    if (energy < 0.05f) break;
+                } else {
+                    // Stopped / absorbed (including indestructible plexi when present).
+                    energy = e;
+                    break;
+                }
+            }
+        } else if (traveled > 0.05f) {
+            // Left the map after traveling — end ray.
+            break;
+        }
+
+        // Step to next voxel face.
+        if (tMaxX < tMaxY) {
+            if (tMaxX < tMaxZ) {
+                traveled = tMaxX;
+                tMaxX += tDeltaX;
+                ix += stepX;
+            } else {
+                traveled = tMaxZ;
+                tMaxZ += tDeltaZ;
+                iz += stepZ;
+            }
+        } else {
+            if (tMaxY < tMaxZ) {
+                traveled = tMaxY;
+                tMaxY += tDeltaY;
+                iy += stepY;
+            } else {
+                traveled = tMaxZ;
+                tMaxZ += tDeltaZ;
+                iz += stepZ;
+            }
+        }
+        if (traveled > maxDist) break;
+    }
+    if (g_meshDirty) {
+        auto mesh = meshAllChunks(*g_chunks);
+        uploadMesh(mesh);
+        g_meshDirty = false;
+    }
+    return breaks;
+}
+
+static void spawnBallisticProjectile(const ProjectileDef& def) {
     Vec3 fwd = cameraForward();
     ProjectileRuntime p;
     p.def = def;
@@ -1642,6 +1789,112 @@ static void fireProjectile() {
     p.energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f);
     p.alive = true;
     g_projectiles.push_back(p);
+}
+
+static void fireProjectile() {
+    if (!g_chunks) return;
+    if (g_fireCooldown > 0.0f) return;
+
+    WeaponDef weapon = activeWeaponOrDefault();
+    std::string caliber = activeCaliberId(weapon);
+    const bool hitscan = weapon.hitscan || caliberIsHitscan(caliber) || caliber == "energy_beam";
+
+    // Compose runtime weapon view with hotkey caliber override.
+    WeaponDef fired = weapon;
+    fired.caliber = caliber;
+    fired.hitscan = hitscan;
+    if (fired.ammo.caliber.empty()) fired.ammo.caliber = caliber;
+    else fired.ammo.caliber = caliber;
+    // Ammo scaffold ids aligned with python/projectiles/ammo.py when overriding caliber.
+    if (caliber != weapon.caliber || fired.ammoId.empty()) {
+        if (caliber == "light") fired.ammoId = "fmj_light";
+        else if (caliber == "heavy") fired.ammoId = "fmj_heavy";
+        else if (caliberIsHitscan(caliber)) fired.ammoId = "cell_energy";
+        else fired.ammoId = "fmj_medium";
+    }
+
+    ProjectileDef def = projectileForCaliber(g_projDefs, caliber);
+    // R still cycles legacy projectile defs when medium + no named caliber ball present.
+    if (!hitscan && !g_projDefs.empty() && caliber == "medium" &&
+        g_activeProjIndex >= 0 && g_activeProjIndex < static_cast<int>(g_projDefs.size())) {
+        bool hasCalBall = false;
+        for (const auto& d : g_projDefs)
+            if (d.id == "medium_ball" || d.caliber == "medium") { hasCalBall = true; break; }
+        if (!hasCalBall)
+            def = g_projDefs[g_activeProjIndex];
+    }
+    // Prefer projectile hitscan flag when set by export.
+    bool useHitscan = hitscan || def.hitscan || def.gravityScale <= 0.0f;
+    def = scaleProjectileForWeapon(def, fired);
+    if (useHitscan) {
+        def.hitscan = true;
+        def.gravityScale = 0.0f;
+    }
+
+    g_lastWeaponId = fired.id;
+    g_lastCaliber = caliber;
+    g_lastHitscan = useHitscan;
+    g_lastAmmoId = fired.ammoId.empty() ? fired.ammo.id : fired.ammoId;
+
+    if (useHitscan) {
+        fireHitscanRay(def, 1.0f);
+        ++g_hitscanShots;
+    } else {
+        spawnBallisticProjectile(def);
+        ++g_ballisticShots;
+    }
+
+    applyRecoilKick(fired);
+    g_fireCooldown = fireCooldownForHandling(fired.handling);
+}
+
+static void tryLoadWeapons() {
+    g_weapons.clear();
+    const std::string candidates[] = {
+        g_exeDir + "\\weapons",
+        g_exeDir + "\\..\\data\\weapons",
+        g_exeDir + "\\..\\..\\data\\weapons",
+    };
+    for (const auto& dir : candidates) {
+        std::string pattern = dir + "\\*.weapon.json";
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::string path = dir + "\\" + fd.cFileName;
+            WeaponDef w = loadWeaponDef(path);
+            if (!w.id.empty()) g_weapons.push_back(w);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+        if (!g_weapons.empty()) break;
+    }
+    if (g_weapons.empty()) {
+        const std::string files[] = {
+            g_exeDir + "\\weapons\\starter_rifle.weapon.json",
+            g_exeDir + "\\..\\data\\weapons\\starter_rifle.weapon.json",
+        };
+        for (const auto& f : files) {
+            WeaponDef w = loadWeaponDef(f);
+            if (!w.id.empty()) {
+                g_weapons.push_back(w);
+                break;
+            }
+        }
+    }
+    if (g_weapons.empty())
+        g_weapons.push_back(defaultWeaponDef());
+
+    g_activeWeaponIndex = 0;
+    const WeaponDef& w0 = g_weapons[0];
+    g_lastWeaponId = w0.id;
+    g_lastCaliber = w0.caliber;
+    g_lastHitscan = w0.hitscan || caliberIsHitscan(w0.caliber);
+    g_lastAmmoId = w0.ammoId.empty() ? w0.ammo.id : w0.ammoId;
+    g_activeCaliberIndex = 1;
+    for (int i = 0; i < 4; ++i) {
+        if (w0.caliber == kCaliberIds[i]) { g_activeCaliberIndex = i; break; }
+    }
 }
 
 static void updateProjectiles(float dt) {
@@ -2087,11 +2340,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             g_projDefs.push_back(ProjectileDef{});
         }
 
+        // Weapon defs from data/weapons or build/weapons
+        tryLoadWeapons();
+
         auto mesh = meshAllChunks(chunks);
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "Chunks=%dx%dx%d voxel=%.4f verts=%zu projs=%zu\n",
-                      CHUNKS_X, CHUNKS_Y, CHUNKS_Z, VOXEL_SIZE, mesh.size(), g_projDefs.size());
+                      "Chunks=%dx%dx%d voxel=%.4f verts=%zu projs=%zu weapons=%zu\n",
+                      CHUNKS_X, CHUNKS_Y, CHUNKS_Z, VOXEL_SIZE, mesh.size(),
+                      g_projDefs.size(), g_weapons.size());
         OutputDebugStringA(msg);
         uploadMesh(mesh);
 
@@ -2115,11 +2372,30 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             if (dt > 0.05f) dt = 0.05f;
             float t = std::chrono::duration<float>(now - start).count();
 
-            // Functional smoke path: fly + fire gravity projectile into world
-if (g_smoke) {
-                // Orbit and tilt up so sky tiles + moon light source are in frame
+            if (g_fireCooldown > 0.0f) {
+                g_fireCooldown -= dt;
+                if (g_fireCooldown < 0.0f) g_fireCooldown = 0.0f;
+            }
+
+            // Functional smoke: fire ballistic + energy hitscan into bay, then sky orbit
+            if (g_smoke) {
                 g_yaw += dt * 0.20f;
-                g_pitch = 0.42f;
+                if (frames < 20) {
+                    // Look into warehouse bay for weapon impact coverage
+                    g_pitch = -0.12f;
+                    if (frames == 4) {
+                        g_activeCaliberIndex = 1; // medium ballistic
+                        g_fireCooldown = 0.0f;
+                        g_firePressed = true;
+                    }
+                    if (frames == 12) {
+                        g_activeCaliberIndex = 3; // energy_beam hitscan
+                        g_fireCooldown = 0.0f;
+                        g_firePressed = true;
+                    }
+                } else {
+                    g_pitch = 0.42f; // sky tiles + moon
+                }
             }
 
             if (g_firePressed) {
@@ -2155,6 +2431,13 @@ if (g_smoke) {
                 << "\ncam=" << g_camPos.x << "," << g_camPos.y << "," << g_camPos.z
                 << "\nyaw=" << g_yaw << "\npitch=" << g_pitch
                 << "\nprojectiles_loaded=" << g_projDefs.size()
+                << "\nweapons_loaded=" << g_weapons.size()
+                << "\nweapon_id=" << g_lastWeaponId
+                << "\ncaliber=" << g_lastCaliber
+                << "\nhitscan=" << (g_lastHitscan ? 1 : 0)
+                << "\nammo_id=" << g_lastAmmoId
+                << "\nballistic_shots=" << g_ballisticShots
+                << "\nhitscan_shots=" << g_hitscanShots
                 << "\ngravity=" << kWorldGravity
                 << "\nremesh_events=" << destroysApprox
                 << "\nwater_touch=" << g_touchingWaterUnits << "/" << g_characterUnitCount
@@ -2170,7 +2453,7 @@ if (g_smoke) {
                 << "\nmax_frame_ms=" << g_frameMsMax
                 << "\npace_hits=" << g_framePaceHits
                 << "\nsteady_frames=" << (g_frameMsCount > 15 ? (g_frameMsCount - 15) : 0)
-<< "\ntarget_hz=" << TARGET_HZ
+                << "\ntarget_hz=" << TARGET_HZ
                 << "\nlock_ok=" << ((g_frameMsCount > 40) && ((g_frameMsSum / double(g_frameMsCount - 15)) <= 9.0) ? 1 : 0)
                 << "\nsky_tiles=" << (SKY_SEG_U * SKY_SEG_V)
                 << "\nsky_verts=" << g_skyTileVertexCount
