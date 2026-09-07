@@ -30,6 +30,16 @@ MATERIALS: dict[str, Material] = {
     ),
     "girder": Material("girder", density=7.85, weight=1.40, fragility=0.12, toughness=4.20, damping=0.50),
     "water": Material("water", density=1.00, weight=1.00, fragility=1.00, toughness=0.05, damping=0.05),
+    # Weapon / structure materials (order after water; keep C++/painter IDs in sync).
+    "plexiglass": Material(
+        "plexiglass", density=1.18, weight=1.00, fragility=0.05, toughness=99.0, damping=0.20
+    ),  # indestructible in resolveVoxelHit
+    "carbon_fiber": Material(
+        "carbon_fiber", density=1.75, weight=0.70, fragility=0.22, toughness=3.80, damping=0.32
+    ),
+    "treated_wood": Material(
+        "treated_wood", density=0.78, weight=1.05, fragility=0.32, toughness=1.70, damping=0.38
+    ),
 }
 
 # Engine unit voxel edge length (1000x smaller than original 1.0 blocks).

@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 
 from effects.physics_loop import run_demo  # noqa: E402
+from projectiles.ammo import ammo_json  # noqa: E402
 from projectiles.defs import WORLD_GRAVITY, projectiles_json  # noqa: E402
 from projectiles.materials import materials_json  # noqa: E402
 
@@ -26,6 +27,7 @@ def main() -> int:
         "physics_engine": "pymunk",
         "materials": materials_json(),
         "projectiles": projectiles_json(),
+        "ammo": ammo_json(),
     }
 
     out_data = data_dir / "projectiles.json"

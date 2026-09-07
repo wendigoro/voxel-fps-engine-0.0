@@ -18,7 +18,10 @@ public final class MaterialPalette {
     public static final int SHEET_METAL = 6;
     public static final int GIRDER = 7;
     public static final int WATER = 8;
-    public static final int CUSTOM = 9; // free RGB (sky)
+    public static final int PLEXIGLASS = 9;
+    public static final int CARBON_FIBER = 10;
+    public static final int TREATED_WOOD = 11;
+    public static final int CUSTOM = 12; // free RGB (sky)
 
     public static final class Entry {
         public final int id;
@@ -46,6 +49,9 @@ public final class MaterialPalette {
         list.add(new Entry(SHEET_METAL, "sheet_metal", 0x7A8085));
         list.add(new Entry(GIRDER, "girder", 0x471A14));
         list.add(new Entry(WATER, "water", 0x1F4770));
+        list.add(new Entry(PLEXIGLASS, "plexiglass", 0xA8D4E6));
+        list.add(new Entry(CARBON_FIBER, "carbon_fiber", 0x1A1A1E));
+        list.add(new Entry(TREATED_WOOD, "treated_wood", 0x6B4423));
         list.add(new Entry(CUSTOM, "custom", 0xFFFFFF));
         ENTRIES = Collections.unmodifiableList(list);
         Map<String, Integer> map = new LinkedHashMap<>();

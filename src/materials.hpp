@@ -16,6 +16,9 @@ enum class MaterialId : uint8_t {
     SheetMetal,
     Girder,
     Water,
+    Plexiglass,
+    CarbonFiber,
+    TreatedWood,
     Count
 };
 
@@ -44,6 +47,9 @@ inline const MaterialProps& materialProps(MaterialId id) {
         {"sheet_metal",    7.80f,  0.55f,  0.35f,     2.10f,    0.28f},
         {"girder",         7.85f,  1.40f,  0.12f,     4.20f,    0.50f},
         {"water",          1.00f,  1.00f,  1.00f,     0.05f,    0.05f},
+        {"plexiglass",     1.18f,  1.00f,  0.05f,    99.00f,    0.20f},
+        {"carbon_fiber",   1.75f,  0.70f,  0.22f,     3.80f,    0.32f},
+        {"treated_wood",   0.78f,  1.05f,  0.32f,     1.70f,    0.38f},
     };
     const auto idx = static_cast<uint8_t>(id);
     if (idx >= static_cast<uint8_t>(MaterialId::Count)) return kTable[0];
@@ -71,5 +77,8 @@ inline MaterialId materialFromName(const std::string& name) {
     if (name == "sheet_metal") return MaterialId::SheetMetal;
     if (name == "girder") return MaterialId::Girder;
     if (name == "water") return MaterialId::Water;
+    if (name == "plexiglass") return MaterialId::Plexiglass;
+    if (name == "carbon_fiber") return MaterialId::CarbonFiber;
+    if (name == "treated_wood") return MaterialId::TreatedWood;
     return MaterialId::Air;
 }

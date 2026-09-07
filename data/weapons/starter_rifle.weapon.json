@@ -1,0 +1,28 @@
+{
+  "id": "starter_rifle",
+  "caliber": "medium",
+  "hitscan": false,
+  "fire_mode": "semi",
+  "damage": 12.0,
+  "impact": 9.0,
+  "recoil": 6.5,
+  "handling": 11.0,
+  "weight": 3.8,
+  "optic": 2.0,
+  "ammo_id": "fmj_medium",
+  "ammo": {
+    "id": "fmj_medium",
+    "caliber": "medium",
+    "effect_tags": ["ap"]
+  },
+  "parts": {
+    "barrel": 48,
+    "action": 22,
+    "bolt_chamber": 14,
+    "trigger": 6,
+    "grip_stock": 36,
+    "sight": 8
+  },
+  "unit": 1,
+  "voxel_size": 0.001
+}

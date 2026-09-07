@@ -20,8 +20,11 @@ class ProjectileType:
     gravity_scale: float = 1.0
     splash_radius: float = 0.0
     splash_falloff: float = 1.0
-    effect: str = "kinetic"  # kinetic | explosive | shred
+    effect: str = "kinetic"  # kinetic | explosive | shred | energy
     tags: list[str] = field(default_factory=list)
+    caliber: str = ""  # light | medium | heavy | energy
+    hitscan: bool = False
+    ammo_id: str = ""  # optional link into ammo table
 
 
 # Radii/speeds tuned for VOXEL_SIZE=0.001 warehouse grid.
@@ -73,6 +76,57 @@ PROJECTILES: list[ProjectileType] = [
         splash_falloff=1.1,
         effect="explosive",
         tags=["aoe"],
+    ),
+    # Caliber ballistic profiles (gravity projectiles).
+    ProjectileType(
+        id="light_ball",
+        mass=0.03,
+        speed=4.0,
+        radius=0.0015,
+        base_damage=6.0,
+        penetration=0.30,
+        gravity_scale=1.0,
+        effect="kinetic",
+        tags=["ballistic", "caliber"],
+        caliber="light",
+    ),
+    ProjectileType(
+        id="medium_ball",
+        mass=0.06,
+        speed=3.4,
+        radius=0.0022,
+        base_damage=11.0,
+        penetration=0.42,
+        gravity_scale=1.0,
+        effect="kinetic",
+        tags=["ballistic", "caliber"],
+        caliber="medium",
+    ),
+    ProjectileType(
+        id="heavy_ball",
+        mass=0.11,
+        speed=2.6,
+        radius=0.0032,
+        base_damage=16.0,
+        penetration=0.55,
+        gravity_scale=1.1,
+        effect="kinetic",
+        tags=["ballistic", "caliber"],
+        caliber="heavy",
+    ),
+    # Energy hitscan: no gravity, instant ray flag for engine-fire child.
+    ProjectileType(
+        id="energy_beam",
+        mass=0.01,
+        speed=80.0,
+        radius=0.0012,
+        base_damage=14.0,
+        penetration=0.70,
+        gravity_scale=0.0,
+        effect="energy",
+        tags=["energy", "hitscan"],
+        caliber="energy",
+        hitscan=True,
     ),
 ]
 

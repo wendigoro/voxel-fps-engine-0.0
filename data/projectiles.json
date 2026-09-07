@@ -65,6 +65,30 @@
       "fragility": 1.0,
       "toughness": 0.05,
       "damping": 0.05
+    },
+    {
+      "id": "plexiglass",
+      "density": 1.18,
+      "weight": 1.0,
+      "fragility": 0.05,
+      "toughness": 99.0,
+      "damping": 0.2
+    },
+    {
+      "id": "carbon_fiber",
+      "density": 1.75,
+      "weight": 0.7,
+      "fragility": 0.22,
+      "toughness": 3.8,
+      "damping": 0.32
+    },
+    {
+      "id": "treated_wood",
+      "density": 0.78,
+      "weight": 1.05,
+      "fragility": 0.32,
+      "toughness": 1.7,
+      "damping": 0.38
     }
   ],
   "projectiles": [
@@ -82,7 +106,10 @@
       "tags": [
         "default",
         "ballistic"
-      ]
+      ],
+      "caliber": "",
+      "hitscan": false,
+      "ammo_id": ""
     },
     {
       "id": "spike",
@@ -97,7 +124,10 @@
       "effect": "kinetic",
       "tags": [
         "ap"
-      ]
+      ],
+      "caliber": "",
+      "hitscan": false,
+      "ammo_id": ""
     },
     {
       "id": "shredder",
@@ -112,7 +142,10 @@
       "effect": "shred",
       "tags": [
         "anti_foliage"
-      ]
+      ],
+      "caliber": "",
+      "hitscan": false,
+      "ammo_id": ""
     },
     {
       "id": "impact_charge",
@@ -127,6 +160,150 @@
       "effect": "explosive",
       "tags": [
         "aoe"
+      ],
+      "caliber": "",
+      "hitscan": false,
+      "ammo_id": ""
+    },
+    {
+      "id": "light_ball",
+      "mass": 0.03,
+      "speed": 4.0,
+      "radius": 0.0015,
+      "base_damage": 6.0,
+      "penetration": 0.3,
+      "gravity_scale": 1.0,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "kinetic",
+      "tags": [
+        "ballistic",
+        "caliber"
+      ],
+      "caliber": "light",
+      "hitscan": false,
+      "ammo_id": ""
+    },
+    {
+      "id": "medium_ball",
+      "mass": 0.06,
+      "speed": 3.4,
+      "radius": 0.0022,
+      "base_damage": 11.0,
+      "penetration": 0.42,
+      "gravity_scale": 1.0,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "kinetic",
+      "tags": [
+        "ballistic",
+        "caliber"
+      ],
+      "caliber": "medium",
+      "hitscan": false,
+      "ammo_id": ""
+    },
+    {
+      "id": "heavy_ball",
+      "mass": 0.11,
+      "speed": 2.6,
+      "radius": 0.0032,
+      "base_damage": 16.0,
+      "penetration": 0.55,
+      "gravity_scale": 1.1,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "kinetic",
+      "tags": [
+        "ballistic",
+        "caliber"
+      ],
+      "caliber": "heavy",
+      "hitscan": false,
+      "ammo_id": ""
+    },
+    {
+      "id": "energy_beam",
+      "mass": 0.01,
+      "speed": 80.0,
+      "radius": 0.0012,
+      "base_damage": 14.0,
+      "penetration": 0.7,
+      "gravity_scale": 0.0,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "energy",
+      "tags": [
+        "energy",
+        "hitscan"
+      ],
+      "caliber": "energy",
+      "hitscan": true,
+      "ammo_id": ""
+    }
+  ],
+  "ammo": [
+    {
+      "id": "fmj_light",
+      "caliber": "light",
+      "grain": 55.0,
+      "mass_scale": 1.0,
+      "effect_tags": [
+        "ap"
+      ]
+    },
+    {
+      "id": "fmj_medium",
+      "caliber": "medium",
+      "grain": 120.0,
+      "mass_scale": 1.0,
+      "effect_tags": [
+        "ap"
+      ]
+    },
+    {
+      "id": "fmj_heavy",
+      "caliber": "heavy",
+      "grain": 220.0,
+      "mass_scale": 1.05,
+      "effect_tags": [
+        "ap"
+      ]
+    },
+    {
+      "id": "hollow_shred",
+      "caliber": "medium",
+      "grain": 100.0,
+      "mass_scale": 0.95,
+      "effect_tags": [
+        "shred"
+      ]
+    },
+    {
+      "id": "he_fragment",
+      "caliber": "heavy",
+      "grain": 180.0,
+      "mass_scale": 1.1,
+      "effect_tags": [
+        "explosive"
+      ]
+    },
+    {
+      "id": "incendiary_light",
+      "caliber": "light",
+      "grain": 50.0,
+      "mass_scale": 0.9,
+      "effect_tags": [
+        "incendiary"
+      ]
+    },
+    {
+      "id": "cell_energy",
+      "caliber": "energy",
+      "grain": 0.0,
+      "mass_scale": 1.0,
+      "effect_tags": [
+        "energy"
       ]
     }
   ]
