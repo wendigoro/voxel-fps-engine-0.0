@@ -17,7 +17,9 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JSlider;
 import voxel.painter.grid.MaterialPalette;
+import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxelGrid;
+import voxel.painter.grid.WeaponParts;
 
 public final class OrthoSlicePanel extends JPanel implements PainterModel.Listener {
     private final PainterModel model;
@@ -88,6 +90,19 @@ public final class OrthoSlicePanel extends JPanel implements PainterModel.Listen
     @Override
     public void sliceChanged() {
         refreshControls();
+    }
+
+
+    private static Color partTint(int part) {
+        return switch (part) {
+            case WeaponParts.BARREL -> new Color(220, 60, 60, 160);
+            case WeaponParts.ACTION -> new Color(220, 140, 40, 160);
+            case WeaponParts.BOLT_CHAMBER -> new Color(200, 200, 40, 160);
+            case WeaponParts.TRIGGER -> new Color(60, 180, 80, 160);
+            case WeaponParts.GRIP_STOCK -> new Color(80, 120, 220, 160);
+            case WeaponParts.SIGHT -> new Color(160, 80, 220, 160);
+            default -> new Color(255, 255, 255, 80);
+        };
     }
 
     private final class Canvas extends JPanel {
@@ -181,6 +196,13 @@ public final class OrthoSlicePanel extends JPanel implements PainterModel.Listen
                         if (rgb == 0) rgb = MaterialPalette.defaultRgb(mat);
                         g2.setColor(new Color(rgb));
                         g2.fillRect(px, py, cell, cell);
+                        if (model.document().mode == VoxDocument.Mode.WEAPON) {
+                            int part = grid.getPart(w[0], w[1], w[2]);
+                            if (part > 0) {
+                                g2.setColor(partTint(part));
+                                g2.fillRect(px, py, cell, Math.max(2, cell / 5));
+                            }
+                        }
                     }
                     if (cell >= 4) {
                         g2.setColor(new Color(0, 0, 0, 40));
