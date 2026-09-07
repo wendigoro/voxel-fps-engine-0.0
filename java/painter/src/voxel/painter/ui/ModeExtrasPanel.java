@@ -100,12 +100,16 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             SkyAndCharacter.paintCharacter(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
             model.markDirty();
         });
+        JButton bakeWeapon = new JButton("Bake starter rifle");
+        bakeWeapon.addActionListener(e -> model.bakeStarterWeapon());
         c.gridy = 4;
         c.gridx = 0;
         c.gridwidth = 2;
         add(bakeSky, c);
         c.gridx = 2;
         add(bakeChar, c);
+        c.gridx = 4;
+        add(bakeWeapon, c);
 
         for (JSpinner s : new JSpinner[] {segU, segV, moonX, moonY, moonZ, moonI, feetX, feetY, feetZ}) {
             s.addChangeListener(ev -> push());
@@ -133,11 +137,16 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         syncing = true;
         try {
             VoxDocument doc = model.document();
+            String extra = "";
+            if (doc.mode == VoxDocument.Mode.WEAPON) {
+                extra = " cal=" + doc.caliber + " ammo=" + doc.ammoId;
+            }
             modeLabel.setText(
                     "Active: " + doc.modeName()
                             + "  unit=" + doc.unit
                             + " voxel_size=" + VoxelGrid.VOXEL_SIZE
-                            + "  solids=" + doc.grid.solidCount());
+                            + "  solids=" + doc.grid.solidCount()
+                            + extra);
             segU.setValue(doc.segU);
             segV.setValue(doc.segV);
             moonX.setValue((double) doc.moonDirX);

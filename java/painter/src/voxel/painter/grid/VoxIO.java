@@ -30,9 +30,13 @@ public final class VoxIO {
                     .append(doc.moonDirY).append(", ").append(doc.moonDirZ).append("],\n");
             sb.append("  \"moon_intensity\": ").append(doc.moonIntensity).append(",\n");
         }
-        if (doc.mode == VoxDocument.Mode.CHARACTER) {
+if (doc.mode == VoxDocument.Mode.CHARACTER) {
             sb.append("  \"feet\": [").append(doc.feetX).append(", ")
                     .append(doc.feetY).append(", ").append(doc.feetZ).append("],\n");
+        }
+        if (doc.mode == VoxDocument.Mode.WEAPON) {
+            sb.append("  \"caliber\": \"").append(doc.caliber).append("\",\n");
+            sb.append("  \"ammo_id\": \"").append(doc.ammoId).append("\",\n");
         }
         sb.append("  \"voxels\": [\n");
         List<String> rows = new ArrayList<>();
@@ -43,9 +47,16 @@ public final class VoxIO {
                     int m = g.getMat(x, y, z);
                     if (m == MaterialPalette.AIR && g.getRgb(x, y, z) == 0) continue;
                     int rgb = g.getRgb(x, y, z);
-                    rows.add(String.format(Locale.ROOT,
-                            "    {\"x\":%d,\"y\":%d,\"z\":%d,\"mat\":\"%s\",\"rgb\":%d}",
-                            x, y, z, MaterialPalette.nameFromId(m), rgb));
+                    int part = g.getPart(x, y, z);
+                    if (part > 0) {
+                        rows.add(String.format(Locale.ROOT,
+                                "    {\"x\":%d,\"y\":%d,\"z\":%d,\"mat\":\"%s\",\"rgb\":%d,\"part\":\"%s\"}",
+                                x, y, z, MaterialPalette.nameFromId(m), rgb, WeaponParts.name(part)));
+                    } else {
+                        rows.add(String.format(Locale.ROOT,
+                                "    {\"x\":%d,\"y\":%d,\"z\":%d,\"mat\":\"%s\",\"rgb\":%d}",
+                                x, y, z, MaterialPalette.nameFromId(m), rgb));
+                    }
                 }
         sb.append(String.join(",\n", rows));
         if (!rows.isEmpty()) sb.append('\n');
@@ -65,10 +76,12 @@ public final class VoxIO {
         doc.moonDirX = moon[0]; doc.moonDirY = moon[1]; doc.moonDirZ = moon[2];
         doc.moonIntensity = findFloat(text, "moon_intensity", 0.95f);
         int[] feet = findIntArray(text, "feet", new int[]{0, 0, 0});
-        doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
+doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
+        doc.caliber = findString(text, "caliber", doc.caliber);
+        doc.ammoId = findString(text, "ammo_id", doc.ammoId);
 
         Matcher vm = Pattern.compile(
-                "\\{\\s*\"x\"\\s*:\\s*(\\d+)\\s*,\\s*\"y\"\\s*:\\s*(\\d+)\\s*,\\s*\"z\"\\s*:\\s*(\\d+)\\s*,\\s*\"mat\"\\s*:\\s*\"([^\"]+)\"\\s*,\\s*\"rgb\"\\s*:\\s*(\\d+)\\s*\\}")
+                "\\{\\s*\"x\"\\s*:\\s*(\\d+)\\s*,\\s*\"y\"\\s*:\\s*(\\d+)\\s*,\\s*\"z\"\\s*:\\s*(\\d+)\\s*,\\s*\"mat\"\\s*:\\s*\"([^\"]+)\"\\s*,\\s*\"rgb\"\\s*:\\s*(\\d+)(?:\\s*,\\s*\"part\"\\s*:\\s*\"([^\"]+)\")?\\s*\\}")
                 .matcher(text);
         while (vm.find()) {
             int x = Integer.parseInt(vm.group(1));
@@ -76,7 +89,8 @@ public final class VoxIO {
             int z = Integer.parseInt(vm.group(3));
             int mat = MaterialPalette.idFromName(vm.group(4));
             int rgb = Integer.parseInt(vm.group(5));
-            doc.grid.set(x, y, z, mat, rgb);
+            int part = vm.group(6) != null ? WeaponParts.idFromName(vm.group(6)) : 0;
+            doc.grid.set(x, y, z, mat, rgb, part);
         }
         doc.grid.assertCubicUnitInvariant();
         return doc;

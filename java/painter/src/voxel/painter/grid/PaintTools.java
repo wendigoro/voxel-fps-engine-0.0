@@ -12,26 +12,29 @@ public final class PaintTools {
     public int matB = MaterialPalette.WOOD;
     public int rgbB = MaterialPalette.defaultRgb(MaterialPalette.WOOD);
     public boolean useB;
-    public BrushShape shape = BrushShape.CUBE;
+public BrushShape shape = BrushShape.CUBE;
     public int brushSize = 1; // odd preferred: 1,3,5
+    /** Active weapon part id (0=none) applied on paint when non-zero. */
+    public int activePart = WeaponParts.NONE;
 
     public int activeMat() { return useB ? matB : matA; }
     public int activeRgb() { return useB ? rgbB : rgbA; }
 
     public void toggleAlternate() { useB = !useB; }
 
-    public void paintAt(VoxelGrid g, int cx, int cy, int cz) {
+public void paintAt(VoxelGrid g, int cx, int cy, int cz) {
         g.assertCubicUnitInvariant();
         int mat = activeMat();
         int rgb = activeRgb();
+        int part = activePart;
         int r = Math.max(0, brushSize / 2);
         switch (shape) {
-            case POINT -> g.set(cx, cy, cz, mat, rgb);
+            case POINT -> g.set(cx, cy, cz, mat, rgb, part);
             case CUBE -> {
                 for (int z = cz - r; z <= cz + r; z++)
                     for (int y = cy - r; y <= cy + r; y++)
                         for (int x = cx - r; x <= cx + r; x++)
-                            g.set(x, y, z, mat, rgb);
+                            g.set(x, y, z, mat, rgb, part);
             }
             case SPHERE -> {
                 int r2 = r * r;
@@ -40,10 +43,10 @@ public final class PaintTools {
                         for (int x = cx - r; x <= cx + r; x++) {
                             int dx = x - cx, dy = y - cy, dz = z - cz;
                             if (dx * dx + dy * dy + dz * dz <= r2)
-                                g.set(x, y, z, mat, rgb);
+                                g.set(x, y, z, mat, rgb, part);
                         }
             }
-            case LINE -> g.set(cx, cy, cz, mat, rgb); // single step; use paintLine for spans
+            case LINE -> g.set(cx, cy, cz, mat, rgb, part);
         }
     }
 
@@ -83,8 +86,8 @@ public final class PaintTools {
             int id = (y * g.sizeZ() + z) * g.sizeX() + x;
             if (seen[id]) continue;
             if (g.getMat(x, y, z) != target) continue;
-            seen[id] = true;
-            g.set(x, y, z, mat, rgb);
+seen[id] = true;
+            g.set(x, y, z, mat, rgb, activePart);
             for (int[] d : dirs) q.add(new int[]{x + d[0], y + d[1], z + d[2]});
         }
     }
@@ -114,8 +117,9 @@ public final class PaintTools {
         for (int z = z0; z <= z1; z++)
             for (int y = y0; y <= y1; y++)
                 for (int x = x0; x <= x1; x++) {
-                    int m = snap.getMat(x, y, z);
+int m = snap.getMat(x, y, z);
                     int c = snap.getRgb(x, y, z);
+                    int p = snap.getPart(x, y, z);
                     if (m == MaterialPalette.AIR) continue;
                     int bx = x0 + (x - x0) * fx;
                     int by = y0 + (y - y0) * fy;
@@ -123,7 +127,7 @@ public final class PaintTools {
                     for (int dz = 0; dz < fz; dz++)
                         for (int dy = 0; dy < fy; dy++)
                             for (int dx = 0; dx < fx; dx++)
-                                g.set(bx + dx, by + dy, bz + dz, m, c);
+                                g.set(bx + dx, by + dy, bz + dz, m, c, p);
                 }
     }
 

@@ -9,6 +9,7 @@ import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.SkyAndCharacter;
 import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxelGrid;
+import voxel.painter.grid.WeaponParts;
 
 /** Shared mutable session state over real voxel.painter.grid types. */
 public final class PainterModel {
@@ -67,10 +68,11 @@ public final class PainterModel {
         fireSlice();
     }
 
-    public void newDocument(VoxDocument.Mode mode) {
+public void newDocument(VoxDocument.Mode mode) {
         VoxDocument doc = switch (mode) {
             case SKY -> new VoxDocument(VoxDocument.Mode.SKY, 28, 1, 14);
             case CHARACTER -> new VoxDocument(VoxDocument.Mode.CHARACTER, 24, 16, 12);
+            case WEAPON -> new VoxDocument(VoxDocument.Mode.WEAPON, 24, 12, 12);
             default -> new VoxDocument(VoxDocument.Mode.MODEL, 32, 24, 32);
         };
         if (mode == VoxDocument.Mode.SKY) {
@@ -79,10 +81,40 @@ public final class PainterModel {
         } else if (mode == VoxDocument.Mode.CHARACTER) {
             doc.feetX = 8; doc.feetY = 0; doc.feetZ = 4;
             SkyAndCharacter.paintCharacter(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
+        } else if (mode == VoxDocument.Mode.WEAPON) {
+            doc.caliber = "medium";
+            doc.ammoId = "medium_fmj";
+            WeaponParts.paintStarterRifle(doc.grid);
+            tools.activePart = WeaponParts.BARREL;
         } else {
             seedDemo(doc);
         }
         setDocument(doc, null, true);
+    }
+
+    public void setActivePart(int partId) {
+        tools.activePart = partId;
+        fireTools();
+    }
+
+    public int activePart() { return tools.activePart; }
+
+    public void setCaliber(String caliber) {
+        if (caliber != null) document.caliber = caliber;
+        fireDoc();
+    }
+
+    public void bakeStarterWeapon() {
+        if (document.mode != VoxDocument.Mode.WEAPON) {
+            newDocument(VoxDocument.Mode.WEAPON);
+            return;
+        }
+        WeaponParts.paintStarterRifle(document.grid);
+        markDirty();
+    }
+
+    public WeaponParts.Stats weaponStats() {
+        return WeaponParts.compose(document.grid, document.caliber);
     }
 
     public static void seedDemo(VoxDocument doc) {
@@ -269,7 +301,13 @@ public final class PainterModel {
         bits.add(uiTool.name().toLowerCase());
         bits.add(tools.shape.name().toLowerCase());
         bits.add("size=" + tools.brushSize);
-        bits.add("mat=" + MaterialPalette.nameFromId(tools.activeMat()) + (tools.useB ? "(B)" : "(A)"));
+bits.add("mat=" + MaterialPalette.nameFromId(tools.activeMat()) + (tools.useB ? "(B)" : "(A)"));
+        if (document.mode == VoxDocument.Mode.WEAPON) {
+            bits.add("part=" + WeaponParts.name(tools.activePart));
+            bits.add("cal=" + document.caliber);
+            WeaponParts.Stats st = WeaponParts.compose(document.grid, document.caliber);
+            bits.add(String.format("dmg=%.1f imp=%.1f rec=%.1f hnd=%.1f w=%.1f", st.damage, st.impact, st.recoil, st.handling, st.weight));
+        }
         bits.add("slice=" + sliceAxis + ":" + sliceIndex);
         bits.add("unit=" + grid().unitSizeX() + "=" + grid().unitSizeY() + "=" + grid().unitSizeZ());
         bits.add("VOXEL_SIZE=" + VoxelGrid.VOXEL_SIZE);

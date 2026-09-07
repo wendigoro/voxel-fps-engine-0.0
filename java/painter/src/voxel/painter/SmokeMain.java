@@ -7,6 +7,7 @@ import voxel.painter.grid.SkyAndCharacter;
 import voxel.painter.grid.VoxelGrid;
 import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxIO;
+import voxel.painter.grid.WeaponParts;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -97,8 +98,28 @@ public final class SmokeMain {
         if (crushed.length != sky.grid.sizeZ() * 32 || crushed[0].length != sky.grid.sizeX() * 32) {
             throw new IllegalStateException("bitcrush dims wrong");
         }
-        // occupancy unchanged
+// occupancy unchanged
         sky.grid.assertCubicUnitInvariant();
+
+        // --- weapon parts ---
+        VoxDocument weapon = new VoxDocument(VoxDocument.Mode.WEAPON, 24, 12, 12);
+        weapon.caliber = "medium";
+        weapon.ammoId = "medium_fmj";
+        WeaponParts.paintStarterRifle(weapon.grid);
+        weapon.grid.assertCubicUnitInvariant();
+        WeaponParts.Stats stats = WeaponParts.compose(weapon.grid, weapon.caliber);
+        if (stats.damage <= 0 || stats.partCounts.getOrDefault("barrel", 0) < 1)
+            throw new IllegalStateException("weapon stats/parts missing");
+        Path weaponsDir = root.resolve("data").resolve("weapons");
+        Files.createDirectories(weaponsDir);
+        Path buildWeapons = root.resolve("build").resolve("weapons");
+        Files.createDirectories(buildWeapons);
+        Path wVox = outDir.resolve("smoke_weapon.vox.json");
+        VoxIO.save(weapon, wVox);
+        Path wJson = weaponsDir.resolve("starter_rifle.weapon.json");
+        WeaponParts.exportWeaponJson(wJson, "starter_rifle", stats, weapon.ammoId);
+        Files.copy(wJson, buildWeapons.resolve("starter_rifle.weapon.json"),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
         Path ok = root.resolve("build").resolve("painter").resolve("painter_smoke_ok.txt");
         Files.createDirectories(ok.getParent());
@@ -109,6 +130,9 @@ public final class SmokeMain {
                 + "model_solids=" + loaded.grid.solidCount() + "\n"
                 + "sky_solids=" + sky.grid.solidCount() + "\n"
                 + "character_solids=" + character.grid.solidCount() + "\n"
+                + "weapon_solids=" + weapon.grid.solidCount() + "\n"
+                + "weapon_damage=" + stats.damage + "\n"
+                + "weapon_caliber=" + stats.caliber + "\n"
                 + "bitcrush_w=" + crushed[0].length + "\n"
                 + "bitcrush_h=" + crushed.length + "\n"
                 + "cubic_ok=1\n";
