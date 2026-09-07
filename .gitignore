@@ -22,3 +22,6 @@ effects_demo.json
 *.log
 __pycache__/
 *.pyc
+
+java/painter/out/
+
