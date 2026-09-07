@@ -65,6 +65,30 @@
       "fragility": 1.0,
       "toughness": 0.05,
       "damping": 0.05
+    },
+    {
+      "id": "plexiglass",
+      "density": 1.2,
+      "weight": 0.4,
+      "fragility": 0.0,
+      "toughness": 9999.0,
+      "damping": 0.95
+    },
+    {
+      "id": "carbon_fiber",
+      "density": 1.75,
+      "weight": 0.45,
+      "fragility": 0.25,
+      "toughness": 2.8,
+      "damping": 0.22
+    },
+    {
+      "id": "treated_wood",
+      "density": 0.75,
+      "weight": 0.95,
+      "fragility": 0.35,
+      "toughness": 1.5,
+      "damping": 0.42
     }
   ],
   "projectiles": [
@@ -82,7 +106,10 @@
       "tags": [
         "default",
         "ballistic"
-      ]
+      ],
+      "caliber": "medium",
+      "hitscan": 0,
+      "grain": 0.0
     },
     {
       "id": "spike",
@@ -97,7 +124,10 @@
       "effect": "kinetic",
       "tags": [
         "ap"
-      ]
+      ],
+      "caliber": "medium",
+      "hitscan": 0,
+      "grain": 0.0
     },
     {
       "id": "shredder",
@@ -112,7 +142,10 @@
       "effect": "shred",
       "tags": [
         "anti_foliage"
-      ]
+      ],
+      "caliber": "medium",
+      "hitscan": 0,
+      "grain": 0.0
     },
     {
       "id": "impact_charge",
@@ -127,7 +160,260 @@
       "effect": "explosive",
       "tags": [
         "aoe"
-      ]
+      ],
+      "caliber": "medium",
+      "hitscan": 0,
+      "grain": 0.0
+    },
+    {
+      "id": "light_ball",
+      "mass": 0.035,
+      "speed": 4.2,
+      "radius": 0.0016,
+      "base_damage": 6.5,
+      "penetration": 0.35,
+      "gravity_scale": 0.85,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "kinetic",
+      "tags": [
+        "caliber",
+        "light",
+        "ballistic"
+      ],
+      "caliber": "light",
+      "hitscan": 0,
+      "grain": 0.0
+    },
+    {
+      "id": "medium_ball",
+      "mass": 0.06,
+      "speed": 3.2,
+      "radius": 0.0025,
+      "base_damage": 10.0,
+      "penetration": 0.4,
+      "gravity_scale": 1.0,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "kinetic",
+      "tags": [
+        "caliber",
+        "medium",
+        "ballistic"
+      ],
+      "caliber": "medium",
+      "hitscan": 0,
+      "grain": 0.0
+    },
+    {
+      "id": "heavy_ball",
+      "mass": 0.14,
+      "speed": 2.1,
+      "radius": 0.0035,
+      "base_damage": 16.0,
+      "penetration": 0.45,
+      "gravity_scale": 1.25,
+      "splash_radius": 0.004,
+      "splash_falloff": 1.2,
+      "effect": "kinetic",
+      "tags": [
+        "caliber",
+        "heavy",
+        "ballistic"
+      ],
+      "caliber": "heavy",
+      "hitscan": 0,
+      "grain": 0.0
+    },
+    {
+      "id": "energy_beam",
+      "mass": 0.001,
+      "speed": 50.0,
+      "radius": 0.0015,
+      "base_damage": 12.0,
+      "penetration": 0.7,
+      "gravity_scale": 0.0,
+      "splash_radius": 0.0,
+      "splash_falloff": 1.0,
+      "effect": "energy",
+      "tags": [
+        "caliber",
+        "energy",
+        "hitscan"
+      ],
+      "caliber": "energy",
+      "hitscan": 1,
+      "grain": 0.0
     }
+  ],
+  "ammo": [
+    {
+      "id": "light_fmj",
+      "caliber": "light",
+      "grain": 55,
+      "mass_scale": 0.85,
+      "damage_scale": 0.9,
+      "penetration_scale": 0.9,
+      "gravity_scale": 0.9,
+      "hitscan": false,
+      "effect": "kinetic",
+      "effect_tags": [
+        "ballistic",
+        "fmj"
+      ],
+      "notes": "light FMJ"
+    },
+    {
+      "id": "light_hp",
+      "caliber": "light",
+      "grain": 50,
+      "mass_scale": 0.8,
+      "damage_scale": 1.05,
+      "penetration_scale": 0.55,
+      "gravity_scale": 0.9,
+      "hitscan": false,
+      "effect": "kinetic",
+      "effect_tags": [
+        "ballistic",
+        "hollow_point"
+      ],
+      "notes": "light HP"
+    },
+    {
+      "id": "light_ap",
+      "caliber": "light",
+      "grain": 62,
+      "mass_scale": 0.9,
+      "damage_scale": 0.95,
+      "penetration_scale": 1.35,
+      "gravity_scale": 0.88,
+      "hitscan": false,
+      "effect": "kinetic",
+      "effect_tags": [
+        "ballistic",
+        "ap"
+      ],
+      "notes": "light AP"
+    },
+    {
+      "id": "medium_fmj",
+      "caliber": "medium",
+      "grain": 150,
+      "mass_scale": 1.0,
+      "damage_scale": 1.0,
+      "penetration_scale": 1.0,
+      "gravity_scale": 1.0,
+      "hitscan": false,
+      "effect": "kinetic",
+      "effect_tags": [
+        "ballistic",
+        "fmj"
+      ],
+      "notes": "medium default"
+    },
+    {
+      "id": "medium_tracer",
+      "caliber": "medium",
+      "grain": 145,
+      "mass_scale": 1.0,
+      "damage_scale": 1.0,
+      "penetration_scale": 0.95,
+      "gravity_scale": 1.0,
+      "hitscan": false,
+      "effect": "kinetic",
+      "effect_tags": [
+        "ballistic",
+        "tracer"
+      ],
+      "notes": "tracer hook"
+    },
+    {
+      "id": "medium_shred",
+      "caliber": "medium",
+      "grain": 140,
+      "mass_scale": 0.95,
+      "damage_scale": 0.9,
+      "penetration_scale": 0.7,
+      "gravity_scale": 1.0,
+      "hitscan": false,
+      "effect": "shred",
+      "effect_tags": [
+        "ballistic",
+        "shred"
+      ],
+      "notes": "shred subtype"
+    },
+    {
+      "id": "heavy_fmj",
+      "caliber": "heavy",
+      "grain": 220,
+      "mass_scale": 1.35,
+      "damage_scale": 1.35,
+      "penetration_scale": 1.1,
+      "gravity_scale": 1.2,
+      "hitscan": false,
+      "effect": "kinetic",
+      "effect_tags": [
+        "ballistic",
+        "fmj"
+      ],
+      "notes": "heavy slug"
+    },
+    {
+      "id": "heavy_he",
+      "caliber": "heavy",
+      "grain": 210,
+      "mass_scale": 1.4,
+      "damage_scale": 1.5,
+      "penetration_scale": 0.6,
+      "gravity_scale": 1.25,
+      "hitscan": false,
+      "effect": "explosive",
+      "effect_tags": [
+        "ballistic",
+        "explosive",
+        "he"
+      ],
+      "notes": "HE shell \u2014 splash later"
+    },
+    {
+      "id": "energy_bolt",
+      "caliber": "energy",
+      "grain": 100,
+      "mass_scale": 0.01,
+      "damage_scale": 1.1,
+      "penetration_scale": 1.2,
+      "gravity_scale": 0.0,
+      "hitscan": true,
+      "effect": "energy",
+      "effect_tags": [
+        "hitscan",
+        "energy"
+      ],
+      "notes": "default beam charge"
+    },
+    {
+      "id": "energy_pierce",
+      "caliber": "energy",
+      "grain": 120,
+      "mass_scale": 0.01,
+      "damage_scale": 0.95,
+      "penetration_scale": 1.8,
+      "gravity_scale": 0.0,
+      "hitscan": true,
+      "effect": "energy",
+      "effect_tags": [
+        "hitscan",
+        "energy",
+        "pierce"
+      ],
+      "notes": "pierce charge \u2014 multi-hit later"
+    }
+  ],
+  "calibers": [
+    "light",
+    "medium",
+    "heavy",
+    "energy"
   ]
 }

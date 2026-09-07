@@ -1,0 +1,24 @@
+{
+  "id": "starter_rifle",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "medium",
+  "hitscan": 0,
+  "ammo_id": "medium_fmj",
+  "stats": {
+    "damage": 20.605,
+    "impact": 35.160,
+    "recoil": 15.390,
+    "handling": 7.497,
+    "weight": 17.033,
+    "optic": 8.000
+  },
+  "parts": {
+    "barrel": 8,
+    "action": 10,
+    "bolt_chamber": 2,
+    "trigger": 1,
+    "grip_stock": 15,
+    "sight": 2
+  }
+}

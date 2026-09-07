@@ -21,7 +21,11 @@ struct ProjectileDef {
     float gravityScale = 1.0f;
     float splashRadius = 0.0f;  // world units
     float splashFalloff = 1.0f;
-    std::string effect = "kinetic"; // kinetic | explosive | shred
+    std::string effect = "kinetic"; // kinetic | explosive | shred | energy
+    std::string caliber = "medium"; // light | medium | heavy | energy
+    bool hitscan = false;
+    float grain = 0.0f;         // ammo grain proxy (integration)
+    std::string ammoId;         // optional ammo subtype id
 };
 
 struct ImpactEvent {
@@ -108,7 +112,14 @@ inline std::vector<ProjectileDef> loadProjectileDefs(const std::string& path) {
         d.gravityScale = jsonExtractFloat(obj, "gravity_scale", d.gravityScale);
         d.splashRadius = jsonExtractFloat(obj, "splash_radius", d.splashRadius);
         d.splashFalloff = jsonExtractFloat(obj, "splash_falloff", d.splashFalloff);
-        d.effect = jsonExtractString(obj, "effect", "kinetic");
+d.effect = jsonExtractString(obj, "effect", "kinetic");
+        d.caliber = jsonExtractString(obj, "caliber", d.caliber);
+        d.ammoId = jsonExtractString(obj, "ammo_id", "");
+        d.grain = jsonExtractFloat(obj, "grain", d.grain);
+        // hitscan: explicit flag or energy effect/caliber
+        d.hitscan = (jsonExtractFloat(obj, "hitscan", 0.0f) > 0.5f) ||
+                    d.effect == "energy" || d.caliber == "energy";
+        if (d.hitscan) d.gravityScale = 0.0f;
         out.push_back(d);
     }
     return out;
@@ -123,6 +134,11 @@ inline ProjectileDef findProjectile(const std::vector<ProjectileDef>& defs, cons
 // Returns true if voxel should be destroyed; updates remainingEnergy.
 inline bool resolveVoxelHit(MaterialId mat, float& remainingEnergy, float penetration) {
     if (mat == MaterialId::Air) return false;
+    // Optics plexiglass is indestructible (integration: absorbs, never breaks).
+    if (mat == MaterialId::Plexiglass) {
+        remainingEnergy *= 0.15f;
+        return false;
+    }
     const auto& m = materialProps(mat);
     const float thr = breakEnergyThreshold(mat);
     if (remainingEnergy < thr) {

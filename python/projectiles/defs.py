@@ -20,7 +20,10 @@ class ProjectileType:
     gravity_scale: float = 1.0
     splash_radius: float = 0.0
     splash_falloff: float = 1.0
-    effect: str = "kinetic"  # kinetic | explosive | shred
+    effect: str = "kinetic"  # kinetic | explosive | shred | energy
+    caliber: str = "medium"  # light | medium | heavy | energy
+    hitscan: bool = False
+    grain: float = 0.0
     tags: list[str] = field(default_factory=list)
 
 
@@ -61,7 +64,7 @@ PROJECTILES: list[ProjectileType] = [
         effect="shred",
         tags=["anti_foliage"],
     ),
-    ProjectileType(
+ProjectileType(
         id="impact_charge",
         mass=0.12,
         speed=2.0,
@@ -73,6 +76,53 @@ PROJECTILES: list[ProjectileType] = [
         splash_falloff=1.1,
         effect="explosive",
         tags=["aoe"],
+    ),
+    # --- caliber class profiles (weapon system) ---
+    ProjectileType(
+        id="light_ball",
+        mass=0.035,
+        speed=4.2,
+        radius=0.0016,
+        base_damage=6.5,
+        penetration=0.35,
+        gravity_scale=0.85,
+        effect="kinetic",
+        tags=["caliber", "light", "ballistic"],
+    ),
+    ProjectileType(
+        id="medium_ball",
+        mass=0.06,
+        speed=3.2,
+        radius=0.0025,
+        base_damage=10.0,
+        penetration=0.40,
+        gravity_scale=1.0,
+        effect="kinetic",
+        tags=["caliber", "medium", "ballistic"],
+    ),
+    ProjectileType(
+        id="heavy_ball",
+        mass=0.14,
+        speed=2.1,
+        radius=0.0035,
+        base_damage=16.0,
+        penetration=0.45,
+        gravity_scale=1.25,
+        splash_radius=0.004,
+        splash_falloff=1.2,
+        effect="kinetic",
+        tags=["caliber", "heavy", "ballistic"],
+    ),
+    ProjectileType(
+        id="energy_beam",
+        mass=0.001,
+        speed=50.0,  # unused when hitscan
+        radius=0.0015,
+        base_damage=12.0,
+        penetration=0.7,
+        gravity_scale=0.0,
+        effect="energy",
+        tags=["caliber", "energy", "hitscan"],
     ),
 ]
 

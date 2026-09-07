@@ -25,6 +25,8 @@ import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingConstants;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.PaintTools;
+import voxel.painter.grid.WeaponParts;
+import javax.swing.JComboBox;
 
 public final class ToolDockPanel extends JPanel implements PainterModel.Listener {
     private final PainterModel model;
@@ -96,6 +98,33 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
         alt.setAlignmentX(LEFT_ALIGNMENT);
         alt.addActionListener(e -> model.toggleAlt());
         add(alt);
+
+add(Box.createVerticalStrut(8));
+        add(title("Weapon part"));
+        JComboBox<String> partBox = new JComboBox<>(new String[]{
+                "none", "barrel", "action", "bolt_chamber", "trigger", "grip_stock", "sight"
+        });
+        partBox.setSelectedItem(WeaponParts.name(model.activePart()));
+        partBox.setAlignmentX(LEFT_ALIGNMENT);
+        partBox.addActionListener(e -> {
+            if (!syncing) {
+                String p = (String) partBox.getSelectedItem();
+                model.setActivePart(WeaponParts.idFromName(p));
+            }
+        });
+        add(partBox);
+        JComboBox<String> calBox = new JComboBox<>(new String[]{"light", "medium", "heavy", "energy"});
+        calBox.setSelectedItem(model.document().caliber == null ? "medium" : model.document().caliber);
+        calBox.setAlignmentX(LEFT_ALIGNMENT);
+        calBox.addActionListener(e -> {
+            if (!syncing) model.setCaliber((String) calBox.getSelectedItem());
+        });
+        add(new JLabel("Caliber"));
+        add(calBox);
+        JButton bakeW = new JButton("Bake starter rifle");
+        bakeW.setAlignmentX(LEFT_ALIGNMENT);
+        bakeW.addActionListener(e -> model.bakeStarterWeapon());
+        add(bakeW);
 
         add(Box.createVerticalStrut(8));
         add(title("Materials"));

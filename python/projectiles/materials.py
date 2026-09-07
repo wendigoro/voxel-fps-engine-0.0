@@ -29,7 +29,16 @@ MATERIALS: dict[str, Material] = {
         "sheet_metal", density=7.80, weight=0.55, fragility=0.35, toughness=2.10, damping=0.28
     ),
     "girder": Material("girder", density=7.85, weight=1.40, fragility=0.12, toughness=4.20, damping=0.50),
-    "water": Material("water", density=1.00, weight=1.00, fragility=1.00, toughness=0.05, damping=0.05),
+"water": Material("water", density=1.00, weight=1.00, fragility=1.00, toughness=0.05, damping=0.05),
+    "plexiglass": Material(
+        "plexiglass", density=1.20, weight=0.40, fragility=0.00, toughness=9999.0, damping=0.95
+    ),
+    "carbon_fiber": Material(
+        "carbon_fiber", density=1.75, weight=0.45, fragility=0.25, toughness=2.80, damping=0.22
+    ),
+    "treated_wood": Material(
+        "treated_wood", density=0.75, weight=0.95, fragility=0.35, toughness=1.50, damping=0.42
+    ),
 }
 
 # Engine unit voxel edge length (1000x smaller than original 1.0 blocks).
