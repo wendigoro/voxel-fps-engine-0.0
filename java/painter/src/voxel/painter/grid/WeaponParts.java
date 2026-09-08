@@ -46,6 +46,7 @@ public final class WeaponParts {
     public static final class Stats {
         public float damage, impact, recoil, handling, weight, optic;
         public String caliber = "medium";
+        public String fireMode = "semi"; // semi | auto | bolt
         public boolean hitscan;
         public Map<String, Integer> partCounts = new LinkedHashMap<>();
     }
@@ -54,7 +55,10 @@ public final class WeaponParts {
         g.assertCubicUnitInvariant();
         Stats s = new Stats();
         s.caliber = caliber == null ? "medium" : caliber;
-        s.hitscan = "energy".equalsIgnoreCase(s.caliber);
+        s.hitscan = "energy".equalsIgnoreCase(s.caliber)
+                || "energy_beam".equalsIgnoreCase(s.caliber);
+        // Default cadence from part balance: long barrel+bolt leans bolt-action; light trigger leans auto.
+        s.fireMode = "semi";
         int[] counts = new int[7];
         float[] mass = new float[7];
         for (int y = 0; y < g.sizeY(); y++)
@@ -84,6 +88,9 @@ public final class WeaponParts {
             s.damage *= 1.35f; s.recoil *= 1.4f; s.impact *= 1.2f; s.weight *= 1.25f;
         }
         s.handling = Math.max(0.5f, s.handling);
+        if (counts[BOLT_CHAMBER] >= 3 && counts[BARREL] >= 10) s.fireMode = "bolt";
+        else if (counts[TRIGGER] >= 2 && counts[BOLT_CHAMBER] <= 1) s.fireMode = "auto";
+        else s.fireMode = "semi";
         return s;
     }
 
@@ -128,6 +135,8 @@ public final class WeaponParts {
         sb.append("  \"voxel_size\": 0.001,\n");
         sb.append("  \"caliber\": \"").append(stats.caliber).append("\",\n");
         sb.append("  \"hitscan\": ").append(stats.hitscan ? 1 : 0).append(",\n");
+        String fm = stats.fireMode == null ? "semi" : stats.fireMode;
+        sb.append("  \"fire_mode\": \"").append(fm).append("\",\n");
         sb.append("  \"ammo_id\": \"").append(ammoId == null ? "" : ammoId).append("\",\n");
         sb.append("  \"stats\": {\n");
         sb.append(String.format(Locale.ROOT, "    \"damage\": %.3f,\n", stats.damage));

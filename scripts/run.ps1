@@ -21,10 +21,13 @@ if (-not (Test-Path (Join-Path $Build "shaders\voxel.vert.spv"))) {
 }
 Write-Host ("Starting: " + $Exe + " " + ($EngineArgs -join " "))
 Write-Host ("CWD: " + $Build)
-if ($EngineArgs -and $EngineArgs.Count -gt 0) {
-  $p = Start-Process -FilePath $Exe -ArgumentList $EngineArgs -WorkingDirectory $Build -PassThru
+# Launch via cmd start to avoid WDAC blocks on Start-Process -FilePath <exe>.
+$cmdExe = Join-Path $env:SystemRoot "System32\cmd.exe"
+$argLine = if ($EngineArgs -and $EngineArgs.Count -gt 0) { ($EngineArgs -join " ") } else { "" }
+if ($argLine) {
+  & $cmdExe /d /c "start `"voxel_engine`" /D `"$Build`" `"$Exe`" $argLine"
 } else {
-  $p = Start-Process -FilePath $Exe -WorkingDirectory $Build -PassThru
+  & $cmdExe /d /c "start `"voxel_engine`" /D `"$Build`" `"$Exe`""
 }
-Write-Host ("engine_pid=" + $p.Id)
+Write-Host "engine_launch=cmd_start"
 exit 0

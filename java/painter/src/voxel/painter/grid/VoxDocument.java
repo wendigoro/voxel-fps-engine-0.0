@@ -17,6 +17,7 @@ public enum Mode { MODEL, SKY, CHARACTER, WEAPON }
 public int feetX, feetY, feetZ;
     public String caliber = "medium"; // light|medium|heavy|energy
     public String ammoId = "medium_fmj";
+    public String fireMode = "semi"; // semi|auto|bolt
 
     public VoxDocument(Mode mode, int sx, int sy, int sz) {
         this.mode = mode;

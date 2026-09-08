@@ -33,6 +33,7 @@ Every voxel cell is a **cube**: Z extent always equals X and Y unit size. No str
 8. **Performance look** — internal downscale (`RENDER_SCALE`) + bitcrush/quantization are allowed post styles; they must not change the unit occupancy grid used for impact.
 9. **Painter** — model / sky / character tools edit the **same integer unit grid**. "Stretch" is integer scale of a selection box (pad/crop on-grid), never continuous non-unit geometry. Saved assets keep `unit=1`, `voxel_size=0.001`.
 10. **Bitcrush 32× filter** — nearest-neighbor upscale ×32 + color quantize is a **display/export layer only** (`voxel.painter.filter.BitcrushUpscale`). It must not rewrite occupancy to non-unit cells. Export may write raw `.vox.json` plus a crushed preview PNG.
+11. **Debris / degradation (8×8×8)** — bullet impacts may spawn visual fragment chips from an **8×8×8 sub-lattice inside each unit voxel** (`src/debris.hpp`). Chips use trajectory/ricochet via a 3×3 matrix calculator. This is **display/effects only** and must never rewrite occupancy away from unit cubes.
 
 ### Forbidden
 

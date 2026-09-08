@@ -32,7 +32,8 @@ public final class OrthoSlicePanel extends JPanel implements PainterModel.Listen
     public OrthoSlicePanel(PainterModel model) {
         this.model = model;
         setLayout(new BorderLayout(4, 4));
-        setBorder(BorderFactory.createTitledBorder("Ortho slice (unit cubes)"));
+        setBackground(PainterTheme.BG_PANEL);
+        setBorder(PainterTheme.cardBorder("Ortho slice (unit cubes)", PainterTheme.ACCENT));
 
         JPanel top = new JPanel();
         axisBox = new JComboBox<>(PainterModel.SliceAxis.values());

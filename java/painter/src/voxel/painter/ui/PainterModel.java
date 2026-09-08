@@ -84,6 +84,7 @@ public void newDocument(VoxDocument.Mode mode) {
         } else if (mode == VoxDocument.Mode.WEAPON) {
             doc.caliber = "medium";
             doc.ammoId = "medium_fmj";
+            doc.fireMode = "semi";
             WeaponParts.paintStarterRifle(doc.grid);
             tools.activePart = WeaponParts.BARREL;
         } else {
@@ -104,17 +105,43 @@ public void newDocument(VoxDocument.Mode mode) {
         fireDoc();
     }
 
+    public void setAmmoId(String ammoId) {
+        if (ammoId != null && !ammoId.isBlank()) document.ammoId = ammoId;
+        fireDoc();
+    }
+
+    public void setFireMode(String fireMode) {
+        if (fireMode == null) return;
+        String fm = fireMode.toLowerCase();
+        if (fm.equals("semi") || fm.equals("auto") || fm.equals("bolt")) {
+            document.fireMode = fm;
+            fireDoc();
+        }
+    }
+
     public void bakeStarterWeapon() {
         if (document.mode != VoxDocument.Mode.WEAPON) {
             newDocument(VoxDocument.Mode.WEAPON);
             return;
         }
         WeaponParts.paintStarterRifle(document.grid);
+        document.caliber = document.caliber == null ? "medium" : document.caliber;
+        document.ammoId = document.ammoId == null ? "medium_fmj" : document.ammoId;
+        document.fireMode = document.fireMode == null ? "semi" : document.fireMode;
+        tools.activePart = WeaponParts.BARREL;
         markDirty();
+        fireTools();
     }
 
     public WeaponParts.Stats weaponStats() {
-        return WeaponParts.compose(document.grid, document.caliber);
+        WeaponParts.Stats s = WeaponParts.compose(document.grid, document.caliber);
+        // Prefer explicit document fire mode when user set one in the UI.
+        if (document.fireMode != null && !document.fireMode.isBlank()) {
+            s.fireMode = document.fireMode;
+        } else {
+            document.fireMode = s.fireMode;
+        }
+        return s;
     }
 
     public static void seedDemo(VoxDocument doc) {
@@ -305,8 +332,12 @@ bits.add("mat=" + MaterialPalette.nameFromId(tools.activeMat()) + (tools.useB ? 
         if (document.mode == VoxDocument.Mode.WEAPON) {
             bits.add("part=" + WeaponParts.name(tools.activePart));
             bits.add("cal=" + document.caliber);
-            WeaponParts.Stats st = WeaponParts.compose(document.grid, document.caliber);
-            bits.add(String.format("dmg=%.1f imp=%.1f rec=%.1f hnd=%.1f w=%.1f", st.damage, st.impact, st.recoil, st.handling, st.weight));
+            bits.add("ammo=" + document.ammoId);
+            bits.add("fire=" + document.fireMode);
+            WeaponParts.Stats st = weaponStats();
+            bits.add(String.format(
+                    "dmg=%.1f imp=%.1f rec=%.1f hnd=%.1f w=%.1f opt=%.1f",
+                    st.damage, st.impact, st.recoil, st.handling, st.weight, st.optic));
         }
         bits.add("slice=" + sliceAxis + ":" + sliceIndex);
         bits.add("unit=" + grid().unitSizeX() + "=" + grid().unitSizeY() + "=" + grid().unitSizeZ());

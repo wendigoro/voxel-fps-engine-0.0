@@ -4,6 +4,7 @@
   "voxel_size": 0.001,
   "caliber": "medium",
   "hitscan": 0,
+  "fire_mode": "semi",
   "ammo_id": "medium_fmj",
   "stats": {
     "damage": 20.605,

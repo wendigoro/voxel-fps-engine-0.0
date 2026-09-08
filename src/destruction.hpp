@@ -12,11 +12,15 @@
 #include <string>
 #include <vector>
 
+// One 8x8x8 subunit of a unit voxel (matches debris.hpp / Python defs).
+inline constexpr float kSubEdge = 0.001f / 8.0f;
+inline constexpr float kSubRadius = kSubEdge * 0.5f; // fits one subunit cube
+
 struct ProjectileDef {
     std::string id = "slug";
     float mass = 0.05f;
     float speed = 25.0f;
-    float radius = 0.02f;       // world units
+    float radius = kSubRadius;  // world units — default one subunit
     float baseDamage = 8.0f;    // energy scale
     float penetration = 0.35f;  // 0..1 leftover energy fraction on break
     float gravityScale = 1.0f;
@@ -26,6 +30,8 @@ struct ProjectileDef {
     std::string caliber;            // light | medium | heavy | energy (optional)
     bool hitscan = false;           // energy_beam / instant ray
     std::string ammoId;             // optional ammo subtype hook
+    int pellets = 1;                // >1 shotgun multi-spawn
+    float spreadDeg = 0.0f;         // cone half-angle degrees
 };
 
 struct ImpactEvent {
@@ -87,9 +93,51 @@ inline bool jsonExtractBool(const std::string& obj, const char* key, bool fallba
     if (k == std::string::npos) return fallback;
     k++;
     while (k < obj.size() && (obj[k] == ' ' || obj[k] == '\t' || obj[k] == '\n' || obj[k] == '\r')) k++;
+    if (k >= obj.size()) return fallback;
+    // Accept true/false and numeric 0/1 (weapon export uses 0|1).
+    if (obj[k] == '1') return true;
+    if (obj[k] == '0') return false;
     if (k + 4 <= obj.size() && obj.compare(k, 4, "true") == 0) return true;
     if (k + 5 <= obj.size() && obj.compare(k, 5, "false") == 0) return false;
     return fallback;
+}
+
+// Extract balanced {...} body immediately after "key": (empty if missing).
+inline std::string jsonExtractObjectBody(const std::string& text, const char* key) {
+    const std::string pat = std::string("\"") + key + "\"";
+    size_t k = text.find(pat);
+    if (k == std::string::npos) return {};
+    k = text.find('{', k);
+    if (k == std::string::npos) return {};
+    int depth = 0;
+    for (size_t i = k; i < text.size(); ++i) {
+        char c = text[i];
+        if (c == '{') depth++;
+        else if (c == '}') {
+            depth--;
+            if (depth == 0) return text.substr(k, i - k + 1);
+        }
+    }
+    return {};
+}
+
+// Extract first JSON array body after "key": [ ... ]
+inline std::string jsonExtractArrayBody(const std::string& text, const char* key) {
+    const std::string pat = std::string("\"") + key + "\"";
+    size_t k = text.find(pat);
+    if (k == std::string::npos) return {};
+    k = text.find('[', k);
+    if (k == std::string::npos) return {};
+    int depth = 0;
+    for (size_t i = k; i < text.size(); ++i) {
+        char c = text[i];
+        if (c == '[') depth++;
+        else if (c == ']') {
+            depth--;
+            if (depth == 0) return text.substr(k, i - k + 1);
+        }
+    }
+    return {};
 }
 
 inline std::vector<ProjectileDef> loadProjectileDefs(const std::string& path) {
@@ -128,8 +176,21 @@ inline std::vector<ProjectileDef> loadProjectileDefs(const std::string& path) {
         d.effect = jsonExtractString(obj, "effect", "kinetic");
         d.caliber = jsonExtractString(obj, "caliber", "");
         d.hitscan = jsonExtractBool(obj, "hitscan", false);
+        // Numeric hitscan: 0/1 (jsonExtractBool handles); also accept bare 1 after key via float.
+        if (!d.hitscan) {
+            float hn = jsonExtractFloat(obj, "hitscan", 0.0f);
+            if (hn >= 0.5f) d.hitscan = true;
+        }
         d.ammoId = jsonExtractString(obj, "ammo_id", "");
-        if (d.effect == "energy" || d.caliber == "energy" || d.id == "energy_beam") {
+        d.pellets = static_cast<int>(jsonExtractFloat(obj, "pellets", 1.0f));
+        if (d.pellets < 1) d.pellets = 1;
+        if (d.pellets > 12) d.pellets = 12; // hard cap for stability
+        d.spreadDeg = jsonExtractFloat(obj, "spread_deg", 0.0f);
+        // Clamp radius to subunit scale (legacy JSON may still have larger radii).
+        if (d.radius > kSubRadius * 8.0f) d.radius = kSubRadius * 3.0f;
+        if (d.radius < kSubRadius * 0.25f) d.radius = kSubRadius;
+        if (d.effect == "energy" || d.caliber == "energy" || d.caliber == "energy_beam" ||
+            d.id == "energy_beam") {
             d.hitscan = true;
             d.gravityScale = 0.0f;
         }
@@ -159,28 +220,66 @@ enum class WeaponPartId : uint8_t {
 };
 
 struct AmmoDef {
-    std::string id = "fmj_medium";
+    std::string id = "medium_fmj";
     std::string caliber = "medium"; // light | medium | heavy | energy | energy_beam
-    std::vector<std::string> effectTags; // future VFX hooks only
+    float grain = 150.0f;
+    float massScale = 1.0f;
+    float damageScale = 1.0f;
+    float penetrationScale = 1.0f;
+    float gravityScale = 1.0f;
+    bool hitscan = false;
+    std::string effect = "kinetic";
+    std::vector<std::string> effectTags;
+    std::string notes;
 };
 
 struct WeaponDef {
     std::string id = "starter_rifle";
     std::string caliber = "medium";
     bool hitscan = false;
-    std::string fireMode = "semi";
+    std::string fireMode = "semi"; // semi | auto | bolt
     float damage = 10.0f;
     float impact = 8.0f;
     float recoil = 6.0f;
     float handling = 10.0f;
     float weight = 4.0f;
     float optic = 1.0f;
-    std::string ammoId = "fmj_medium";
+    std::string ammoId = "medium_fmj";
     AmmoDef ammo{};
 };
 
 inline bool caliberIsHitscan(const std::string& caliber) {
     return caliber == "energy_beam" || caliber == "energy" || caliber == "hitscan";
+}
+
+// Canonicalize caliber labels used across hotkeys / Python / painter.
+inline std::string normalizeCaliber(const std::string& caliber) {
+    if (caliber == "energy_beam" || caliber == "hitscan") return "energy";
+    if (caliber.empty()) return "medium";
+    return caliber;
+}
+
+// Map legacy engine ids → Python ammo.py ids.
+inline std::string normalizeAmmoId(const std::string& id) {
+    if (id == "fmj_light") return "light_fmj";
+    if (id == "fmj_medium") return "medium_fmj";
+    if (id == "fmj_heavy") return "heavy_fmj";
+    if (id == "cell_energy") return "energy_bolt";
+    return id;
+}
+
+inline std::string defaultAmmoIdForCaliber(const std::string& caliber) {
+    const std::string c = normalizeCaliber(caliber);
+    if (c == "light") return "light_fmj";
+    if (c == "heavy") return "heavy_fmj";
+    if (c == "energy") return "energy_bolt";
+    return "medium_fmj";
+}
+
+inline bool ammoHasTag(const AmmoDef& a, const char* tag) {
+    for (const auto& t : a.effectTags)
+        if (t == tag) return true;
+    return false;
 }
 
 // Built-in caliber ballistic/energy profiles (unit-grid VOXEL_SIZE=0.001).
@@ -235,24 +334,149 @@ inline ProjectileDef caliberFallbackDef(const std::string& caliber) {
 
 inline ProjectileDef projectileForCaliber(const std::vector<ProjectileDef>& defs,
                                           const std::string& caliber) {
-    // Prefer mats projectile ids: light_ball / medium_ball / heavy_ball / energy_beam.
+    // Prefer caliber ball ids: light_ball / medium_ball / heavy_ball / energy_beam.
+    const std::string c = normalizeCaliber(caliber);
     const char* preferred = nullptr;
-    if (caliber == "light") preferred = "light_ball";
-    else if (caliber == "heavy") preferred = "heavy_ball";
-    else if (caliberIsHitscan(caliber)) preferred = "energy_beam";
+    if (c == "light") preferred = "light_ball";
+    else if (c == "heavy") preferred = "heavy_ball";
+    else if (c == "energy") preferred = "energy_beam";
     else preferred = "medium_ball";
 
     for (const auto& d : defs) {
         if (d.id == preferred) return d;
     }
     for (const auto& d : defs) {
-        if (d.caliber == caliber || (caliberIsHitscan(caliber) && d.hitscan)) return d;
+        if (normalizeCaliber(d.caliber) == c || (c == "energy" && d.hitscan)) return d;
     }
-    // Exact caliber-as-id (legacy)
     for (const auto& d : defs) {
-        if (d.id == caliber) return d;
+        if (d.id == caliber || d.id == c) return d;
     }
-    return caliberFallbackDef(caliber);
+    return caliberFallbackDef(c == "energy" ? "energy_beam" : c);
+}
+
+inline AmmoDef parseAmmoObject(const std::string& obj) {
+    AmmoDef a;
+    a.id = normalizeAmmoId(jsonExtractString(obj, "id", a.id));
+    a.caliber = normalizeCaliber(jsonExtractString(obj, "caliber", a.caliber));
+    a.grain = jsonExtractFloat(obj, "grain", a.grain);
+    a.massScale = jsonExtractFloat(obj, "mass_scale", a.massScale);
+    a.damageScale = jsonExtractFloat(obj, "damage_scale", a.damageScale);
+    a.penetrationScale = jsonExtractFloat(obj, "penetration_scale", a.penetrationScale);
+    a.gravityScale = jsonExtractFloat(obj, "gravity_scale", a.gravityScale);
+    a.hitscan = jsonExtractBool(obj, "hitscan", a.hitscan);
+    if (!a.hitscan && jsonExtractFloat(obj, "hitscan", 0.0f) >= 0.5f) a.hitscan = true;
+    a.effect = jsonExtractString(obj, "effect", a.effect);
+    a.notes = jsonExtractString(obj, "notes", a.notes);
+    std::string arr = jsonExtractArrayBody(obj, "effect_tags");
+    if (!arr.empty()) {
+        size_t p = 0;
+        while (true) {
+            size_t q0 = arr.find('"', p);
+            if (q0 == std::string::npos) break;
+            size_t q1 = arr.find('"', q0 + 1);
+            if (q1 == std::string::npos) break;
+            a.effectTags.push_back(arr.substr(q0 + 1, q1 - q0 - 1));
+            p = q1 + 1;
+        }
+    }
+    if (a.caliber == "energy" || a.effect == "energy") a.hitscan = true;
+    return a;
+}
+
+inline std::vector<AmmoDef> loadAmmoDefs(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const std::string text = ss.str();
+
+    // Prefer the top-level "ammo" array so we don't confuse projectile objects.
+    std::string arr = jsonExtractArrayBody(text, "ammo");
+    const std::string& src = arr.empty() ? text : arr;
+
+    std::vector<AmmoDef> out;
+    size_t pos = 0;
+    while (true) {
+        size_t start = src.find('{', pos);
+        if (start == std::string::npos) break;
+        size_t end = src.find('}', start);
+        if (end == std::string::npos) break;
+        std::string obj = src.substr(start, end - start + 1);
+        pos = end + 1;
+        if (obj.find("\"id\"") == std::string::npos) continue;
+        // Ammo rows carry grain and/or mass_scale; projectiles carry speed.
+        if (obj.find("\"mass_scale\"") == std::string::npos &&
+            obj.find("\"grain\"") == std::string::npos)
+            continue;
+        if (obj.find("\"speed\"") != std::string::npos) continue;
+        AmmoDef a = parseAmmoObject(obj);
+        if (!a.id.empty()) out.push_back(a);
+    }
+    return out;
+}
+
+inline AmmoDef findAmmo(const std::vector<AmmoDef>& defs, const std::string& id) {
+    const std::string want = normalizeAmmoId(id);
+    for (const auto& a : defs)
+        if (a.id == want) return a;
+    return {};
+}
+
+inline AmmoDef findAmmoForCaliber(const std::vector<AmmoDef>& defs, const std::string& caliber,
+                                  const std::string& preferredId = {}) {
+    if (!preferredId.empty()) {
+        AmmoDef hit = findAmmo(defs, preferredId);
+        if (!hit.id.empty() && (hit.caliber.empty() ||
+                                normalizeCaliber(hit.caliber) == normalizeCaliber(caliber) ||
+                                (caliberIsHitscan(caliber) && hit.hitscan)))
+            return hit;
+    }
+    const std::string c = normalizeCaliber(caliber);
+    const std::string defId = defaultAmmoIdForCaliber(c);
+    AmmoDef defHit = findAmmo(defs, defId);
+    if (!defHit.id.empty()) return defHit;
+    for (const auto& a : defs)
+        if (normalizeCaliber(a.caliber) == c) return a;
+    AmmoDef fallback;
+    fallback.id = defId;
+    fallback.caliber = c;
+    fallback.hitscan = (c == "energy");
+    if (fallback.hitscan) {
+        fallback.effect = "energy";
+        fallback.gravityScale = 0.0f;
+        fallback.massScale = 0.01f;
+    }
+    return fallback;
+}
+
+inline std::vector<AmmoDef> ammosForCaliber(const std::vector<AmmoDef>& defs,
+                                           const std::string& caliber) {
+    const std::string c = normalizeCaliber(caliber);
+    std::vector<AmmoDef> out;
+    for (const auto& a : defs)
+        if (normalizeCaliber(a.caliber) == c) out.push_back(a);
+    return out;
+}
+
+// AOE scale from projectile caliber + damage (density applied at impact site).
+inline float impactAoeScale(const ProjectileDef& def) {
+    float cal = 1.0f;
+    const std::string c = normalizeCaliber(def.caliber.empty() ? "medium" : def.caliber);
+    if (c == "light") cal = 0.85f;
+    else if (c == "heavy") cal = 1.45f;
+    else if (c == "energy") cal = 1.1f;
+    else cal = 1.0f;
+    const float dmg = std::max(0.5f, def.baseDamage / 10.0f);
+    // radius relative to one subunit contributes area
+    const float rScale = std::clamp(def.radius / kSubRadius, 0.5f, 4.0f);
+    return cal * dmg * std::sqrt(rScale);
+}
+
+// Effective splash radius after material density (denser absorbs AOE).
+inline float densityScaledSplash(float baseSplash, MaterialId mat) {
+    if (baseSplash <= 0.0f) return 0.0f;
+    const float dens = std::max(0.2f, materialProps(mat).density);
+    return baseSplash / std::sqrt(dens);
 }
 
 inline ProjectileDef scaleProjectileForWeapon(ProjectileDef def, const WeaponDef& w) {
@@ -262,11 +486,57 @@ inline ProjectileDef scaleProjectileForWeapon(ProjectileDef def, const WeaponDef
     def.baseDamage *= dmgScale;
     def.mass *= (0.85f + 0.15f * impactScale);
     def.penetration = std::min(0.95f, def.penetration * (0.9f + 0.1f * impactScale));
-    if (w.hitscan || caliberIsHitscan(w.caliber)) {
+    // Weapon damage expands subunit AOE footprint.
+    def.splashRadius = std::max(def.splashRadius, def.radius * 2.0f) * (0.75f + dmgScale * 0.5f);
+    def.radius = std::max(kSubRadius * 0.5f, def.radius);
+
+    // Ammo subtype scales (Python ammo.py / projectiles.json ammo[]).
+    const AmmoDef& a = w.ammo;
+    if (!a.id.empty() || a.massScale != 1.0f || a.damageScale != 1.0f) {
+        def.mass *= std::max(0.01f, a.massScale);
+        def.baseDamage *= std::max(0.1f, a.damageScale);
+        def.penetration = std::min(0.99f, def.penetration * std::max(0.1f, a.penetrationScale));
+        def.gravityScale *= a.gravityScale;
+        if (!a.effect.empty()) def.effect = a.effect;
+        def.ammoId = a.id.empty() ? w.ammoId : a.id;
+        if (a.effect == "explosive" || ammoHasTag(a, "he") || ammoHasTag(a, "explosive")) {
+            def.splashRadius = std::max(def.splashRadius, 0.010f * std::max(1.0f, a.damageScale));
+            def.splashFalloff = std::max(def.splashFalloff, 1.1f);
+            def.effect = "explosive";
+        }
+        if (a.effect == "shred" || ammoHasTag(a, "shred")) {
+            def.effect = "shred";
+            def.splashRadius = std::max(def.splashRadius, 0.005f);
+        }
+        if (ammoHasTag(a, "pierce") || a.id.find("pierce") != std::string::npos) {
+            def.penetration = std::min(0.99f, def.penetration * 1.35f);
+        }
+        if (a.hitscan || a.effect == "energy") {
+            def.hitscan = true;
+            def.gravityScale = 0.0f;
+        }
+    }
+
+    if (w.hitscan || caliberIsHitscan(w.caliber) || a.hitscan) {
         def.gravityScale = 0.0f;
-        def.id = def.id.empty() ? "energy_beam" : def.id;
+        def.hitscan = true;
+        if (def.id.empty() || def.id == "medium_ball") def.id = "energy_beam";
     }
     return def;
+}
+
+inline float fireCooldownForWeapon(const WeaponDef& w) {
+    // Higher handling → faster follow-up. Fire mode adjusts cadence.
+    float cd = std::max(0.05f, 0.40f - w.handling * 0.018f);
+    const std::string& m = w.fireMode;
+    if (m == "auto") {
+        cd = std::max(0.04f, cd * 0.55f);
+    } else if (m == "bolt") {
+        cd = std::max(cd, 0.55f + std::max(0.0f, w.recoil) * 0.025f);
+    }
+    // Weight slightly slows cyclic rate.
+    cd *= (1.0f + std::max(0.0f, w.weight) * 0.008f);
+    return cd;
 }
 
 inline WeaponDef defaultWeaponDef() {
@@ -281,42 +551,16 @@ inline WeaponDef defaultWeaponDef() {
     w.handling = 11.0f;
     w.weight = 3.8f;
     w.optic = 2.0f;
-    w.ammoId = "fmj_medium";
-    w.ammo.id = "fmj_medium";
+    w.ammoId = "medium_fmj";
+    w.ammo.id = "medium_fmj";
     w.ammo.caliber = "medium";
-    w.ammo.effectTags = {"ap"};
+    w.ammo.effect = "kinetic";
+    w.ammo.effectTags = {"ballistic", "fmj"};
     return w;
-}
-
-inline AmmoDef parseAmmoObject(const std::string& obj) {
-    AmmoDef a;
-    a.id = jsonExtractString(obj, "id", a.id);
-    a.caliber = jsonExtractString(obj, "caliber", a.caliber);
-    // effect_tags: naive scan for quoted strings inside the array if present
-    const std::string pat = "\"effect_tags\"";
-    size_t k = obj.find(pat);
-    if (k != std::string::npos) {
-        size_t lb = obj.find('[', k);
-        size_t rb = (lb == std::string::npos) ? std::string::npos : obj.find(']', lb);
-        if (lb != std::string::npos && rb != std::string::npos) {
-            std::string arr = obj.substr(lb + 1, rb - lb - 1);
-            size_t p = 0;
-            while (true) {
-                size_t q0 = arr.find('"', p);
-                if (q0 == std::string::npos) break;
-                size_t q1 = arr.find('"', q0 + 1);
-                if (q1 == std::string::npos) break;
-                a.effectTags.push_back(arr.substr(q0 + 1, q1 - q0 - 1));
-                p = q1 + 1;
-            }
-        }
-    }
-    return a;
 }
 
 inline WeaponDef parseWeaponObject(const std::string& text) {
     WeaponDef w = defaultWeaponDef();
-    // Prefer top-level object body
     std::string obj = text;
     size_t start = text.find('{');
     size_t end = text.rfind('}');
@@ -324,51 +568,51 @@ inline WeaponDef parseWeaponObject(const std::string& text) {
         obj = text.substr(start, end - start + 1);
 
     w.id = jsonExtractString(obj, "id", w.id);
-    w.caliber = jsonExtractString(obj, "caliber", w.caliber);
+    w.caliber = normalizeCaliber(jsonExtractString(obj, "caliber", w.caliber));
     w.fireMode = jsonExtractString(obj, "fire_mode", w.fireMode);
-    w.ammoId = jsonExtractString(obj, "ammo_id", w.ammoId);
-    w.damage = jsonExtractFloat(obj, "damage", w.damage);
-    w.impact = jsonExtractFloat(obj, "impact", w.impact);
-    w.recoil = jsonExtractFloat(obj, "recoil", w.recoil);
-    w.handling = jsonExtractFloat(obj, "handling", w.handling);
-    w.weight = jsonExtractFloat(obj, "weight", w.weight);
-    w.optic = jsonExtractFloat(obj, "optic", w.optic);
+    if (w.fireMode != "semi" && w.fireMode != "auto" && w.fireMode != "bolt")
+        w.fireMode = "semi";
+    w.ammoId = normalizeAmmoId(jsonExtractString(obj, "ammo_id", w.ammoId));
+    w.hitscan = jsonExtractBool(obj, "hitscan", w.hitscan);
+    if (!w.hitscan && jsonExtractFloat(obj, "hitscan", 0.0f) >= 0.5f) w.hitscan = true;
 
-    // hitscan bool: true/false token after key
-    {
-        const std::string pat = "\"hitscan\"";
-        size_t k = obj.find(pat);
-        if (k != std::string::npos) {
-            k = obj.find(':', k);
-            if (k != std::string::npos) {
-                std::string tail = obj.substr(k + 1, 16);
-                if (tail.find("true") != std::string::npos) w.hitscan = true;
-                else if (tail.find("false") != std::string::npos) w.hitscan = false;
-            }
-        }
-    }
+    // Nested stats object is the source of truth for composed painter export.
+    std::string stats = jsonExtractObjectBody(obj, "stats");
+    const std::string& statSrc = stats.empty() ? obj : stats;
+    w.damage = jsonExtractFloat(statSrc, "damage", w.damage);
+    w.impact = jsonExtractFloat(statSrc, "impact", w.impact);
+    w.recoil = jsonExtractFloat(statSrc, "recoil", w.recoil);
+    w.handling = jsonExtractFloat(statSrc, "handling", w.handling);
+    w.weight = jsonExtractFloat(statSrc, "weight", w.weight);
+    w.optic = jsonExtractFloat(statSrc, "optic", w.optic);
+
     if (caliberIsHitscan(w.caliber)) w.hitscan = true;
 
-    // nested ammo object (first nested { after "ammo")
-    {
-        const std::string pat = "\"ammo\"";
-        size_t k = obj.find(pat);
-        if (k != std::string::npos) {
-            size_t b = obj.find('{', k);
-            if (b != std::string::npos) {
-                size_t e = obj.find('}', b);
-                if (e != std::string::npos) {
-                    w.ammo = parseAmmoObject(obj.substr(b, e - b + 1));
-                    if (!w.ammo.id.empty()) w.ammoId = w.ammo.id;
-                    if (!w.ammo.caliber.empty() && w.caliber.empty())
-                        w.caliber = w.ammo.caliber;
-                }
-            }
-        }
+    std::string ammoBody = jsonExtractObjectBody(obj, "ammo");
+    if (!ammoBody.empty()) {
+        w.ammo = parseAmmoObject(ammoBody);
+        if (!w.ammo.id.empty()) w.ammoId = normalizeAmmoId(w.ammo.id);
+        if (!w.ammo.caliber.empty())
+            w.caliber = normalizeCaliber(w.ammo.caliber);
     }
+    if (w.ammoId.empty()) w.ammoId = defaultAmmoIdForCaliber(w.caliber);
     if (w.ammo.id.empty()) w.ammo.id = w.ammoId;
     if (w.ammo.caliber.empty()) w.ammo.caliber = w.caliber;
     return w;
+}
+
+// Bind ammo table row onto a loaded weapon (fills scales/effect).
+inline void bindWeaponAmmo(WeaponDef& w, const std::vector<AmmoDef>& ammoTable) {
+    w.ammoId = normalizeAmmoId(w.ammoId.empty() ? defaultAmmoIdForCaliber(w.caliber) : w.ammoId);
+    AmmoDef found = findAmmoForCaliber(ammoTable, w.caliber, w.ammoId);
+    if (!found.id.empty()) {
+        w.ammo = found;
+        w.ammoId = found.id;
+        if (found.hitscan) w.hitscan = true;
+    } else {
+        w.ammo.id = w.ammoId;
+        w.ammo.caliber = normalizeCaliber(w.caliber);
+    }
 }
 
 inline WeaponDef loadWeaponDef(const std::string& path) {

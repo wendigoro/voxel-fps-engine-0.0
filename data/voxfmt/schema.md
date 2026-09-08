@@ -15,8 +15,9 @@ Cell extent on Z always equals X and Y (no non-cubic voxels).
   "moon_intensity": 0.95,
   "feet": [x, y, z],
   "weapon_name": "starter_rifle",
-  "caliber": "light|medium|heavy|energy_beam",
+  "caliber": "light|medium|heavy|energy",
   "fire_mode": "semi|auto|bolt",
+  "ammo_id": "medium_fmj",
   "active_part": "barrel",
   "voxels": [
     {"x": 0, "y": 0, "z": 0, "mat": "concrete", "rgb": 6710886, "part": "barrel"}
@@ -41,6 +42,8 @@ Materials after water: `plexiglass` (9), `carbon_fiber` (10), `treated_wood` (11
 ## Weapon export (`data/weapons/*.weapon.json`)
 
 Composed from painted part volumes + materials via `WeaponParts.compose`. Fields include
-`id`, `unit`, `voxel_size`, `caliber`, `hitscan`, `ammo_id`, `stats` (damage/impact/recoil/handling/weight/optic), `parts` tallies.
+`id`, `unit`, `voxel_size`, `caliber`, `hitscan` (0|1), `fire_mode` (semi|auto|bolt), `ammo_id`
+(Python ids: `light_fmj`, `medium_fmj`, …), nested `stats` (damage/impact/recoil/handling/weight/optic),
+`parts` tallies. Engine loads ammo scales from `data/projectiles.json` `ammo[]` and applies them on fire.
 
 Bitcrush 32× is a display/export filter only — it must not rewrite occupancy.

@@ -46,6 +46,8 @@ def _enrich_projectiles() -> list[dict]:
         d["caliber"] = cal
         d["hitscan"] = 1 if hitscan else 0
         d["grain"] = float(p.grain)
+        d["pellets"] = int(getattr(p, "pellets", 1) or 1)
+        d["spread_deg"] = float(getattr(p, "spread_deg", 0.0) or 0.0)
         if hitscan:
             d["gravity_scale"] = 0.0
         out.append(d)

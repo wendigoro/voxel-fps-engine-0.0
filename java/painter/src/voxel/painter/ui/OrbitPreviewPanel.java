@@ -25,7 +25,8 @@ public final class OrbitPreviewPanel extends JPanel implements PainterModel.List
     public OrbitPreviewPanel(PainterModel model) {
         this.model = model;
         setLayout(new BorderLayout());
-        setBorder(BorderFactory.createTitledBorder("3D orbit preview (unit cubes)"));
+        setBackground(PainterTheme.BG_PANEL);
+        setBorder(PainterTheme.cardBorder("3D orbit preview (unit cubes)", PainterTheme.ACCENT_WARM));
         canvas = new Canvas();
         add(canvas, BorderLayout.CENTER);
         model.addListener(this);
