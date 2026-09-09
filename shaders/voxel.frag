@@ -16,6 +16,10 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float moonIntensity;
     vec3 moonColor;
     float ambientScale;
+    float muzzleFlash;
+    float fireOverlay;
+    float _fxPad0;
+    float _fxPad1;
     vec4 bulbPos[4];
     vec4 bulbColor[4];
 } ubo;
@@ -80,10 +84,64 @@ float shadowRayPoint(vec3 origin, vec3 lightPos, out float edge) {
     return clamp(shadow, 0.1, 1.0);
 }
 
+void applyFireOverlay(inout vec3 lit) {
+    float flash = ubo.muzzleFlash;
+    float border = ubo.fireOverlay;
+    if (flash < 0.001 && border < 0.001) return;
+
+    float r = length(fragNdc);
+    // Center bloom + warm fill
+    float center = 1.0 - smoothstep(0.0, 0.72, r);
+    lit += vec3(1.0, 0.78, 0.32) * flash * (0.18 + 0.55 * center);
+    // Frame burn / corner vignette pulse
+    float edgeX = smoothstep(0.72, 1.08, abs(fragNdc.x));
+    float edgeY = smoothstep(0.68, 1.05, abs(fragNdc.y));
+    float frame = max(edgeX, edgeY);
+    float corner = edgeX * edgeY;
+    lit += vec3(1.0, 0.42, 0.12) * border * (frame * 0.55 + corner * 0.85);
+    // Slight desat crush on hard flash for "shutter" feel
+    float luma = dot(lit, vec3(0.299, 0.587, 0.114));
+    lit = mix(lit, vec3(luma) * vec3(1.05, 0.95, 0.85), flash * 0.12);
+}
+
 void main() {
     vec3 n = normalize(fragNormal);
     vec3 base = fragColor;
     float matId = fragMat;
+
+    // mat 6: muzzle flash cubes (emissive, no lighting)
+    if (matId > 5.5) {
+        vec3 glow = base * (1.4 + 0.6 * ubo.muzzleFlash);
+        float pulse = 0.85 + 0.15 * sin(ubo.time * 90.0);
+        glow *= pulse;
+        float levels = 20.0;
+        glow = floor(glow * levels + 0.5) / levels;
+        vec3 outRgb = glow;
+        applyFireOverlay(outRgb);
+        outColor = vec4(outRgb, 1.0);
+        return;
+    }
+
+    // mat 5: cubic debris chips — lit + emissive lift so sub-voxels read clearly
+    if (matId > 4.5) {
+        float night = smoothstep(0.55, 0.8, ubo.timeOfDay);
+        vec3 ambientCol = mix(vec3(0.35, 0.38, 0.42), vec3(0.08, 0.09, 0.11), night);
+        float ambient = (0.28 + 0.14 * max(n.y, 0.0)) * ubo.ambientScale;
+        vec3 moonL = normalize(-ubo.moonDir);
+        float moonNdotL = max(dot(n, moonL), 0.0);
+        vec3 moonContrib = ubo.moonColor * ubo.moonIntensity * moonNdotL * 1.15;
+        vec3 lit = base * (ambientCol * ambient + moonContrib) + base * 0.22;
+        // Face bevel: emphasize cube silhouette
+        float face = pow(max(abs(n.x), max(abs(n.y), abs(n.z))), 4.0);
+        lit += base * face * 0.18;
+        float r = length(fragNdc);
+        lit *= 1.0 - smoothstep(0.55, 1.45, r) * 0.25;
+        float levels = 18.0;
+        lit = floor(lit * levels + 0.5) / levels;
+        applyFireOverlay(lit);
+        outColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
+        return;
+    }
 
     // mat 4: pixel sky tiles
     if (matId > 3.5) {
@@ -115,6 +173,7 @@ void main() {
 
         float levels = 14.0;
         sky = floor(sky * levels + 0.5) / levels;
+        applyFireOverlay(sky);
         outColor = vec4(sky, 1.0);
         return;
     }
@@ -145,6 +204,7 @@ void main() {
 
         float levels = 16.0;
         glow = floor(glow * levels + 0.5) / levels;
+        applyFireOverlay(glow);
         outColor = vec4(glow, clamp(crescent + halo * 0.65, 0.0, 1.0));
         return;
     }
@@ -153,6 +213,7 @@ void main() {
         vec3 glow = vec3(1.0, 0.72, 0.42) * (1.1 + 0.15 * sin(ubo.time * 6.0));
         float r = length(fragNdc);
         glow *= 1.0 - smoothstep(0.6, 1.4, r) * 0.25;
+        applyFireOverlay(glow);
         outColor = vec4(glow, 1.0);
         return;
     }
@@ -204,6 +265,17 @@ void main() {
         }
     }
 
+    // Muzzle as transient point light near camera
+    if (ubo.muzzleFlash > 0.02) {
+        vec3 mp = ubo.camPos;
+        vec3 toM = mp - fragWorldPos;
+        float md = length(toM);
+        float matt = ubo.muzzleFlash * 2.4 / (1.0 + 120.0 * md * md);
+        matt *= smoothstep(0.08, 0.01, md);
+        float mnd = max(dot(n, normalize(toM + vec3(0.0, 0.001, 0.0))), 0.0);
+        bulbContrib += vec3(1.0, 0.72, 0.3) * matt * (0.35 + 0.65 * mnd);
+    }
+
     float groundDark = smoothstep(0.0, 0.01, fragWorldPos.y) * 0.15;
     float heightAo = clamp(0.55 + fragWorldPos.y * 25.0, 0.4, 0.95);
 
@@ -226,5 +298,6 @@ void main() {
     lit = floor(lit * levels + 0.5) / levels;
     lit = pow(clamp(lit, 0.0, 1.0), vec3(1.12));
 
+    applyFireOverlay(lit);
     outColor = vec4(lit, 1.0);
 }
