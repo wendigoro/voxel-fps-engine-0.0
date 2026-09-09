@@ -118,7 +118,7 @@ struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
     float cr, cg, cb;
-    float mat; // 0 solid, 1 water (shader tide)
+float mat; // 0 solid, 1 water, 2 bulb, 3 moon, 4 sky, 5 debris cube, 6 muzzle flash
 };
 
 struct FrameUBO {
@@ -131,6 +131,9 @@ struct FrameUBO {
     float moonIntensity;
     float moonColor[3];
     float ambientScale;
+    float muzzleFlash;     // 0..1 fire pulse (shader overlay + lighting kick)
+    float fireOverlay;     // 0..1 frame-border burn
+    float _fxPad[2];
     float bulbPos[4][4];   // xyz, intensity
     float bulbColor[4][4]; // rgb, radius
 };
@@ -160,13 +163,28 @@ static int g_mouseX = 0, g_mouseY = 0, g_lastMouseX = 0, g_lastMouseY = 0;
 // Free-float first-person POV camera (radians)
 static float g_yaw = 0.0f;          // 0 = looking toward -Z
 static float g_pitch = -0.28f; // slightly down with higher fisheye POV
-static float g_moveSpeed = 0.06f;   // world units/sec at 0.001 voxel scale
+static float g_moveSpeed = 0.045f;  // walk speed (world units/sec at 0.001 voxel scale)
 static float g_lookSens = 0.0035f;
-// Spawn on dirt apron, looking into warehouse bay.
+// Locked FPS camera follows physics player (eye). Initialized in spawnPlayer().
 static Vec3 g_camPos(
     WORLD_W * VOXEL_SIZE * 0.5f,
-    0.0261f,  // default eye height ~45% higher
-    WORLD_D * VOXEL_SIZE + 0.025f);
+    0.018f,
+    WORLD_D * VOXEL_SIZE * 0.72f);
+
+// Physics-bound player body (feet at py; hitbox is unit-grid AABB).
+struct PlayerBody {
+    float px = 0, py = 0, pz = 0; // feet center (world)
+    float vx = 0, vy = 0, vz = 0;
+    bool onGround = false;
+    float lean = 0.0f;       // current lean -1..+1 (Q left, E right)
+    float leanTarget = 0.0f;
+    float eyeHeight = 0.0165f; // ~16.5 unit voxels
+    float height = 0.0185f;    // full body height
+    float radius = 0.0022f;    // horizontal half-extent (~2.2 unit voxels)
+    float jumpSpeed = 0.055f;
+};
+static PlayerBody g_player;
+static bool g_wantJump = false;
 
 // Projectile destruction state (g_chunks assigned after Chunk type exists)
 struct Chunk;
@@ -185,6 +203,11 @@ static int g_activeWeaponIndex = 0;
 static int g_activeCaliberIndex = 1; // 0 light 1 medium 2 heavy 3 energy (keys 1-4)
 static const char* kCaliberIds[4] = {"light", "medium", "heavy", "energy"};
 static float g_fireCooldown = 0.0f;
+// Recoil is a temporary view offset on top of aim angles; recovers after last fire.
+static float g_recoilPitch = 0.0f;
+static float g_recoilYaw = 0.0f;
+static float g_recoilHold = 0.0f;     // seconds to hold kick before recover starts
+static float g_recoilReturn = 10.0f;  // exponential recover rate (1/s)
 static std::string g_lastAmmoId = "medium_fmj";
 static std::string g_lastCaliber = "medium";
 static std::string g_lastFireMode = "semi";
@@ -199,20 +222,25 @@ static float g_lastImpactEnergy = 10.0f;
 static float g_lastAoeScale = 1.0f;
 static int g_shotgunShots = 0;
 static int g_pelletSpawns = 0;
-// GPU buffer for visual debris cubes (display-only 8^3 chips)
+// GPU buffer for visual debris cubes (display-only 8^3 chips) + muzzle flash cubes
 static VkBuffer g_debrisVB = VK_NULL_HANDLE;
 static VkDeviceMemory g_debrisMem = VK_NULL_HANDLE;
 static void* g_debrisMapped = nullptr;
 static uint32_t g_debrisVertexCount = 0;
-// Billboard quads (6 verts) — far cheaper than full cubes (36 verts).
-static constexpr uint32_t kDebrisMaxParticlesDraw = 512;
-static constexpr uint32_t kDebrisVertsPerParticle = 6;
-static constexpr uint32_t kDebrisMaxVerts = kDebrisMaxParticlesDraw * kDebrisVertsPerParticle;
+// True cubic chips: 36 verts/particle (6 faces × 2 tris). Cap keeps upload cheap.
+static constexpr uint32_t kDebrisMaxParticlesDraw = 160;
+static constexpr uint32_t kDebrisVertsPerParticle = 36;
+static constexpr uint32_t kMuzzleFlashCubes = 4;
+static constexpr uint32_t kDebrisMaxVerts =
+    kDebrisMaxParticlesDraw * kDebrisVertsPerParticle + kMuzzleFlashCubes * 36u;
 static double g_debrisUploadUsSum = 0.0;
 static double g_debrisUploadUsMax = 0.0;
 static int g_debrisUploadSamples = 0;
 static uint32_t g_debrisVertsPeak = 0;
 static bool g_debrisWasActive = false;
+static float g_muzzleFlash = 0.0f;   // decays each frame after fire
+static float g_fireOverlay = 0.0f;  // frame-border burn intensity
+static float g_muzzleR = 1.0f, g_muzzleG = 0.72f, g_muzzleB = 0.28f;
 
 // Player character as unit-voxel body on the cubic grid (impact/current sampling).
 static int g_playerGX = 0, g_playerGY = 0, g_playerGZ = 0;
@@ -406,6 +434,13 @@ static MaterialId blockMaterial(Block b) {
 
 static bool isWaterBlock(Block b) {
     return b == Block::Water || b == Block::WaterCurrent;
+}
+
+// Collision solids: occupancy that blocks the player hitbox (not water/emissive).
+static bool isSolidBlock(Block b) {
+    if (b == Block::Air || isWaterBlock(b)) return false;
+    if (b == Block::Moon || b == Block::LightBulb) return false;
+    return true;
 }
 
 struct Chunk {
@@ -928,15 +963,21 @@ static void ensureDebrisBuffer() {
     if (g_debrisMapped) std::memset(g_debrisMapped, 0, static_cast<size_t>(size));
 }
 
-// Camera-facing debris quads (6 verts) — same subunit scale, ~6× less upload than cubes.
+// Cubic 8^3 debris chips + short-lived muzzle flash cubes (display only).
 static void updateDebrisMesh() {
     const int alive = g_debris.activeCount();
-    if (alive <= 0) {
+    const bool flashOn = g_muzzleFlash > 0.02f;
+    if (alive <= 0 && !flashOn) {
         g_debrisVertexCount = 0;
         g_debrisWasActive = false;
+        g_debris.meshDirty = false;
         return;
     }
-    // Buffer is prewarmed at startup; keep ensure as safety.
+    // Skip rebuild only when nothing moved and no flash (still draw last mesh).
+    if (!g_debris.meshDirty && !flashOn && g_debrisWasActive && g_debrisVertexCount > 0) {
+        return;
+    }
+
     ensureDebrisBuffer();
     if (!g_debrisMapped) { g_debrisVertexCount = 0; return; }
 
@@ -945,26 +986,20 @@ static void updateDebrisMesh() {
     QueryPerformanceCounter(&t0);
 
     Vertex* verts = reinterpret_cast<Vertex*>(g_debrisMapped);
-    Vec3 fwd = cameraForward();
-    Vec3 right = cameraRight();
-    if (right.length() < 1e-5f) right = Vec3(1, 0, 0);
-    right = right.normalized();
-    Vec3 up = right.cross(fwd).normalized();
-
     uint32_t wi = 0;
     auto put = [&](float px, float py, float pz,
                    float nx, float ny, float nz,
-                   float cr, float cg, float cb) {
+                   float cr, float cg, float cb, float matId) {
         if (wi >= kDebrisMaxVerts) return;
         Vertex& v = verts[wi++];
         v.px = px; v.py = py; v.pz = pz;
         v.nx = nx; v.ny = ny; v.nz = nz;
         v.cr = cr; v.cg = cg; v.cb = cb;
-        v.mat = 0.0f;
+        v.mat = matId;
     };
 
-    // Soft-cap drawn particles under load (keeps upload under ~100us).
-    const int drawCap = g_stress ? 256 : static_cast<int>(kDebrisMaxParticlesDraw);
+    // Soft-cap drawn particles under load (36 verts each).
+    const int drawCap = g_stress ? 96 : static_cast<int>(kDebrisMaxParticlesDraw);
     int drawn = 0;
     int stride = 1;
     if (alive > drawCap) stride = (alive + drawCap - 1) / drawCap;
@@ -974,30 +1009,44 @@ static void updateDebrisMesh() {
         if (!p.alive) continue;
         if ((seen++ % stride) != 0) continue;
         if (drawn >= drawCap) break;
-        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts) break;
+        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u) break;
         ++drawn;
-        const float fade = std::clamp(p.life / std::max(0.05f, p.maxLife), 0.15f, 1.0f);
-        const float cr = p.cr * fade, cg = p.cg * fade, cb = p.cb * fade;
-        const float h = p.half;
-        // Camera-facing quad corners
-        const float rx = right.x * h, ry = right.y * h, rz = right.z * h;
-        const float ux = up.x * h, uy = up.y * h, uz = up.z * h;
-        const float x0 = p.px - rx - ux, y0 = p.py - ry - uy, z0 = p.pz - rz - uz;
-        const float x1 = p.px + rx - ux, y1 = p.py + ry - uy, z1 = p.pz + rz - uz;
-        const float x2 = p.px + rx + ux, y2 = p.py + ry + uy, z2 = p.pz + rz + uz;
-        const float x3 = p.px - rx + ux, y3 = p.py - ry + uy, z3 = p.pz - rz + uz;
-        const float nx = -fwd.x, ny = -fwd.y, nz = -fwd.z;
-        put(x0, y0, z0, nx, ny, nz, cr, cg, cb);
-        put(x1, y1, z1, nx, ny, nz, cr, cg, cb);
-        put(x2, y2, z2, nx, ny, nz, cr, cg, cb);
-        put(x0, y0, z0, nx, ny, nz, cr, cg, cb);
-        put(x2, y2, z2, nx, ny, nz, cr, cg, cb);
-        put(x3, y3, z3, nx, ny, nz, cr, cg, cb);
+        emitDebrisCube(p, kDebrisMatId, put);
+    }
+
+    // Muzzle flash: stacked emissive cubes just ahead of the camera along aim.
+    if (flashOn) {
+        Vec3 fwd = cameraForward();
+        Vec3 right = cameraRight();
+        if (right.length() < 1e-5f) right = Vec3(1, 0, 0);
+        right = right.normalized();
+        Vec3 up = right.cross(fwd).normalized();
+        const float f = g_muzzleFlash;
+        const float base = 0.010f + 0.006f * f;
+        // Core + side sparks (caliber-tinted).
+        const float cr = g_muzzleR, cg = g_muzzleG, cb = g_muzzleB;
+        struct FlashSpec { float along, side, up, half, bright; } specs[4] = {
+            { base,            0.0f,           0.0f, 0.0018f * (0.7f + f), 1.0f },
+            { base * 1.35f,    0.0f,           0.0f, 0.0011f * (0.5f + f), 0.85f },
+            { base * 0.85f,    0.0012f * f,    0.0004f, 0.0009f, 0.7f },
+            { base * 0.85f,   -0.0012f * f,   -0.0003f, 0.0009f, 0.7f },
+        };
+        for (uint32_t i = 0; i < kMuzzleFlashCubes; ++i) {
+            if (wi + 36u > kDebrisMaxVerts) break;
+            const auto& s = specs[i];
+            float px = g_camPos.x + fwd.x * s.along + right.x * s.side + up.x * s.up;
+            float py = g_camPos.y + fwd.y * s.along + right.y * s.side + up.y * s.up;
+            float pz = g_camPos.z + fwd.z * s.along + right.z * s.side + up.z * s.up;
+            emitFlashCube(px, py, pz, s.half,
+                          cr * s.bright * f, cg * s.bright * f, cb * s.bright * f,
+                          kMuzzleMatId, put);
+        }
     }
 
     g_debrisVertexCount = wi;
     if (wi > g_debrisVertsPeak) g_debrisVertsPeak = wi;
-    g_debrisWasActive = true;
+    g_debrisWasActive = (wi > 0);
+    g_debris.meshDirty = false;
 
     QueryPerformanceCounter(&t1);
     const double us = (double(t1.QuadPart - t0.QuadPart) * 1e6) / double(freq.QuadPart);
@@ -1104,10 +1153,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_running = false;
             PostQuitMessage(0);
         }
-        if (wParam == 'F') {
+if (wParam == 'F') {
             g_firePressed = true;
             g_fireHeld = true;
         }
+        if (wParam == VK_SPACE) g_wantJump = true;
         // 1-4: caliber class (light medium heavy energy)
         if (wParam == '1') { g_activeCaliberIndex = 0; g_activeAmmoIndex = 0; }
         if (wParam == '2') { g_activeCaliberIndex = 1; g_activeAmmoIndex = 0; }
@@ -1198,7 +1248,7 @@ static void createWindow() {
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExA(
         0, wc.lpszClassName,
-        "Voxel FPS 0.0 — WASD fly | LMB look | RMB/F fire | X ADS | 1-4 caliber | R ammo | V weapon | B firemode | Esc",
+"Voxel FPS 0.0 — WASD walk | Space jump | Q/E lean | LMB look | RMB/F fire | X ADS | 1-4 cal | R ammo | V weapon | B mode | Esc",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
@@ -1839,16 +1889,47 @@ static std::string activeCaliberId(const WeaponDef& w) {
 }
 
 static void applyRecoilKick(const WeaponDef& w) {
-    // Minimal camera kick from bolt/chamber recoil stat (+ weight damps slightly).
-    // ADS + optic reduce kick; handling also settles the sight picture.
+    // Kick accumulates on a temporary offset (not permanent aim). Handling/weight/ADS
+    // damp the punch; handling also speeds the smooth return after the last shot.
     const float damp = 1.0f / (1.0f + std::max(0.0f, w.weight) * 0.08f +
                                std::max(0.0f, w.optic) * (g_ads ? 0.12f : 0.03f) +
                                std::max(0.0f, w.handling) * 0.02f);
-    const float kick = w.recoil * 0.0011f * damp;
-    g_pitch += kick;
-    g_yaw += kick * 0.35f;
-    const float lim = static_cast<float>(M_PI) * 0.49f;
-    g_pitch = std::max(-lim, std::min(lim, g_pitch));
+    const float kick = w.recoil * 0.0024f * damp;
+    // Slight horizontal wander so repeated shots don't climb a perfect line.
+    const float yawSign = ((g_ballisticShots + g_hitscanShots) & 1) ? 1.0f : -1.0f;
+    g_recoilPitch += kick;
+    g_recoilYaw += kick * (0.28f + 0.12f * yawSign);
+    // Cap stacked recoil so full-auto doesn't flip the camera.
+    const float maxKick = 0.22f * damp + 0.04f;
+    g_recoilPitch = std::min(g_recoilPitch, maxKick);
+    g_recoilYaw = std::max(-maxKick * 0.65f, std::min(maxKick * 0.65f, g_recoilYaw));
+// Hold the punch briefly after this shot, then recover (refreshed on every fire).
+    const float shotCd = fireCooldownForWeapon(w);
+    const float hold = 0.050f + shotCd * 0.45f +
+                       (w.fireMode == "bolt" ? 0.10f : 0.0f) +
+                       (w.fireMode == "auto" ? 0.02f : 0.0f);
+    g_recoilHold = std::max(g_recoilHold, hold);
+    // Return speed: heavier / higher handling settles faster; ADS a bit snappier.
+    g_recoilReturn = 7.5f + std::max(0.0f, w.handling) * 0.55f +
+                     std::max(0.0f, w.weight) * 0.08f +
+                     (g_ads ? 3.0f : 0.0f);
+}
+
+// Exponentially ease recoil offset back to zero after the hold window.
+static void updateRecoilRecovery(float dt) {
+    if (g_recoilHold > 0.0f) {
+        g_recoilHold -= dt;
+        if (g_recoilHold < 0.0f) g_recoilHold = 0.0f;
+        return; // keep current kick while holding after last shot
+    }
+    if (g_recoilPitch == 0.0f && g_recoilYaw == 0.0f) return;
+    // While auto-fire is held, don't settle mid-stream — wait for release / last shot hold.
+    if (g_fireHeld) return;
+    const float k = 1.0f - std::exp(-g_recoilReturn * dt);
+    g_recoilPitch += (0.0f - g_recoilPitch) * k;
+    g_recoilYaw += (0.0f - g_recoilYaw) * k;
+    if (std::fabs(g_recoilPitch) < 1e-5f) g_recoilPitch = 0.0f;
+    if (std::fabs(g_recoilYaw) < 1e-5f) g_recoilYaw = 0.0f;
 }
 
 // Aim direction with optic/ADS spread (hip-fire looser, ADS tighter).
@@ -2090,9 +2171,22 @@ static void fireProjectile() {
         }
     }
 
-    applyRecoilKick(fired);
+applyRecoilKick(fired);
     g_fireCooldown = fireCooldownForWeapon(fired);
     if (def.pellets > 1) g_fireCooldown *= 1.15f; // slight pump delay
+
+    // Muzzle flash + frame overlay pulse (shader + world cubes).
+    {
+        float pulse = useHitscan ? 1.0f : (def.pellets > 1 ? 1.15f : 0.85f);
+        if (caliber == "heavy") pulse *= 1.2f;
+        if (caliber == "energy") { g_muzzleR = 0.45f; g_muzzleG = 0.85f; g_muzzleB = 1.0f; }
+        else if (caliber == "light") { g_muzzleR = 1.0f; g_muzzleG = 0.82f; g_muzzleB = 0.35f; }
+        else if (caliber == "heavy") { g_muzzleR = 1.0f; g_muzzleG = 0.55f; g_muzzleB = 0.18f; }
+        else { g_muzzleR = 1.0f; g_muzzleG = 0.70f; g_muzzleB = 0.28f; }
+        g_muzzleFlash = std::min(1.0f, std::max(g_muzzleFlash, pulse));
+        g_fireOverlay = std::min(1.0f, std::max(g_fireOverlay, pulse * 0.9f));
+        g_debris.meshDirty = true;
+    }
 }
 
 static void tryLoadWeapons() {
@@ -2311,7 +2405,8 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     vkEndCommandBuffer(cmd);
 }
 
-// Character body as unit voxels relative to feet grid position (for submersion tests).
+// Character body as unit voxels relative to feet grid (hitbox proxy + water sampling).
+// Layout is a standing humanoid ~5 wide × 7 tall × 1 deep in unit cells.
 static const int kCharUnits[][3] = {
     // legs
     {0,0,0},{1,0,0},{0,1,0},{1,1,0}, {3,0,0},{4,0,0},{3,1,0},{4,1,0},
@@ -2352,49 +2447,89 @@ static SubmersionInfo sampleCharacterWater(const std::vector<Chunk>& chunks, int
     return info;
 }
 
-// Basic current function: how many character units touch moving water.
+// True if player AABB at (px,py,pz) intersects any solid unit voxel.
+static bool playerHitsSolid(float px, float py, float pz) {
+    if (!g_chunks) return false;
+    const float r = g_player.radius;
+    const float h = g_player.height;
+    const float eps = VOXEL_SIZE * 0.02f;
+    int x0 = static_cast<int>(std::floor((px - r + eps) / VOXEL_SIZE));
+    int x1 = static_cast<int>(std::floor((px + r - eps) / VOXEL_SIZE));
+    int y0 = static_cast<int>(std::floor((py + eps) / VOXEL_SIZE));
+    int y1 = static_cast<int>(std::floor((py + h - eps) / VOXEL_SIZE));
+    int z0 = static_cast<int>(std::floor((pz - r + eps) / VOXEL_SIZE));
+    int z1 = static_cast<int>(std::floor((pz + r - eps) / VOXEL_SIZE));
+    for (int y = y0; y <= y1; ++y)
+        for (int z = z0; z <= z1; ++z)
+            for (int x = x0; x <= x1; ++x) {
+                if (!worldInBounds(x, y, z)) {
+                    // Treat out-of-world as solid walls (except open sky above).
+                    if (y < 0 || y >= WORLD_H) continue;
+                    return true;
+                }
+                if (isSolidBlock(getWorldBlock(*g_chunks, x, y, z))) return true;
+            }
+    return false;
+}
+
+static void spawnPlayerOnMap(const std::vector<Chunk>& chunks) {
+    // Stand on the concrete apron just inside the open bay, looking -Z into the warehouse.
+    const int sx = WORLD_W / 2;
+    const int sz = WORLD_D - DIRT_MARGIN - 18;
+    int gy = 1 + SLAB_THICK; // default slab top
+    for (int y = WORLD_H - 2; y >= 0; --y) {
+        Block b = getWorldBlock(chunks, sx, y, sz);
+        if (isSolidBlock(b)) { gy = y + 1; break; }
+    }
+    g_player.px = (sx + 0.5f) * VOXEL_SIZE;
+    g_player.py = gy * VOXEL_SIZE + 0.0002f;
+    g_player.pz = (sz + 0.5f) * VOXEL_SIZE;
+    g_player.vx = g_player.vy = g_player.vz = 0.0f;
+    g_player.onGround = true;
+    g_player.lean = 0.0f;
+    g_player.leanTarget = 0.0f;
+    g_yaw = 0.0f;          // look toward -Z into bay
+    g_pitch = -0.08f;
+    g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+}
+
+// Water current + weight sampling from physics feet (not free-fly camera).
 static void updatePlayerCurrentAndWeight(float dt) {
     if (!g_chunks) return;
-    // Sync grid feet from camera (fly-cam proxy for character model).
-    g_playerGX = static_cast<int>(std::floor(g_camPos.x / VOXEL_SIZE)) - 2;
-    g_playerGY = static_cast<int>(std::floor(g_camPos.y / VOXEL_SIZE)) - 1;
-    g_playerGZ = static_cast<int>(std::floor(g_camPos.z / VOXEL_SIZE)) - 1;
+    g_playerGX = static_cast<int>(std::floor(g_player.px / VOXEL_SIZE)) - 2;
+    g_playerGY = static_cast<int>(std::floor(g_player.py / VOXEL_SIZE));
+    g_playerGZ = static_cast<int>(std::floor(g_player.pz / VOXEL_SIZE)) - 0;
     auto info = sampleCharacterWater(*g_chunks, g_playerGX, g_playerGY, g_playerGZ);
     g_touchingWaterUnits = info.touching;
     g_characterUnitCount = info.total;
     g_currentTriggered = info.anyCurrent && info.touching > 0;
     g_fullySubmerged = info.fullySubmerged;
 
-    float ratio = (info.total > 0) ? (float)info.touching / (float)info.total : 0.0f;
-    // Weight rules:
-    // - current triggered => weight doubles
-    // - fully submerged => weight halves (of current value)
     g_playerWeight = g_playerBaseWeight;
     if (g_currentTriggered) g_playerWeight *= 2.0f;
     if (g_fullySubmerged) g_playerWeight *= 0.5f;
 
-    // Current force from moving water contacts; doubles if fully submerged in current.
     float baseForce = 0.035f * ((info.total > 0) ? (float)info.currentTouching / (float)info.total : 0.0f);
     if (info.fullySubmerged && info.anyCurrent) baseForce *= 2.0f;
     g_currentForce = baseForce;
 
     if (g_currentForce > 0.0f && g_playerWeight > 1e-4f) {
-        // Acceleration ~ force / weight along river +X
         float acc = g_currentForce / g_playerWeight;
-        g_camPos.x += g_currentDir.x * acc * dt;
-        g_camPos.y += g_currentDir.y * acc * dt;
-        g_camPos.z += g_currentDir.z * acc * dt;
+        g_player.vx += g_currentDir.x * acc * dt;
+        g_player.vz += g_currentDir.z * acc * dt;
     }
-    (void)ratio;
 }
 
 static Vec3 cameraForward() {
-    // Yaw around +Y, pitch around local X. Forward is free-float (includes vertical).
-    const float cp = std::cos(g_pitch);
+    // Locked FPS aim: yaw/pitch + temporary recoil offset (no free-fly roll).
+    const float lim = static_cast<float>(M_PI) * 0.49f;
+    float pitch = std::max(-lim, std::min(lim, g_pitch + g_recoilPitch));
+    float yaw = g_yaw + g_recoilYaw;
+    const float cp = std::cos(pitch);
     return Vec3(
-        std::sin(g_yaw) * cp,
-        std::sin(g_pitch),
-        -std::cos(g_yaw) * cp
+        std::sin(yaw) * cp,
+        std::sin(pitch),
+        -std::cos(yaw) * cp
     ).normalized();
 }
 
@@ -2402,23 +2537,139 @@ static Vec3 cameraRight() {
     return cameraForward().cross(Vec3(0, 1, 0)).normalized();
 }
 
+// Flat look vectors (movement stays grounded; pitch does not fly).
+static Vec3 flatForward() {
+    return Vec3(std::sin(g_yaw), 0.0f, -std::cos(g_yaw)).normalized();
+}
+static Vec3 flatRight() {
+    return Vec3(std::cos(g_yaw), 0.0f, std::sin(g_yaw)).normalized();
+}
+
+// Sync locked eye camera to physics body + lean offset.
+static void syncCameraToPlayer() {
+    Vec3 right = flatRight();
+    const float leanLat = g_player.lean * 0.0032f;   // lateral peek
+    const float leanDrop = std::fabs(g_player.lean) * 0.0009f;
+    g_camPos.x = g_player.px + right.x * leanLat;
+    g_camPos.y = g_player.py + g_player.eyeHeight - leanDrop;
+    g_camPos.z = g_player.pz + right.z * leanLat;
+}
+
+// Physics-bound walk/jump + unit-grid hitbox; Q/E side lean (not up/down fly).
+static void updatePlayerPhysics(float dt) {
+    if (!g_chunks) return;
+
+    // --- lean targets: Q left, E right ---
+    g_player.leanTarget = 0.0f;
+    if (g_keys['Q']) g_player.leanTarget -= 1.0f;
+    if (g_keys['E']) g_player.leanTarget += 1.0f;
+    g_player.leanTarget = std::max(-1.0f, std::min(1.0f, g_player.leanTarget));
+    const float leanRate = 8.0f;
+    g_player.lean += (g_player.leanTarget - g_player.lean) * (1.0f - std::exp(-leanRate * dt));
+
+    // --- desired horizontal velocity (WASD walk, Shift sprint) ---
+    float speed = g_moveSpeed;
+    if (g_keys[VK_SHIFT]) speed *= 1.65f;
+    // Lean slows strafe slightly (shoulder into cover).
+    speed *= (1.0f - 0.18f * std::fabs(g_player.lean));
+
+    Vec3 wish(0, 0, 0);
+    Vec3 f = flatForward();
+    Vec3 r = flatRight();
+    if (g_keys['W'] || g_keys[VK_UP]) wish = wish + f;
+    if (g_keys['S'] || g_keys[VK_DOWN]) wish = wish - f;
+    if (g_keys['A'] || g_keys[VK_LEFT]) wish = wish - r;
+    if (g_keys['D'] || g_keys[VK_RIGHT]) wish = wish + r;
+    if (wish.length() > 1e-5f) wish = wish.normalized() * speed;
+
+    // Accelerate / friction on horizontal plane.
+    const float accel = g_player.onGround ? 18.0f : 4.0f;
+    const float friction = g_player.onGround ? 12.0f : 1.5f;
+    if (wish.length() > 1e-6f) {
+        g_player.vx += (wish.x - g_player.vx) * std::min(1.0f, accel * dt);
+        g_player.vz += (wish.z - g_player.vz) * std::min(1.0f, accel * dt);
+    } else {
+        float damp = std::exp(-friction * dt);
+        g_player.vx *= damp;
+        g_player.vz *= damp;
+        if (std::fabs(g_player.vx) < 1e-5f) g_player.vx = 0.0f;
+        if (std::fabs(g_player.vz) < 1e-5f) g_player.vz = 0.0f;
+    }
+
+    // Jump (Space) — no free-fly up/down.
+    if (g_wantJump && g_player.onGround) {
+        g_player.vy = g_player.jumpSpeed;
+        g_player.onGround = false;
+    }
+    g_wantJump = false;
+
+    // Gravity (same world scale as projectiles).
+    g_player.vy -= kWorldGravity * dt;
+    if (g_player.vy < -0.25f) g_player.vy = -0.25f; // terminal
+
+    // Integrate with axis-separated unit-grid collision.
+    auto moveAxis = [&](float& pos, float& vel, int axis) {
+        if (std::fabs(vel) < 1e-8f) return;
+        float next = pos + vel * dt;
+        float tx = g_player.px, ty = g_player.py, tz = g_player.pz;
+        if (axis == 0) tx = next;
+        else if (axis == 1) ty = next;
+        else tz = next;
+        if (!playerHitsSolid(tx, ty, tz)) {
+            pos = next;
+            return;
+        }
+        // Step up small ledges while grounded/walking horizontally.
+        if (axis != 1 && g_player.onGround) {
+            const float step = VOXEL_SIZE * 1.05f;
+            if (!playerHitsSolid(tx, g_player.py + step, tz)) {
+                g_player.py += step;
+                pos = next;
+                return;
+            }
+        }
+const float prevVel = vel;
+        vel = 0.0f;
+        // Only count floor hits (downward), not ceiling bumps.
+        if (axis == 1 && prevVel < 0.0f) g_player.onGround = true;
+    };
+
+    g_player.onGround = false;
+    moveAxis(g_player.px, g_player.vx, 0);
+    moveAxis(g_player.pz, g_player.vz, 2);
+    moveAxis(g_player.py, g_player.vy, 1);
+
+    // Ground probe: if feet almost on a solid top face, snap and clear fall speed.
+    {
+        float probeY = g_player.py - VOXEL_SIZE * 0.15f;
+        if (playerHitsSolid(g_player.px, probeY, g_player.pz) && g_player.vy <= 0.0f) {
+            // Snap up out of penetration.
+            for (int i = 0; i < 6 && playerHitsSolid(g_player.px, g_player.py, g_player.pz); ++i)
+                g_player.py += VOXEL_SIZE * 0.25f;
+            g_player.vy = 0.0f;
+            g_player.onGround = true;
+        }
+    }
+
+    // World floor safety.
+    if (g_player.py < 0.0f) {
+        g_player.py = 0.0f;
+        g_player.vy = 0.0f;
+        g_player.onGround = true;
+    }
+
+    syncCameraToPlayer();
+}
+
+// Kept name for call sites: water weight + physics body + locked camera.
 static void updateCamera(float dt) {
-    // Sprint with Shift
-    float speed = g_moveSpeed * dt;
-    if (g_keys[VK_SHIFT]) speed *= 2.25f;
-
-    Vec3 fwd = cameraForward();
-    Vec3 right = cameraRight();
-    // Keep strafe level so A/D feels like float-strafe, not roll
-    Vec3 flatRight = Vec3(right.x, 0.0f, right.z).normalized();
-    if (flatRight.length() < 1e-4f) flatRight = Vec3(1, 0, 0);
-
-    if (g_keys['W'] || g_keys[VK_UP]) g_camPos = g_camPos + fwd * speed;
-    if (g_keys['S'] || g_keys[VK_DOWN]) g_camPos = g_camPos - fwd * speed;
-    if (g_keys['A'] || g_keys[VK_LEFT]) g_camPos = g_camPos - flatRight * speed;
-    if (g_keys['D'] || g_keys[VK_RIGHT]) g_camPos = g_camPos + flatRight * speed;
-    if (g_keys[VK_SPACE] || g_keys['E']) g_camPos.y += speed;
-    if (g_keys[VK_CONTROL] || g_keys['Q']) g_camPos.y -= speed;
+    updatePlayerCurrentAndWeight(dt);
+    if (!g_smoke) {
+        updatePlayerPhysics(dt);
+    } else {
+        // Headless smoke: keep body planted, only yaw/pitch scripted; still lock eye.
+        syncCameraToPlayer();
+    }
 }
 
 static void updateUBO(uint32_t frameIndex, float timeSec) {
@@ -2454,9 +2705,13 @@ static void updateUBO(uint32_t frameIndex, float timeSec) {
         // Shader uses normalize(-moonDir) as light vector, so moonDir points toward surface from moon
         ubo.moonDir[0] = -L.x; ubo.moonDir[1] = -L.y; ubo.moonDir[2] = -L.z;
     }
-    ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
+ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
     ubo.moonColor[0] = 0.62f; ubo.moonColor[1] = 0.72f; ubo.moonColor[2] = 0.95f;
     ubo.ambientScale = g_isNight ? 0.65f : 1.0f;
+    ubo.muzzleFlash = g_muzzleFlash;
+    ubo.fireOverlay = g_fireOverlay;
+    ubo._fxPad[0] = 0.0f;
+    ubo._fxPad[1] = 0.0f;
 
     // Warm bulbs (world-space); match warehouse placements roughly
     auto setBulb = [&](int i, float x, float y, float z, float inten, float r, float g, float b, float radius) {
@@ -2488,8 +2743,8 @@ static void flushDirtyMesh() {
 }
 
 static void drawFrame(float timeSec, float dt) {
+    // updateCamera runs physics body + water weight + locks eye to player.
     updateCamera(dt);
-    updatePlayerCurrentAndWeight(dt);
 
     // Wait for this frame slot's prior GPU work before touching shared mesh buffers.
     vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
@@ -2641,8 +2896,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createPipeline();
         createSync();
 
-        auto chunks = buildWarehouseMap();
+auto chunks = buildWarehouseMap();
         g_chunks = &chunks;
+        spawnPlayerOnMap(chunks);
 
         // Load Python-exported projectile + ammo defs (gravity + effects)
         const std::string projCandidates[] = {
@@ -2696,12 +2952,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             if (dt > 0.05f) dt = 0.05f;
             float t = std::chrono::duration<float>(now - start).count();
 
-            if (g_fireCooldown > 0.0f) {
+if (g_fireCooldown > 0.0f) {
                 g_fireCooldown -= dt;
                 if (g_fireCooldown < 0.0f) g_fireCooldown = 0.0f;
             }
 
             g_ads = g_keys['X'] != 0;
+            updateRecoilRecovery(dt);
 
             // Functional smoke / stress: fire into warehouse bay
             if (g_smoke) {
@@ -2761,12 +3018,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                 g_firePressed = false;
             }
 
-            const bool wasDirty = g_meshDirty;
+const bool wasDirty = g_meshDirty;
             g_debris.beginFrame();
             updateProjectiles(dt);
             if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
                 g_projLivePeak = static_cast<int>(g_projectiles.size());
             g_debris.update(dt, kWorldGravity);
+            // Decay fire VFX (overlay + muzzle cubes).
+            if (g_muzzleFlash > 0.0f || g_fireOverlay > 0.0f) {
+                g_muzzleFlash = std::max(0.0f, g_muzzleFlash - dt * 6.5f);
+                g_fireOverlay = std::max(0.0f, g_fireOverlay - dt * 4.2f);
+                g_debris.meshDirty = true;
+            }
             if (wasDirty || g_meshDirty) { /* remesh deferred to drawFrame */ }
             // Count live projectile impacts indirectly via remesh flag consumption
             static int lastVertCount = -1;
@@ -2790,8 +3053,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         if (g_smoke) {
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
-            out << "frames=" << frames << "\nvertices=" << g_vertexCount
+out << "frames=" << frames << "\nvertices=" << g_vertexCount
                 << "\ncam=" << g_camPos.x << "," << g_camPos.y << "," << g_camPos.z
+                << "\nplayer=" << g_player.px << "," << g_player.py << "," << g_player.pz
+                << "\non_ground=" << (g_player.onGround ? 1 : 0)
+                << "\nlean=" << g_player.lean
                 << "\nyaw=" << g_yaw << "\npitch=" << g_pitch
                 << "\nprojectiles_loaded=" << g_projDefs.size()
                 << "\nammo_loaded=" << g_ammoDefs.size()
@@ -2811,8 +3077,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                 << "\ndebris_verts_peak=" << g_debrisVertsPeak
                 << "\ndebris_upload_us_avg=" << (g_debrisUploadSamples > 0 ? (g_debrisUploadUsSum / g_debrisUploadSamples) : 0.0)
                 << "\ndebris_upload_us_max=" << g_debrisUploadUsMax
-                << "\ndebris_upload_samples=" << g_debrisUploadSamples
-                << "\ndebris_billboard=1"
+<< "\ndebris_upload_samples=" << g_debrisUploadSamples
+                << "\ndebris_billboard=0"
+                << "\ndebris_cubes=1"
+                << "\ndebris_visual_scale=" << kDebrisVisualScale
+                << "\nmuzzle_flash_peak=1"
                 << "\nmesh_upload_us_avg=" << (g_meshUploadSamples > 0 ? (g_meshUploadUsSum / g_meshUploadSamples) : 0.0)
                 << "\nmesh_upload_us_max=" << g_meshUploadUsMax
                 << "\nmesh_upload_samples=" << g_meshUploadSamples

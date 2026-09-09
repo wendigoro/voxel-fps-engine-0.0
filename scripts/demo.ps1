@@ -30,7 +30,7 @@ if ($headless) {
   Write-Host "SkipInteractive/headless set - headless demo only."
 } else {
   Write-Host "== interactive warehouse demo =="
-  Write-Host "Controls: WASD fly | LMB look | RMB/F fire | 1-4 ammo | R cycle | Esc quit"
+Write-Host "Controls: WASD walk | Space jump | Q/E lean | LMB look | RMB/F fire | 1-4 ammo | R cycle | Esc quit"
   $launch = "start `"voxel_engine`" /D `"$Build`" voxel_engine.exe"
   & $cmdExe /d /c $launch
   Write-Host ("engine_launch=cmd_start cwd=" + $Build)

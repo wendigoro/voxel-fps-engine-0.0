@@ -14,6 +14,10 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float moonIntensity;
     vec3 moonColor;
     float ambientScale;
+    float muzzleFlash;
+    float fireOverlay;
+    float _fxPad0;
+    float _fxPad1;
     vec4 bulbPos[4];
     vec4 bulbColor[4];
 } ubo;
@@ -42,7 +46,7 @@ void main() {
 
     // Strong true-sky style fisheye (barrel + higher-order terms)
     float r = length(ndc);
-    float strength = (inMat > 2.5) ? 1.35 : 1.0;
+float strength = (inMat > 2.5 && inMat < 4.5) ? 1.35 : 1.0;
     float k1 = 0.55 * strength;
     float k2 = 0.22 * strength;
     float k3 = 0.08 * strength;
@@ -57,8 +61,12 @@ void main() {
     clip.xy = ndc * wclip;
 
     // Sky dome + moon stay at far plane so world wins on depth
-    if (inMat > 2.5) {
+    if (inMat > 2.5 && inMat < 4.5) {
         clip.z = clip.w * 0.999;
+    }
+    // Muzzle flash cubes: slight depth bias toward camera so they don't z-fight
+    if (inMat > 5.5) {
+        clip.z = clip.z * 0.98;
     }
 
     gl_Position = clip;
