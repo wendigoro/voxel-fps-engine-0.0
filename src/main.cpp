@@ -200,6 +200,75 @@ static bool g_fullySubmerged = false;
 static int g_touchingWaterUnits = 0;
 static int g_characterUnitCount = 0;
 
+// ===== MOVEMENT SYSTEM =====
+enum class Stance : uint8_t { Standing = 0, Crouch = 1, Prone = 2 };
+enum class Gait : uint8_t { Walk = 0, Run = 1, Sprint = 2 };
+
+struct MoveState {
+    Stance stance = Stance::Standing;
+    Gait gait = Gait::Walk;
+    bool sliding = false;
+    bool wallRunning = false;
+    int wallRunSide = 0; // -1 left, +1 right
+    float wallRunTime = 0.0f;
+    float slideSpeed = 0.0f;
+    float slideTime = 0.0f;
+    Vec3 slideDir = {0,0,0};
+    bool dashing = false;
+    float dashTime = 0.0f;
+    float dashCooldown = 0.0f;
+    Vec3 dashDir = {0,0,0};
+    bool dashInvuln = false;
+    float dashInvulnTime = 0.0f;
+    // Stamina for sprint/dash
+    float stamina = 100.0f;
+    float staminaRegenDelay = 0.0f;
+    // Animation
+    float animTime = 0.0f;
+    float animSpeed = 1.0f;
+    int animFrame = 0;
+};
+
+static MoveState g_move;
+
+// Stance params
+inline constexpr float STANCE_EYE_HEIGHT[3] = { 0.0261f, 0.015f, 0.006f }; // standing, crouch, prone
+inline constexpr float STANCE_COLLISION_HEIGHT[3] = { 0.048f, 0.028f, 0.012f };
+inline constexpr float STANCE_SPEED_MULT[3] = { 1.0f, 0.55f, 0.25f };
+
+// Gait params
+inline constexpr float GAIT_SPEED_MULT[3] = { 0.6f, 1.0f, 1.8f };
+inline constexpr float GAIT_STAMINA_DRAIN[3] = { 0.0f, 0.0f, 18.0f }; // per second
+inline constexpr float GAIT_STAMINA_REGEN = 25.0f; // per second
+
+// Slide params
+inline constexpr float SLIDE_ENTER_MIN_SPEED = 0.12f; // world units/sec
+inline constexpr float SLIDE_INITIAL_BOOST = 1.6f;
+inline constexpr float SLIDE_FRICTION = 0.85f; // per second factor
+inline constexpr float SLIDE_MIN_SPEED = 0.02f;
+inline constexpr float SLIDE_MAX_TIME = 2.0f;
+
+// Wallrun params
+inline constexpr float WALLRUN_MIN_SPEED = 0.08f;
+inline constexpr float WALLRUN_MAX_TIME = 3.0f;
+inline constexpr float WALLRUN_GRAVITY_SCALE = 0.15f;
+inline constexpr float WALLRUN_JUMP_IMPULSE = 0.18f;
+inline constexpr float WALLRUN_CAMERA_TILT = 0.35f; // radians
+
+// Dash params
+inline constexpr float DASH_DISTANCE = 0.35f; // world units
+inline constexpr float DASH_DURATION = 0.18f;
+inline constexpr float DASH_COOLDOWN = 1.2f;
+inline constexpr float DASH_INVULN_TIME = 0.12f;
+inline constexpr float DASH_STAMINA_COST = 25.0f;
+
+// Animation
+inline constexpr float ANIM_WALK_CYCLE = 1.0f;
+inline constexpr float ANIM_RUN_CYCLE = 0.7f;
+inline constexpr float ANIM_SPRINT_CYCLE = 0.5f;
+inline constexpr float ANIM_CROUCH_CYCLE = 1.3f;
+inline constexpr float ANIM_PRONE_CYCLE = 1.6f;
+
 static VkInstance g_instance = VK_NULL_HANDLE;
 static VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 static VkPhysicalDevice g_phys = VK_NULL_HANDLE;
@@ -258,6 +327,14 @@ static double g_frameMsMin = 1e9;
 static double g_frameMsMax = 0.0;
 static int g_frameMsCount = 0;
 static int g_framePaceHits = 0;
+
+// Character model (first-person body)
+static VkBuffer g_charVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_charMem = VK_NULL_HANDLE;
+static uint32_t g_charVertexCount = 0;
+static Mat4 g_charModelMatrix{};
+static float g_charBobOffset = 0.0f;
+static float g_charSwayOffset = 0.0f;
 
 static std::string g_exeDir;
 
@@ -1609,7 +1686,9 @@ static void uploadMesh(const std::vector<Vertex>& verts) {
     vkFreeMemory(g_device, stagingMem, nullptr);
 }
 
+// Forward declarations
 static Vec3 cameraForward();
+static Vec3 cameraRight();
 
 static void destroyVoxelAt(int x, int y, int z) {
     if (!g_chunks || !worldInBounds(x, y, z)) return;
@@ -2025,6 +2104,13 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         g_drawnChunks = 1;
     }
 
+    // Character model (first-person body)
+    if (g_charVB != VK_NULL_HANDLE && g_charVertexCount > 0) {
+        VkDeviceSize co = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_charVB, &co);
+        vkCmdDraw(cmd, g_charVertexCount, 1, 0, 0);
+    }
+
 // Pixel sky dome + moon light-source sprite (drawn after world; sky verts forced to far Z)
     if (g_skyTileVB != VK_NULL_HANDLE && g_skyTileVertexCount > 0) {
         VkDeviceSize mo = 0;
@@ -2113,6 +2199,700 @@ static void updatePlayerCurrentAndWeight(float dt) {
     (void)ratio;
 }
 
+// ===== MOVEMENT SYSTEM FUNCTIONS =====
+
+// Check if there's ground under the player at given stance height
+static bool checkGround(const std::vector<Chunk>& chunks, const Vec3& pos, float stanceHeight) {
+    int gx = static_cast<int>(std::floor(pos.x / VOXEL_SIZE));
+    int gy = static_cast<int>(std::floor((pos.y - stanceHeight * 0.5f) / VOXEL_SIZE));
+    int gz = static_cast<int>(std::floor(pos.z / VOXEL_SIZE));
+    if (!worldInBounds(gx, gy, gz)) return false;
+    Block b = getWorldBlock(chunks, gx, gy, gz);
+    return b != Block::Air && !isWaterBlock(b);
+}
+
+// Check wall for wallrunning (returns side: -1 left, +1 right, 0 none)
+static int checkWallRun(const std::vector<Chunk>& chunks, const Vec3& pos, const Vec3& fwd, const Vec3& right, float stanceHeight) {
+    // Check slightly above feet and at head height
+    float checkY = pos.y - stanceHeight * 0.5f + 0.01f;
+    float headY = pos.y + stanceHeight * 0.5f - 0.01f;
+    
+    // Check right wall
+    Vec3 rp = pos + right * 0.35f;
+    int rgx = static_cast<int>(std::floor(rp.x / VOXEL_SIZE));
+    int rgy = static_cast<int>(std::floor(checkY / VOXEL_SIZE));
+    int rgz = static_cast<int>(std::floor(rp.z / VOXEL_SIZE));
+    bool rightWall = worldInBounds(rgx, rgy, rgz) && 
+                     getWorldBlock(chunks, rgx, rgy, rgz) != Block::Air && 
+                     !isWaterBlock(getWorldBlock(chunks, rgx, rgy, rgz));
+    // Also check at head height
+    int rgy2 = static_cast<int>(std::floor(headY / VOXEL_SIZE));
+    rightWall = rightWall || (worldInBounds(rgx, rgy2, rgz) && 
+                              getWorldBlock(chunks, rgx, rgy2, rgz) != Block::Air && 
+                              !isWaterBlock(getWorldBlock(chunks, rgx, rgy2, rgz)));
+    
+    // Check left wall
+    Vec3 lp = pos - right * 0.35f;
+    int lgx = static_cast<int>(std::floor(lp.x / VOXEL_SIZE));
+    int lgy = static_cast<int>(std::floor(checkY / VOXEL_SIZE));
+    int lgz = static_cast<int>(std::floor(lp.z / VOXEL_SIZE));
+    bool leftWall = worldInBounds(lgx, lgy, lgz) && 
+                    getWorldBlock(chunks, lgx, lgy, lgz) != Block::Air && 
+                    !isWaterBlock(getWorldBlock(chunks, lgx, lgy, lgz));
+    int lgy2 = static_cast<int>(std::floor(headY / VOXEL_SIZE));
+    leftWall = leftWall || (worldInBounds(lgx, lgy2, lgz) && 
+                            getWorldBlock(chunks, lgx, lgy2, lgz) != Block::Air && 
+                            !isWaterBlock(getWorldBlock(chunks, lgx, lgy2, lgz)));
+    
+    // Need forward velocity component
+    float fwdSpeed = 0.0f;
+    if (g_chunks) {
+        // Approximate from recent movement - we'll compute in updateMovement
+    }
+    
+    if (rightWall && !leftWall) return +1;
+    if (leftWall && !rightWall) return -1;
+    return 0;
+}
+
+// Stance transition helper
+static void setStance(Stance newStance) {
+    if (newStance == g_move.stance) return;
+    g_move.stance = newStance;
+    // Adjust camera height smoothly
+    // Instant for now, could lerp
+}
+
+// Main movement update
+static void updateMovement(float dt) {
+    if (!g_chunks) return;
+    
+    const auto& chunks = *g_chunks;
+    MoveState& m = g_move;
+    
+    // ----- Input handling -----
+    bool inputForward = g_keys['W'] || g_keys[VK_UP];
+    bool inputBack = g_keys['S'] || g_keys[VK_DOWN];
+    bool inputLeft = g_keys['A'] || g_keys[VK_LEFT];
+    bool inputRight = g_keys['D'] || g_keys[VK_RIGHT];
+    bool inputJump = g_keys[VK_SPACE] && !(g_keys['E']); // Space = jump, E = up (fly)
+    bool inputCrouch = g_keys[VK_CONTROL] && !(g_keys['Q']); // Control = crouch/prone, Q = down (fly)
+    bool inputSprint = g_keys[VK_SHIFT];
+    bool inputDash = (GetAsyncKeyState('C') & 0x8000) != 0; // C for dash
+    
+    // Stance toggles: C = crouch (tap), X = prone (tap) - but C is dash, so use different keys
+    // Tap Control for crouch/stand, Hold Control + Tap for prone
+    static bool prevControl = false;
+    bool controlPressed = g_keys[VK_CONTROL];
+    if (controlPressed && !prevControl) {
+        if (m.stance == Stance::Standing) setStance(Stance::Crouch);
+        else if (m.stance == Stance::Crouch) setStance(Stance::Prone);
+        else setStance(Stance::Standing);
+    }
+    prevControl = controlPressed;
+    
+    // ----- Dash cooldown -----
+    if (m.dashCooldown > 0.0f) m.dashCooldown -= dt;
+    if (m.dashInvulnTime > 0.0f) {
+        m.dashInvulnTime -= dt;
+        if (m.dashInvulnTime <= 0.0f) m.dashInvuln = false;
+    }
+    
+    // ----- Ground check -----
+    float stanceHeight = STANCE_COLLISION_HEIGHT[static_cast<int>(m.stance)];
+    float eyeHeight = STANCE_EYE_HEIGHT[static_cast<int>(m.stance)];
+    bool onGround = checkGround(chunks, g_camPos, stanceHeight);
+    
+    // Track position for speed calculation
+    Vec3 posBefore = g_camPos;
+    
+    // ----- Camera vectors -----
+    Vec3 fwd = cameraForward();
+    Vec3 right = cameraRight();
+    Vec3 flatFwd = Vec3(fwd.x, 0.0f, fwd.z).normalized();
+    Vec3 flatRight = Vec3(right.x, 0.0f, right.z).normalized();
+    if (flatFwd.length() < 1e-4f) flatFwd = Vec3(0, 0, -1);
+    if (flatRight.length() < 1e-4f) flatRight = Vec3(1, 0, 0);
+    
+    // ----- Dash -----
+    if (inputDash && m.dashCooldown <= 0.0f && !m.dashing && m.stamina >= DASH_STAMINA_COST) {
+        m.dashing = true;
+        m.dashTime = DASH_DURATION;
+        m.dashCooldown = DASH_COOLDOWN;
+        m.dashInvuln = true;
+        m.dashInvulnTime = DASH_INVULN_TIME;
+        m.stamina -= DASH_STAMINA_COST;
+        m.staminaRegenDelay = 0.5f;
+        
+        // Dash direction: input direction or forward
+        Vec3 dashInput = {0,0,0};
+        if (inputForward) dashInput = dashInput + flatFwd;
+        if (inputBack) dashInput = dashInput - flatFwd;
+        if (inputLeft) dashInput = dashInput - flatRight;
+        if (inputRight) dashInput = dashInput + flatRight;
+        if (dashInput.length() < 1e-4f) dashInput = flatFwd;
+        m.dashDir = dashInput.normalized();
+        
+        // Dash can be used in air or on ground
+    }
+    
+    // Execute dash
+    if (m.dashing) {
+        m.dashTime -= dt;
+        float dashSpeed = DASH_DISTANCE / DASH_DURATION;
+        g_camPos = g_camPos + m.dashDir * dashSpeed * dt;
+        
+        if (m.dashTime <= 0.0f) {
+            m.dashing = false;
+            m.dashDir = {0,0,0};
+        }
+    }
+    
+    // ----- Wallrun detection -----
+    int wallSide = 0;
+    if (!m.dashing && onGround == false && m.stamina > 10.0f) {
+        // Check walls at current velocity
+        wallSide = checkWallRun(chunks, g_camPos, flatFwd, flatRight, stanceHeight);
+    }
+    
+    // ----- Wallrun logic -----
+    if (wallSide != 0 && !m.dashing && !m.sliding) {
+        if (!m.wallRunning) {
+            m.wallRunning = true;
+            m.wallRunSide = wallSide;
+            m.wallRunTime = 0.0f;
+        } else if (m.wallRunSide == wallSide) {
+            m.wallRunTime += dt;
+            if (m.wallRunTime > WALLRUN_MAX_TIME) {
+                m.wallRunning = false;
+            }
+        } else {
+            // Switched walls
+            m.wallRunSide = wallSide;
+            m.wallRunTime = 0.0f;
+        }
+    } else {
+        m.wallRunning = false;
+        m.wallRunTime = 0.0f;
+    }
+    
+    // ----- Movement speed calculation -----
+    float stanceMult = STANCE_SPEED_MULT[static_cast<int>(m.stance)];
+    float gaitMult = GAIT_SPEED_MULT[static_cast<int>(m.gait)];
+    float baseSpeed = g_moveSpeed * stanceMult * gaitMult;
+    
+    // Determine gait from input
+    if (inputSprint && m.stamina > 0.0f && onGround && !m.sliding && !m.wallRunning) {
+        m.gait = Gait::Sprint;
+    } else if (inputForward || inputBack || inputLeft || inputRight) {
+        if (inputSprint && m.stamina <= 0.0f) {
+            m.gait = Gait::Run; // exhausted sprint becomes run
+        } else if (m.stance == Stance::Crouch || m.stance == Stance::Prone) {
+            m.gait = Gait::Walk;
+        } else {
+            m.gait = Gait::Run;
+        }
+    } else {
+        m.gait = Gait::Walk;
+    }
+    
+    // ----- Stamina -----
+    float staminaDrain = GAIT_STAMINA_DRAIN[static_cast<int>(m.gait)];
+    if (staminaDrain > 0.0f) {
+        m.stamina = std::max(0.0f, m.stamina - staminaDrain * dt);
+        m.staminaRegenDelay = 0.5f;
+    } else if (m.staminaRegenDelay > 0.0f) {
+        m.staminaRegenDelay -= dt;
+    } else {
+        m.stamina = std::min(100.0f, m.stamina + GAIT_STAMINA_REGEN * dt);
+    }
+    
+    // ----- Sliding -----
+    // Enter slide: sprint + crouch tap while moving fast
+    static float prevSpeed = 0.0f;
+    float currentFlatSpeed = 0.0f; // will compute after movement
+    
+    if (m.sliding) {
+        m.slideTime += dt;
+        m.slideSpeed *= std::pow(SLIDE_FRICTION, dt);
+        
+        if (m.slideSpeed < SLIDE_MIN_SPEED || m.slideTime > SLIDE_MAX_TIME || onGround == false) {
+            m.sliding = false;
+            m.slideSpeed = 0.0f;
+            m.slideTime = 0.0f;
+            // Return to crouch
+            if (m.stance == Stance::Crouch) setStance(Stance::Crouch);
+        } else {
+            // Continue sliding in slide direction
+            g_camPos = g_camPos + m.slideDir * m.slideSpeed * dt;
+        }
+    } else if (onGround && m.gait == Gait::Sprint && controlPressed && prevSpeed > SLIDE_ENTER_MIN_SPEED) {
+        // Enter slide
+        m.sliding = true;
+        m.slideTime = 0.0f;
+        m.slideSpeed = prevSpeed * SLIDE_INITIAL_BOOST;
+        m.slideDir = flatFwd; // slide in current facing direction
+        setStance(Stance::Crouch);
+    }
+    
+    // ----- Wallrun movement -----
+    if (m.wallRunning && !m.dashing && !m.sliding) {
+        // Move along wall
+        Vec3 wallFwd = flatFwd; // along wall direction
+        float wallSpeed = baseSpeed * 1.2f; // slight speed boost
+        g_camPos = g_camPos + wallFwd * wallSpeed * dt;
+        
+        // Reduced gravity
+        g_camPos.y -= 9.81f * 0.35f * WALLRUN_GRAVITY_SCALE * dt;
+        
+        // Camera tilt
+        float targetRoll = m.wallRunSide * WALLRUN_CAMERA_TILT;
+        // Note: roll would need camera matrix modification
+        
+        // Wall jump
+        if (inputJump) {
+            m.wallRunning = false;
+            g_camPos.y += WALLRUN_JUMP_IMPULSE;
+            // Kick away from wall
+            g_camPos = g_camPos - flatRight * m.wallRunSide * 0.15f;
+        }
+    }
+    
+    // ----- Normal ground/air movement -----
+    if (!m.dashing && !m.sliding && !m.wallRunning) {
+        float speed = baseSpeed * dt;
+        Vec3 moveDir = {0,0,0};
+        
+        if (inputForward) moveDir = moveDir + flatFwd;
+        if (inputBack) moveDir = moveDir - flatFwd;
+        if (inputLeft) moveDir = moveDir - flatRight;
+        if (inputRight) moveDir = moveDir + flatRight;
+        
+        if (moveDir.length() > 1e-4f) {
+            moveDir = moveDir.normalized();
+            g_camPos = g_camPos + moveDir * speed;
+        }
+        
+        // Jump
+        if (inputJump && onGround && !m.dashing) {
+            float jumpImpulse = 0.16f * stanceMult; // lower jump when crouched/prone
+            g_camPos.y += jumpImpulse;
+        }
+        
+        // Gravity (when not on ground)
+        if (!onGround) {
+            float gravity = 9.81f * 0.35f;
+            if (m.stance == Stance::Prone) gravity *= 0.5f; // slower fall when prone
+            g_camPos.y -= gravity * dt;
+            
+            // Ground collision
+            if (g_camPos.y < stanceHeight * 0.5f) {
+                g_camPos.y = stanceHeight * 0.5f;
+            }
+        } else {
+            // Snap to ground
+            float targetY = stanceHeight * 0.5f;
+            // Find actual ground height
+            int gx = static_cast<int>(std::floor(g_camPos.x / VOXEL_SIZE));
+            int gz = static_cast<int>(std::floor(g_camPos.z / VOXEL_SIZE));
+            for (int gy = static_cast<int>(g_camPos.y / VOXEL_SIZE); gy >= 0; --gy) {
+                if (worldInBounds(gx, gy, gz)) {
+                    Block b = getWorldBlock(chunks, gx, gy, gz);
+                    if (b != Block::Air && !isWaterBlock(b)) {
+                        targetY = (gy + 1) * VOXEL_SIZE + stanceHeight * 0.5f;
+                        break;
+                    }
+                }
+            }
+            g_camPos.y = targetY;
+        }
+    }
+    
+    // ----- Vertical movement (fly mode with E/Q) -----
+    if (g_keys['E']) g_camPos.y += baseSpeed * dt;
+    if (g_keys['Q']) g_camPos.y -= baseSpeed * dt;
+    
+    // ----- Clamp to world bounds -----
+    g_camPos.x = std::max(VOXEL_SIZE, std::min(g_camPos.x, (WORLD_W - 1) * VOXEL_SIZE));
+    g_camPos.z = std::max(VOXEL_SIZE, std::min(g_camPos.z, (WORLD_D - 1) * VOXEL_SIZE));
+    g_camPos.y = std::max(stanceHeight * 0.5f, std::min(g_camPos.y, (WORLD_H - 1) * VOXEL_SIZE));
+    
+    // ----- Update eye height based on stance -----
+    // Camera position IS the eye position, so we adjust Y to maintain eye height
+    // The collision check uses stanceHeight for feet position
+    
+    // ----- Animation timer -----
+    m.animTime += dt * m.animSpeed;
+    
+    // Store speed for slide entry detection next frame
+    Vec3 delta = g_camPos - posBefore;
+    currentFlatSpeed = std::sqrt(delta.x * delta.x + delta.z * delta.z) / dt;
+    prevSpeed = currentFlatSpeed;
+    
+    // Update player grid position for water/current
+    g_playerGX = static_cast<int>(std::floor(g_camPos.x / VOXEL_SIZE)) - 2;
+    g_playerGY = static_cast<int>(std::floor((g_camPos.y - stanceHeight) / VOXEL_SIZE)) - 1;
+    g_playerGZ = static_cast<int>(std::floor(g_camPos.z / VOXEL_SIZE)) - 1;
+}
+
+// ===== CHARACTER MODEL & ANIMATION =====
+
+// Character body part structure
+struct CharPart {
+    Vec3 localPos;      // Relative to character root
+    Vec3 size;          // Dimensions in voxels
+    Vec3 color;         // RGB color
+    float material;     // Vertex mat attribute
+    // Animation
+    Vec3 animOffset;    // Current animation offset
+    Vec3 animRot;       // Current animation rotation (euler)
+};
+
+// Build character voxel model for current animation frame (vertices in world space)
+static std::vector<Vertex> buildCharacterModel(const MoveState& m, float timeSec, const Vec3& camPos, float yaw) {
+    std::vector<Vertex> verts;
+    verts.reserve(2000);
+    
+    // Character dimensions (in voxels, then scaled by VOXEL_SIZE)
+    // Standing: ~1.8m tall = 1800 voxels, but we use smaller for first-person view
+    float voxelScale = VOXEL_SIZE;
+    
+    // Stance adjustments
+    float stanceHeight = STANCE_COLLISION_HEIGHT[static_cast<int>(m.stance)];
+    float crouchFactor = (m.stance == Stance::Crouch) ? 0.6f : 
+                         (m.stance == Stance::Prone) ? 0.3f : 1.0f;
+    
+    // Character world position (feet)
+    Vec3 charPos = camPos;
+    charPos.y -= stanceHeight * 0.5f; // Move from eye to feet
+    
+    // Yaw rotation
+    float cy = std::cos(yaw);
+    float sy = std::sin(yaw);
+    
+    // Animation phase
+    float animPhase = m.animTime * 2.0f * static_cast<float>(M_PI);
+    float gaitCycle = 1.0f;
+    if (m.gait == Gait::Walk) gaitCycle = ANIM_WALK_CYCLE;
+    else if (m.gait == Gait::Run) gaitCycle = ANIM_RUN_CYCLE;
+    else if (m.gait == Gait::Sprint) gaitCycle = ANIM_SPRINT_CYCLE;
+    else if (m.stance == Stance::Crouch) gaitCycle = ANIM_CROUCH_CYCLE;
+    else if (m.stance == Stance::Prone) gaitCycle = ANIM_PRONE_CYCLE;
+    
+    animPhase *= gaitCycle;
+    
+    // Bob and sway
+    float bobAmount = 0.0f;
+    float swayAmount = 0.0f;
+    if (m.gait == Gait::Walk) { bobAmount = 0.0015f; swayAmount = 0.0008f; }
+    else if (m.gait == Gait::Run) { bobAmount = 0.003f; swayAmount = 0.0015f; }
+    else if (m.gait == Gait::Sprint) { bobAmount = 0.0045f; swayAmount = 0.002f; }
+    else if (m.stance == Stance::Crouch) { bobAmount = 0.0008f; swayAmount = 0.0004f; }
+    else if (m.stance == Stance::Prone) { bobAmount = 0.0003f; swayAmount = 0.0002f; }
+    
+    // Apply dash animation
+    if (m.dashing) {
+        bobAmount *= 2.0f;
+        swayAmount *= 0.5f;
+    }
+    
+    // Apply slide animation
+    if (m.sliding) {
+        bobAmount *= 0.3f;
+        swayAmount *= 0.1f;
+    }
+    
+    // Apply wallrun animation
+    if (m.wallRunning) {
+        bobAmount *= 0.5f;
+        swayAmount *= 1.5f;
+    }
+    
+    g_charBobOffset = std::sin(animPhase) * bobAmount;
+    g_charSwayOffset = std::sin(animPhase * 0.5f) * swayAmount;
+    
+    // Define body parts (local positions relative to character center at feet)
+    // All units in voxels, will multiply by voxelScale
+    
+    // Torso
+    CharPart torso = {
+        {0, 12 * crouchFactor, 0},           // localPos
+        {6, 10 * crouchFactor, 4},           // size
+        {0.35f, 0.25f, 0.15f},               // color (clothing)
+        0.0f,                                 // material (solid)
+        {0, g_charBobOffset / voxelScale, 0}, // animOffset
+        {0, 0, 0}                             // animRot
+    };
+    
+    // Head
+    CharPart head = {
+        {0, 22 * crouchFactor, 0},
+        {5, 5, 5},
+        {0.85f, 0.70f, 0.55f}, // skin tone
+        0.0f,
+        {0, g_charBobOffset / voxelScale * 0.5f, 0},
+        {0, 0, 0}
+    };
+    
+    // Legs
+    float legPhase = animPhase;
+    float legSwing = std::sin(legPhase) * 0.6f; // radians
+    float legLift = std::max(0.0f, std::sin(legPhase)) * 0.3f;
+    
+    CharPart legL = {
+        {-2.5f, 5 * crouchFactor, 0},
+        {3, 10 * crouchFactor, 3},
+        {0.25f, 0.20f, 0.15f}, // pants
+        0.0f,
+        {g_charSwayOffset / voxelScale, 
+         g_charBobOffset / voxelScale + std::sin(legPhase) * 0.5f * voxelScale / voxelScale,
+         -legSwing * 2.0f},
+        {legSwing, 0, 0}
+    };
+    
+    CharPart legR = {
+        {2.5f, 5 * crouchFactor, 0},
+        {3, 10 * crouchFactor, 3},
+        {0.25f, 0.20f, 0.15f},
+        0.0f,
+        {-g_charSwayOffset / voxelScale,
+         g_charBobOffset / voxelScale - std::sin(legPhase) * 0.5f * voxelScale / voxelScale,
+         legSwing * 2.0f},
+        {-legSwing, 0, 0}
+    };
+    
+    // Arms
+    float armPhase = animPhase + static_cast<float>(M_PI); // opposite to legs
+    float armSwing = std::sin(armPhase) * 0.5f;
+    
+    CharPart armL = {
+        {-5.5f, 16 * crouchFactor, 0},
+        {3, 10 * crouchFactor, 3},
+        {0.80f, 0.65f, 0.50f}, // skin
+        0.0f,
+        {g_charSwayOffset / voxelScale * 0.5f,
+         g_charBobOffset / voxelScale * 0.3f,
+         -armSwing * 3.0f},
+        {armSwing * 0.5f, 0, 0}
+    };
+    
+    CharPart armR = {
+        {5.5f, 16 * crouchFactor, 0},
+        {3, 10 * crouchFactor, 3},
+        {0.80f, 0.65f, 0.50f},
+        0.0f,
+        {-g_charSwayOffset / voxelScale * 0.5f,
+         g_charBobOffset / voxelScale * 0.3f,
+         armSwing * 3.0f},
+        {-armSwing * 0.5f, 0, 0}
+    };
+    
+    // Adjust for stance
+    if (m.stance == Stance::Crouch) {
+        // Legs bent
+        legL.localPos.y = 3;
+        legR.localPos.y = 3;
+        legL.size.y = 7;
+        legR.size.y = 7;
+        legL.animOffset.z = -0.8f;
+        legR.animOffset.z = 0.8f;
+        legL.animRot.x = 0.8f;
+        legR.animRot.x = -0.8f;
+        // Arms forward
+        armL.animOffset.z = -1.5f;
+        armR.animOffset.z = 1.5f;
+        armL.animRot.x = 0.5f;
+        armR.animRot.x = -0.5f;
+    } else if (m.stance == Stance::Prone) {
+        // Prone - body horizontal
+        torso.localPos.y = 3;
+        torso.size.y = 4;
+        torso.animRot.x = 1.57f; // 90 degrees
+        head.localPos.y = 5;
+        head.animRot.x = 1.57f;
+        legL.localPos = {-2, 2, 5};
+        legR.localPos = {2, 2, 5};
+        legL.size.y = 8;
+        legR.size.y = 8;
+        legL.animRot.x = 0;
+        legR.animRot.x = 0;
+        armL.localPos = {-5, 3, 2};
+        armR.localPos = {5, 3, 2};
+        armL.animRot.x = 0;
+        armR.animRot.x = 0;
+    }
+    
+    // Apply slide pose
+    if (m.sliding) {
+        torso.animRot.x = -0.3f; // lean back
+        legL.animRot.x = 1.0f;  // legs forward
+        legR.animRot.x = 1.0f;
+        legL.localPos.z = 3;
+        legR.localPos.z = 3;
+        armL.animRot.x = -0.5f; // arms back
+        armR.animRot.x = -0.5f;
+        armL.localPos.z = -2;
+        armR.localPos.z = -2;
+    }
+    
+    // Apply wallrun pose
+    if (m.wallRunning) {
+        float tilt = m.wallRunSide * 0.4f;
+        torso.animRot.z = tilt;
+        head.animRot.z = tilt * 0.5f;
+        // Legs push against wall
+        if (m.wallRunSide > 0) {
+            legR.animOffset.z = -2.0f;
+            legR.animRot.x = -0.6f;
+        } else {
+            legL.animOffset.z = 2.0f;
+            legL.animRot.x = 0.6f;
+        }
+    }
+    
+    // Helper to emit a box as voxels
+    auto emitBox = [&](const CharPart& part) {
+        int vx = static_cast<int>(part.size.x);
+        int vy = static_cast<int>(part.size.y);
+        int vz = static_cast<int>(part.size.z);
+        if (vx < 1) vx = 1;
+        if (vy < 1) vy = 1;
+        if (vz < 1) vz = 1;
+        
+        for (int x = 0; x < vx; ++x) {
+            for (int y = 0; y < vy; ++y) {
+                for (int z = 0; z < vz; ++z) {
+                    // Only surface voxels for performance
+                    bool surface = (x == 0 || x == vx-1 || y == 0 || y == vy-1 || z == 0 || z == vz-1);
+                    if (!surface && (vx > 2 && vy > 2 && vz > 2)) continue;
+                    
+                    float px = (part.localPos.x + part.animOffset.x + (x - vx*0.5f + 0.5f)) * voxelScale;
+                    float py = (part.localPos.y + part.animOffset.y + (y - vy*0.5f + 0.5f)) * voxelScale;
+                    float pz = (part.localPos.z + part.animOffset.z + (z - vz*0.5f + 0.5f)) * voxelScale;
+                    
+                    // Apply rotation (simplified - just Y and X)
+                    if (part.animRot.x != 0 || part.animRot.z != 0) {
+                        float cx = px, cy = py, cz = pz;
+                        if (part.animRot.x != 0) {
+                            float c = std::cos(part.animRot.x), s = std::sin(part.animRot.x);
+                            py = cy * c - cz * s;
+                            pz = cy * s + cz * c;
+                        }
+                        if (part.animRot.z != 0) {
+                            float c = std::cos(part.animRot.z), s = std::sin(part.animRot.z);
+                            float nx = cx * c - cy * s;
+                            float ny = cx * s + cy * c;
+                            px = nx; py = ny;
+                        }
+                    }
+                    
+                    // Apply character yaw rotation
+                    {
+                        float cx = px, cz = pz;
+                        px = cx * cy - cz * sy;
+                        pz = cx * sy + cz * cy;
+                    }
+                    
+                    // Apply character world position
+                    px += charPos.x;
+                    py += charPos.y;
+                    pz += charPos.z;
+                    
+                    // Emit 6 faces for this voxel
+                    static const float F[6][4][3] = {
+                        {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
+                        {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
+                        {{0,1,0},{0,1,1},{1,1,1},{1,1,0}}, // +Y
+                        {{0,0,1},{0,0,0},{1,0,0},{1,0,1}}, // -Y
+                        {{1,0,1},{1,1,1},{0,1,1},{0,0,1}}, // +Z
+                        {{0,0,0},{0,1,0},{1,1,0},{1,0,0}}, // -Z
+                    };
+                    static const float N[6][3] = {
+                        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
+                    };
+                    static const int IDX[6] = {0, 1, 2, 0, 2, 3};
+                    static const float faceShade[6] = {0.82f, 0.68f, 1.0f, 0.52f, 0.90f, 0.74f};
+                    
+                    Vec3 col = part.color * faceShade[0]; // will be overridden per face
+                    
+                    for (int f = 0; f < 6; ++f) {
+                        Vec3 fc = part.color * faceShade[f];
+                        for (int i = 0; i < 6; ++i) {
+                            const float* p = F[f][IDX[i]];
+                            verts.push_back(Vertex{
+                                px + p[0] * voxelScale,
+                                py + p[1] * voxelScale,
+                                pz + p[2] * voxelScale,
+                                N[f][0], N[f][1], N[f][2],
+                                fc.x, fc.y, fc.z,
+                                part.material
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    };
+    
+    // Build parts in order: legs, torso, arms, head
+    emitBox(legL);
+    emitBox(legR);
+    emitBox(torso);
+    emitBox(armL);
+    emitBox(armR);
+    emitBox(head);
+    
+    return verts;
+}
+
+// Upload character model to GPU
+static void uploadCharacterModel(const std::vector<Vertex>& verts) {
+    if (verts.empty()) {
+        g_charVertexCount = 0;
+        return;
+    }
+    vkDeviceWaitIdle(g_device);
+    if (g_charVB) {
+        vkDestroyBuffer(g_device, g_charVB, nullptr);
+        g_charVB = VK_NULL_HANDLE;
+    }
+    if (g_charMem) {
+        vkFreeMemory(g_device, g_charMem, nullptr);
+        g_charMem = VK_NULL_HANDLE;
+    }
+    
+    g_charVertexCount = static_cast<uint32_t>(verts.size());
+    VkDeviceSize size = sizeof(Vertex) * verts.size();
+    
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 staging, stagingMem);
+    void* data = nullptr;
+    vkMapMemory(g_device, stagingMem, 0, size, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(size));
+    vkUnmapMemory(g_device, stagingMem);
+    
+    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, g_charVB, g_charMem);
+    
+    VkCommandBuffer cmd = beginOneTime();
+    VkBufferCopy copy{0, 0, size};
+    vkCmdCopyBuffer(cmd, staging, g_charVB, 1, &copy);
+    endOneTime(cmd);
+    
+    vkDestroyBuffer(g_device, staging, nullptr);
+    vkFreeMemory(g_device, stagingMem, nullptr);
+}
+
+// Update character model (rebuilds mesh each frame for animation)
+static void updateCharacterModel(float dt, float timeSec) {
+    // Rebuild character mesh each frame for animation (vertices in world space)
+    auto charVerts = buildCharacterModel(g_move, timeSec, g_camPos, g_yaw);
+    uploadCharacterModel(charVerts);
+}
+
 static Vec3 cameraForward() {
     // Yaw around +Y, pitch around local X. Forward is free-float (includes vertical).
     const float cp = std::cos(g_pitch);
@@ -2127,23 +2907,10 @@ static Vec3 cameraRight() {
     return cameraForward().cross(Vec3(0, 1, 0)).normalized();
 }
 
-static void updateCamera(float dt) {
-    // Sprint with Shift
-    float speed = g_moveSpeed * dt;
-    if (g_keys[VK_SHIFT]) speed *= 2.25f;
-
-    Vec3 fwd = cameraForward();
-    Vec3 right = cameraRight();
-    // Keep strafe level so A/D feels like float-strafe, not roll
-    Vec3 flatRight = Vec3(right.x, 0.0f, right.z).normalized();
-    if (flatRight.length() < 1e-4f) flatRight = Vec3(1, 0, 0);
-
-    if (g_keys['W'] || g_keys[VK_UP]) g_camPos = g_camPos + fwd * speed;
-    if (g_keys['S'] || g_keys[VK_DOWN]) g_camPos = g_camPos - fwd * speed;
-    if (g_keys['A'] || g_keys[VK_LEFT]) g_camPos = g_camPos - flatRight * speed;
-    if (g_keys['D'] || g_keys[VK_RIGHT]) g_camPos = g_camPos + flatRight * speed;
-    if (g_keys[VK_SPACE] || g_keys['E']) g_camPos.y += speed;
-    if (g_keys[VK_CONTROL] || g_keys['Q']) g_camPos.y -= speed;
+static void updateCameraOrientation(float dt) {
+    // Mouse look handled in WndProc
+    // This function exists for future camera effects (recoil, bob, etc.)
+    (void)dt;
 }
 
 static void updateUBO(uint32_t frameIndex, float timeSec) {
@@ -2192,8 +2959,10 @@ static void updateUBO(uint32_t frameIndex, float timeSec) {
 
 
 static void drawFrame(float timeSec, float dt) {
-    updateCamera(dt);
+    updateMovement(dt);
+    updateCameraOrientation(dt);
     updatePlayerCurrentAndWeight(dt);
+    updateCharacterModel(dt, timeSec);
 
     vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
 
@@ -2274,6 +3043,15 @@ if (g_skyTileVB) {
         g_skyTileMem = VK_NULL_HANDLE;
     }
     g_skyTileVertexCount = 0;
+    if (g_charVB) {
+        vkDestroyBuffer(g_device, g_charVB, nullptr);
+        g_charVB = VK_NULL_HANDLE;
+    }
+    if (g_charMem) {
+        vkFreeMemory(g_device, g_charMem, nullptr);
+        g_charMem = VK_NULL_HANDLE;
+    }
+    g_charVertexCount = 0;
     if (g_vertexBuffer) vkDestroyBuffer(g_device, g_vertexBuffer, nullptr);
     if (g_vertexMem) vkFreeMemory(g_device, g_vertexMem, nullptr);
     if (g_cmdPool) vkDestroyCommandPool(g_device, g_cmdPool, nullptr);
@@ -2306,11 +3084,18 @@ static std::string getExeDir() {
 
 // Optional headless-ish smoke test: run N frames then quit if --smoke
 static bool g_smoke = false;
+static bool g_smokeMovement = false;
 static int g_smokeFrames = 300;
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
     std::string cmd = cmdLine ? cmdLine : "";
-    if (cmd.find("--smoke") != std::string::npos) g_smoke = true;
+    if (cmd.find("--smoke-movement") != std::string::npos) {
+        g_smoke = true;
+        g_smokeMovement = true;
+        g_smokeFrames = 300; // movement test sequence length
+    } else if (cmd.find("--smoke") != std::string::npos) {
+        g_smoke = true;
+    }
 
     try {
         g_exeDir = getExeDir();
@@ -2378,23 +3163,107 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             }
 
             // Functional smoke: fire ballistic + energy hitscan into bay, then sky orbit
+            // Movement smoke: exercise all movement states
             if (g_smoke) {
-                g_yaw += dt * 0.20f;
-                if (frames < 20) {
-                    // Look into warehouse bay for weapon impact coverage
+                if (g_smokeMovement) {
+                    // Movement smoke test sequence
+                    // Frames 0-29: Stand walk forward
+                    // Frames 30-59: Sprint forward
+                    // Frames 60-89: Crouch walk
+                    // Frames 90-119: Prone crawl
+                    // Frames 120-149: Slide (from sprint)
+                    // Frames 150-179: Dash forward
+                    // Frames 180-209: Dash backward
+                    // Frames 210-239: Wallrun simulation (near wall)
+                    // Frames 240-269: Stance transitions
+                    // Frames 270-299: Final state check
+                    
+                    if (frames < 30) {
+                        // Stand walk
+                        g_keys['W'] = true;
+                        g_move.stance = Stance::Standing;
+                    } else if (frames < 60) {
+                        // Sprint
+                        g_keys['W'] = true;
+                        g_keys[VK_SHIFT] = true;
+                        g_move.stance = Stance::Standing;
+                    } else if (frames < 90) {
+                        // Crouch walk
+                        g_keys['W'] = true;
+                        g_keys[VK_SHIFT] = false;
+                        g_keys[VK_CONTROL] = true; // triggers crouch
+                        g_move.stance = Stance::Crouch;
+                    } else if (frames < 120) {
+                        // Prone crawl
+                        g_keys['W'] = true;
+                        // Tap control again for prone
+                        if (frames == 90) g_keys[VK_CONTROL] = true;
+                        g_move.stance = Stance::Prone;
+                    } else if (frames < 150) {
+                        // Slide: sprint then crouch
+                        g_keys['W'] = true;
+                        g_keys[VK_SHIFT] = true;
+                        if (frames == 120) g_keys[VK_CONTROL] = true; // trigger slide
+                        g_keys[VK_CONTROL] = false;
+                    } else if (frames < 180) {
+                        // Dash forward
+                        if (frames == 150) {
+                            // Simulate C key press for dash
+                            g_keys['C'] = true;
+                        } else {
+                            g_keys['C'] = false;
+                        }
+                        g_keys['W'] = true;
+                    } else if (frames < 210) {
+                        // Dash backward
+                        if (frames == 180) {
+                            g_keys['C'] = true;
+                        } else {
+                            g_keys['C'] = false;
+                        }
+                        g_keys['S'] = true;
+                    } else if (frames < 240) {
+                        // Wallrun simulation - move along wall at Z ~40
+                        g_keys['W'] = true;
+                        g_keys[VK_SHIFT] = true;
+                        // Position near warehouse wall for wallrun
+                        if (frames == 210) {
+                            g_camPos.z = 40.0f * VOXEL_SIZE + 0.02f; // near right wall
+                            g_yaw = 0.0f; // face along wall
+                        }
+                    } else if (frames < 270) {
+                        // Stance transitions
+                        g_keys['W'] = false;
+                        if (frames == 240) g_keys[VK_CONTROL] = true; // stand->crouch
+                        else if (frames == 250) g_keys[VK_CONTROL] = true; // crouch->prone
+                        else if (frames == 260) g_keys[VK_CONTROL] = true; // prone->stand
+                        else g_keys[VK_CONTROL] = false;
+                    } else {
+                        // Final check
+                        g_keys['W'] = false;
+                    }
+                    
+                    // Keep looking forward
                     g_pitch = -0.12f;
-                    if (frames == 4) {
-                        g_activeCaliberIndex = 1; // medium ballistic
-                        g_fireCooldown = 0.0f;
-                        g_firePressed = true;
-                    }
-                    if (frames == 12) {
-                        g_activeCaliberIndex = 3; // energy_beam hitscan
-                        g_fireCooldown = 0.0f;
-                        g_firePressed = true;
-                    }
                 } else {
-                    g_pitch = 0.42f; // sky tiles + moon
+                    // Original smoke: fire ballistic + energy hitscan into bay, then sky orbit
+                    g_yaw += dt * 0.20f;
+                    if (frames < 20) {
+                        // Look into warehouse bay for weapon impact coverage
+                        g_pitch = -0.12f;
+                        if (frames == 4) {
+                            g_activeCaliberIndex = 1; // medium ballistic
+                            g_fireCooldown = 0.0f;
+                            g_firePressed = true;
+                        }
+                        if (frames == 12) {
+                            g_activeCaliberIndex = 3; // energy_beam hitscan
+                            g_fireCooldown = 0.0f;
+                            g_firePressed = true;
+                        }
+                    } else {
+                        g_pitch = 0.42f; // sky tiles + moon
+                    }
                 }
             }
 
@@ -2426,6 +3295,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         // Write success marker for smoke tests
         if (g_smoke) {
             std::string outPath = g_exeDir + "\\smoke_ok.txt";
+            if (g_smokeMovement) {
+                outPath = g_exeDir + "\\movement_smoke_ok.txt";
+            }
             std::ofstream out(outPath);
             out << "frames=" << frames << "\nvertices=" << g_vertexCount
                 << "\ncam=" << g_camPos.x << "," << g_camPos.y << "," << g_camPos.z
@@ -2458,8 +3330,30 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                 << "\nsky_tiles=" << (SKY_SEG_U * SKY_SEG_V)
                 << "\nsky_verts=" << g_skyTileVertexCount
                 << "\nmoon_light=" << (g_isNight ? 1 : 0)
-                << "\nmoon_dir=" << g_moonDirWorld.x << "," << g_moonDirWorld.y << "," << g_moonDirWorld.z
-                << "\n";
+                << "\nmoon_dir=" << g_moonDirWorld.x << "," << g_moonDirWorld.y << "," << g_moonDirWorld.z;
+            
+            // Movement-specific output
+            if (g_smokeMovement) {
+                out << "\n--- MOVEMENT STATE ---"
+                    << "\nstance=" << static_cast<int>(g_move.stance)
+                    << "\ngait=" << static_cast<int>(g_move.gait)
+                    << "\nsliding=" << (g_move.sliding ? 1 : 0)
+                    << "\nwall_running=" << (g_move.wallRunning ? 1 : 0)
+                    << "\nwall_run_side=" << g_move.wallRunSide
+                    << "\nwall_run_time=" << g_move.wallRunTime
+                    << "\nslide_speed=" << g_move.slideSpeed
+                    << "\nslide_time=" << g_move.slideTime
+                    << "\ndashing=" << (g_move.dashing ? 1 : 0)
+                    << "\ndash_time=" << g_move.dashTime
+                    << "\ndash_cooldown=" << g_move.dashCooldown
+                    << "\ndash_invuln=" << (g_move.dashInvuln ? 1 : 0)
+                    << "\nstamina=" << g_move.stamina
+                    << "\nanim_time=" << g_move.animTime
+                    << "\nchar_verts=" << g_charVertexCount
+                    << "\nchar_bob=" << g_charBobOffset
+                    << "\nchar_sway=" << g_charSwayOffset;
+            }
+            out << "\n";
         }
     } catch (const std::exception& e) {
         MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);

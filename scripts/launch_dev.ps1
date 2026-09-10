@@ -18,7 +18,7 @@
   (empty)       - interactive menu
 #>
 param(
-  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokePainter", "SmokeAll", "Ui", "Help", "")]
+  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokePainter", "SmokeMovement", "SmokeAll", "Ui", "Help", "")]
   [string]$Action = "",
 
   [Parameter(ValueFromRemainingArguments = $true)]
@@ -40,25 +40,23 @@ function Invoke-RepoScript {
     throw "Missing script: $path"
   }
   Write-Host "== $Name $($ScriptArgs -join ' ') ==" -ForegroundColor Cyan
-  if ($ScriptArgs.Count -gt 0) {
-    & $path @ScriptArgs
-  } else {
-    & $path
-  }
-  return $LASTEXITCODE
+  # Use Start-Process to avoid capturing script stdout (which breaks $LASTEXITCODE capture in callers)
+  $proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$path`" $($ScriptArgs -join ' ')" -Wait -PassThru -NoNewWindow
+  return $proc.ExitCode
 }
 
 function Show-Help {
   Write-Host @"
-launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokePainter|SmokeAll|Ui>
-  Build         - engine build.ps1
-  Painter       - build_painter.ps1 (core smoke)
-  Engine        - run.ps1 interactive
-  SmokeEngine   - demo.ps1 -SkipInteractive
-  SmokePainter  - smoke_painter.ps1 / build_painter.ps1
-  SmokeAll      - painter + engine smokes
-  Ui            - run_painter_ui.ps1 if present else Painter
-  Help          - this text
+launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokePainter|SmokeMovement|SmokeAll|Ui>
+  Build           - engine build.ps1
+  Painter         - build_painter.ps1 (core smoke)
+  Engine          - run.ps1 interactive
+  SmokeEngine     - demo.ps1 -SkipInteractive
+  SmokePainter    - smoke_painter.ps1 / build_painter.ps1
+  SmokeMovement   - smoke_movement.ps1 (movement system smoke)
+  SmokeAll        - painter + engine + movement smokes
+  Ui              - run_painter_ui.ps1 if present else Painter
+  Help            - this text
 
 Cubic unit voxels only (VOXEL_SIZE=0.001). Bitcrush 32x is display/export only.
 "@
@@ -67,13 +65,14 @@ Cubic unit voxels only (VOXEL_SIZE=0.001). Bitcrush 32x is display/export only.
 function Show-Menu {
   Write-Host ""
   Write-Host "======== VOXEL DEV LAUNCHER ========" -ForegroundColor Magenta
-  Write-Host " 1  Build          engine (scripts/build.ps1)"
-  Write-Host " 2  Painter        build_painter.ps1 (core smoke)"
-  Write-Host " 3  Engine         interactive engine (scripts/run.ps1)"
-  Write-Host " 4  SmokeEngine    demo.ps1 -SkipInteractive"
-  Write-Host " 5  SmokePainter   smoke_painter.ps1"
-  Write-Host " 6  SmokeAll       painter + engine smokes"
-  Write-Host " 7  Ui             run_painter_ui.ps1 (or Painter)"
+  Write-Host " 1  Build           engine (scripts/build.ps1)"
+  Write-Host " 2  Painter         build_painter.ps1 (core smoke)"
+  Write-Host " 3  Engine          interactive engine (scripts/run.ps1)"
+  Write-Host " 4  SmokeEngine     demo.ps1 -SkipInteractive"
+  Write-Host " 5  SmokePainter    smoke_painter.ps1"
+  Write-Host " 6  SmokeMovement   smoke_movement.ps1 (movement system)"
+  Write-Host " 7  SmokeAll        painter + engine + movement smokes"
+  Write-Host " 8  Ui              run_painter_ui.ps1 (or Painter)"
   Write-Host " h  Help"
   Write-Host " q  Quit"
   Write-Host "------------------------------------"
@@ -85,8 +84,9 @@ function Show-Menu {
     "^3$" { return "Engine" }
     "^4$" { return "SmokeEngine" }
     "^5$" { return "SmokePainter" }
-    "^6$" { return "SmokeAll" }
-    "^7$" { return "Ui" }
+    "^6$" { return "SmokeMovement" }
+    "^7$" { return "SmokeAll" }
+    "^8$" { return "Ui" }
     "^[hH]$" { return "Help" }
     "^[qQ]$" { return "Quit" }
     default {
@@ -125,11 +125,21 @@ function Invoke-Action {
       }
       return Invoke-RepoScript -Name "build_painter.ps1"
     }
+    "SmokeMovement" {
+      $smoke = Join-Path $Scripts "smoke_movement.ps1"
+      if (Test-Path $smoke) {
+        return Invoke-RepoScript -Name "smoke_movement.ps1"
+      }
+      Write-Host "smoke_movement.ps1 missing" -ForegroundColor Red
+      return 1
+    }
     "SmokeAll" {
       $p = Invoke-Action -Name "SmokePainter"
       if ($p -ne 0) { return $p }
       $e = Invoke-Action -Name "SmokeEngine"
       if ($e -ne 0) { return $e }
+      $m = Invoke-Action -Name "SmokeMovement"
+      if ($m -ne 0) { return $m }
       Write-Host "SMOKE_ALL_OK" -ForegroundColor Green
       return 0
     }
