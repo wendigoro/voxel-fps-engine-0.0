@@ -189,6 +189,11 @@ static std::string g_lastWeaponId = "none";
 static int g_hitscanShots = 0;
 static int g_ballisticShots = 0;
 
+// Pause / cursor state
+static bool g_paused = false;
+static bool g_cursorLocked = true;
+static POINT g_lastCursorPos = {0, 0};
+
 // Player character as unit-voxel body on the cubic grid (impact/current sampling).
 static int g_playerGX = 0, g_playerGY = 0, g_playerGZ = 0;
 static float g_playerBaseWeight = 1.0f;
@@ -1033,6 +1038,10 @@ static void updateMoonSkyTile() {
     g_skyTileVertexCount = wi;
 }
 
+// Forward declarations for cursor/pause
+static void lockCursor();
+static void unlockCursor();
+static void togglePause();
 
 // ---- Win32 ----
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1054,8 +1063,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_KEYDOWN:
         if (wParam < 256) g_keys[wParam] = true;
         if (wParam == VK_ESCAPE) {
-            g_running = false;
-            PostQuitMessage(0);
+            if (g_paused) {
+                togglePause(); // resume
+            } else {
+                togglePause(); // pause
+            }
         }
         if (wParam == 'F') g_firePressed = true;
         // 1-4: caliber / ammo cycle (light medium heavy energy_beam)
@@ -1077,35 +1089,64 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_mouseDown = true;
         g_lastMouseX = static_cast<short>(LOWORD(lParam));
         g_lastMouseY = static_cast<short>(HIWORD(lParam));
-        SetCapture(hwnd);
+        if (!g_paused) SetCapture(hwnd);
         return 0;
     case WM_LBUTTONUP:
         g_mouseDown = false;
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
-        g_firePressed = true;
+        if (!g_paused) g_firePressed = true;
         return 0;
-    case WM_MOUSEMOVE:
-        g_mouseX = static_cast<short>(LOWORD(lParam));
-        g_mouseY = static_cast<short>(HIWORD(lParam));
-        if (g_mouseDown) {
-            int dx = g_mouseX - g_lastMouseX;
-            int dy = g_mouseY - g_lastMouseY;
+    case WM_MOUSEMOVE: {
+        int x = static_cast<short>(LOWORD(lParam));
+        int y = static_cast<short>(HIWORD(lParam));
+        
+        if (g_cursorLocked && !g_paused) {
+            // Relative mouse movement for camera
+            int dx = x - g_lastMouseX;
+            int dy = y - g_lastMouseY;
             g_yaw += dx * g_lookSens;
             g_pitch -= dy * g_lookSens; // drag up = look up
             const float lim = static_cast<float>(M_PI) * 0.49f;
             g_pitch = std::max(-lim, std::min(lim, g_pitch));
-            g_lastMouseX = g_mouseX;
-            g_lastMouseY = g_mouseY;
+            
+            // Re-center cursor
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            POINT center = {rc.right / 2, rc.bottom / 2};
+            ClientToScreen(hwnd, &center);
+            SetCursorPos(center.x, center.y);
+            g_lastMouseX = center.x;
+            g_lastMouseY = center.y;
+        } else {
+            g_mouseX = x;
+            g_mouseY = y;
+            if (g_mouseDown && !g_paused) {
+                int dx = x - g_lastMouseX;
+                int dy = y - g_lastMouseY;
+                g_yaw += dx * g_lookSens;
+                g_pitch -= dy * g_lookSens;
+                const float lim = static_cast<float>(M_PI) * 0.49f;
+                g_pitch = std::max(-lim, std::min(lim, g_pitch));
+            }
+            g_lastMouseX = x;
+            g_lastMouseY = y;
         }
         return 0;
+    }
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
         g_moveSpeed *= (delta > 0) ? 1.1f : 0.9f;
         g_moveSpeed = std::max(0.01f, std::min(0.25f, g_moveSpeed));
         return 0;
     }
+    case WM_SETFOCUS:
+        if (!g_paused) lockCursor();
+        return 0;
+    case WM_KILLFOCUS:
+        unlockCursor();
+        return 0;
     default:
         return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
@@ -1132,6 +1173,8 @@ static void createWindow() {
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
     if (!g_hwnd) fail("CreateWindowEx failed");
+    // Lock cursor on startup
+    lockCursor();
 }
 
 // ---- Vulkan setup ----
@@ -2261,6 +2304,63 @@ static int checkWallRun(const std::vector<Chunk>& chunks, const Vec3& pos, const
     return 0;
 }
 
+// Horizontal collision check - returns true if position is blocked at feet/head level
+static bool checkHorizontalCollision(const std::vector<Chunk>& chunks, const Vec3& pos, float stanceHeight, float radius) {
+    int gx = static_cast<int>(std::floor(pos.x / VOXEL_SIZE));
+    int gz = static_cast<int>(std::floor(pos.z / VOXEL_SIZE));
+    int footY = static_cast<int>(std::floor((pos.y - stanceHeight * 0.5f + 0.005f) / VOXEL_SIZE));
+    int headY = static_cast<int>(std::floor((pos.y + stanceHeight * 0.5f - 0.005f) / VOXEL_SIZE));
+    
+    int r = std::max(1, static_cast<int>(std::ceil(radius / VOXEL_SIZE)));
+    for (int dx = -r; dx <= r; ++dx) {
+        for (int dz = -r; dz <= r; ++dz) {
+            int x = gx + dx;
+            int z = gz + dz;
+            if (!worldInBounds(x, footY, z)) return true;
+            Block bFoot = getWorldBlock(chunks, x, footY, z);
+            if (bFoot != Block::Air && !isWaterBlock(bFoot)) return true;
+            if (headY != footY) {
+                Block bHead = getWorldBlock(chunks, x, headY, z);
+                if (bHead != Block::Air && !isWaterBlock(bHead)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Try to move with sliding collision response
+static Vec3 moveWithCollision(const std::vector<Chunk>& chunks, const Vec3& from, const Vec3& to, float stanceHeight, float radius) {
+    Vec3 dir = to - from;
+    float dist = dir.length();
+    if (dist < 1e-6f) return from;
+    dir = dir * (1.0f / dist);
+    
+    // Try full move first
+    if (!checkHorizontalCollision(chunks, to, stanceHeight, radius)) {
+        return to;
+    }
+    
+    // Slide along X axis
+    Vec3 tryX = {to.x, from.y, from.z};
+    if (!checkHorizontalCollision(chunks, tryX, stanceHeight, radius)) {
+        // Try full diagonal from X-only position
+        Vec3 tryXY = {to.x, to.y, from.z};
+        if (!checkHorizontalCollision(chunks, tryXY, stanceHeight, radius)) {
+            return tryXY;
+        }
+        return tryX;
+    }
+    
+    // Slide along Z axis
+    Vec3 tryZ = {from.x, from.y, to.z};
+    if (!checkHorizontalCollision(chunks, tryZ, stanceHeight, radius)) {
+        return tryZ;
+    }
+    
+    // Blocked - stay at original position
+    return from;
+}
+
 // Stance transition helper
 static void setStance(Stance newStance) {
     if (newStance == g_move.stance) return;
@@ -2271,7 +2371,7 @@ static void setStance(Stance newStance) {
 
 // Main movement update
 static void updateMovement(float dt) {
-    if (!g_chunks) return;
+    if (!g_chunks || g_paused) return;
     
     const auto& chunks = *g_chunks;
     MoveState& m = g_move;
@@ -2474,10 +2574,15 @@ static void updateMovement(float dt) {
         if (inputLeft) moveDir = moveDir - flatRight;
         if (inputRight) moveDir = moveDir + flatRight;
         
+        Vec3 desiredPos = g_camPos;
         if (moveDir.length() > 1e-4f) {
             moveDir = moveDir.normalized();
-            g_camPos = g_camPos + moveDir * speed;
+            desiredPos = g_camPos + moveDir * speed;
         }
+        
+        // Apply horizontal collision (slide against walls)
+        float playerRadius = 0.12f; // ~12cm radius
+        g_camPos = moveWithCollision(chunks, g_camPos, desiredPos, stanceHeight, playerRadius);
         
         // Jump
         if (inputJump && onGround && !m.dashing) {
@@ -2934,6 +3039,37 @@ static Vec3 cameraRight() {
     return cameraForward().cross(Vec3(0, 1, 0)).normalized();
 }
 
+// Cursor lock / pause functions
+static void lockCursor() {
+    if (!g_cursorLocked) {
+        g_cursorLocked = true;
+        GetCursorPos(&g_lastCursorPos);
+        SetCursorPos(g_lastCursorPos.x, g_lastCursorPos.y);
+        ShowCursor(FALSE);
+        SetCapture(g_hwnd);
+        ClipCursor(nullptr); // Will clip to window in WM_MOUSEMOVE
+    }
+}
+
+static void unlockCursor() {
+    if (g_cursorLocked) {
+        g_cursorLocked = false;
+        ReleaseCapture();
+        ClipCursor(nullptr);
+        SetCursorPos(g_lastCursorPos.x, g_lastCursorPos.y);
+        ShowCursor(TRUE);
+    }
+}
+
+static void togglePause() {
+    g_paused = !g_paused;
+    if (g_paused) {
+        unlockCursor();
+    } else {
+        lockCursor();
+    }
+}
+
 static void updateCameraOrientation(float dt) {
     // Mouse look handled in WndProc
     // This function exists for future camera effects (recoil, bob, etc.)
@@ -3023,10 +3159,15 @@ static void updateUBO(uint32_t frameIndex, float timeSec, float dt) {
 
 
 static void drawFrame(float timeSec, float dt) {
-    updateMovement(dt);
-    updateCameraOrientation(dt);
-    updatePlayerCurrentAndWeight(dt);
-    updateCharacterModel(dt, timeSec);
+    if (!g_paused) {
+        updateMovement(dt);
+        updateCameraOrientation(dt);
+        updatePlayerCurrentAndWeight(dt);
+        updateCharacterModel(dt, timeSec);
+    } else {
+        // Still update camera orientation for pause menu rendering if needed
+        updateCameraOrientation(0.0f);
+    }
 
     vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
 
