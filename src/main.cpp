@@ -2317,14 +2317,21 @@ static void updatePlayerCurrentAndWeight(float dt) {
 
 // ===== MOVEMENT SYSTEM FUNCTIONS =====
 
+// Helper: water is NEVER solid for player physics (movement, collision, ground check).
+// Only projectiles interact with water as a solid.
+static inline bool isSolidForPhysics(Block b) {
+    return b != Block::Air && !isWaterBlock(b);
+}
+
 // Check if there's ground under the player at given stance height
+// Water is NOT ground - you float/swim in it
 static bool checkGround(const std::vector<Chunk>& chunks, const Vec3& pos, float stanceHeight) {
     int gx = static_cast<int>(std::floor(pos.x / VOXEL_SIZE));
     int gy = static_cast<int>(std::floor((pos.y - stanceHeight * 0.5f) / VOXEL_SIZE));
     int gz = static_cast<int>(std::floor(pos.z / VOXEL_SIZE));
     if (!worldInBounds(gx, gy, gz)) return false;
     Block b = getWorldBlock(chunks, gx, gy, gz);
-    return b != Block::Air && !isWaterBlock(b);
+    return isSolidForPhysics(b);
 }
 
 // Check wall for wallrunning (returns side: -1 left, +1 right, 0 none)
@@ -2372,6 +2379,7 @@ static int checkWallRun(const std::vector<Chunk>& chunks, const Vec3& pos, const
 }
 
 // Horizontal collision check - returns true if position is blocked at feet/head level
+// Water is NEVER solid for player physics (see isSolidForPhysics)
 static bool checkHorizontalCollision(const std::vector<Chunk>& chunks, const Vec3& pos, float stanceHeight, float radius) {
     int gx = static_cast<int>(std::floor(pos.x / VOXEL_SIZE));
     int gz = static_cast<int>(std::floor(pos.z / VOXEL_SIZE));
@@ -2385,10 +2393,10 @@ static bool checkHorizontalCollision(const std::vector<Chunk>& chunks, const Vec
             int z = gz + dz;
             if (!worldInBounds(x, footY, z)) return true;
             Block bFoot = getWorldBlock(chunks, x, footY, z);
-            if (bFoot != Block::Air && !isWaterBlock(bFoot)) return true;
+            if (isSolidForPhysics(bFoot)) return true;
             if (headY != footY) {
                 Block bHead = getWorldBlock(chunks, x, headY, z);
-                if (bHead != Block::Air && !isWaterBlock(bHead)) return true;
+                if (isSolidForPhysics(bHead)) return true;
             }
         }
     }
@@ -2662,11 +2670,7 @@ static void updateMovement(float dt) {
             float gravity = 9.81f * 0.35f;
             if (m.stance == Stance::Prone) gravity *= 0.5f; // slower fall when prone
             g_camPos.y -= gravity * dt;
-            
-            // Ground collision
-            if (g_camPos.y < stanceHeight * 0.5f) {
-                g_camPos.y = stanceHeight * 0.5f;
-            }
+            // No hard floor clamp - ground check/snap handles actual floor
         } else {
             // Snap to ground
             float targetY = stanceHeight * 0.5f;
@@ -2676,7 +2680,7 @@ static void updateMovement(float dt) {
             for (int gy = static_cast<int>(g_camPos.y / VOXEL_SIZE); gy >= 0; --gy) {
                 if (worldInBounds(gx, gy, gz)) {
                     Block b = getWorldBlock(chunks, gx, gy, gz);
-                    if (b != Block::Air && !isWaterBlock(b)) {
+                    if (isSolidForPhysics(b)) {
                         targetY = (gy + 1) * VOXEL_SIZE + stanceHeight * 0.5f;
                         break;
                     }
