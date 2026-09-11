@@ -34,6 +34,11 @@ static constexpr float DEFAULT_FOV_DEG = 101.5f; // 70 * 1.45 fisheye default
 static constexpr int INTERNAL_W = 640;  // WIDTH * 0.5
 static constexpr int INTERNAL_H = 360;  // HEIGHT * 0.5
 
+// App state
+enum class AppState : uint8_t { Menu = 0, Playing = 1, Paused = 2 };
+static AppState g_appState = AppState::Menu;
+static bool g_fullscreen = true;
+
 // Unit voxel grid: 1000x smaller than original 1.0 blocks. Every solid is 1x1x1 voxels
 // (no stretched planes). Impact / destruction use integer grid indices only.
 static constexpr float VOXEL_SIZE = 0.001f;    // == materials.hpp kVoxelSize
@@ -346,6 +351,13 @@ static Vec3 g_cameraSmoothedPos = {0,0,0};
 static Vec3 g_cameraTargetPos = {0,0,0};
 static float g_cameraSmoothSpeed = 15.0f; // interpolation speed
 static bool g_cameraInitialized = false;
+
+// Menu UI
+static VkBuffer g_menuVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_menuMem = VK_NULL_HANDLE;
+static uint32_t g_menuVertexCount = 0;
+static int g_menuSelectedIndex = 0;
+static constexpr int MENU_OPTIONS = 3;
 
 static std::string g_exeDir;
 
@@ -1042,6 +1054,9 @@ static void updateMoonSkyTile() {
 static void lockCursor();
 static void unlockCursor();
 static void togglePause();
+static void buildMenuMesh();
+static void uploadMenuMesh(const std::vector<Vertex>& verts);
+static void updateMenuSelection(int direction);
 
 // ---- Win32 ----
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1062,25 +1077,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_KEYDOWN:
         if (wParam < 256) g_keys[wParam] = true;
+        
+        // Handle ESC based on app state
         if (wParam == VK_ESCAPE) {
-            if (g_paused) {
-                togglePause(); // resume
-            } else {
+            if (g_appState == AppState::Menu) {
+                g_running = false;
+                PostQuitMessage(0);
+            } else if (g_appState == AppState::Playing) {
                 togglePause(); // pause
+            } else if (g_appState == AppState::Paused) {
+                // ESC in paused goes to main menu
+                g_appState = AppState::Menu;
+                g_paused = false;
+                unlockCursor();
+                g_menuSelectedIndex = 0;
+                buildMenuMesh();
             }
         }
-        if (wParam == 'F') g_firePressed = true;
-        // 1-4: caliber / ammo cycle (light medium heavy energy_beam)
-        if (wParam == '1') { g_activeCaliberIndex = 0; g_activeProjIndex = 0; }
-        if (wParam == '2') { g_activeCaliberIndex = 1; g_activeProjIndex = 1; }
-        if (wParam == '3') { g_activeCaliberIndex = 2; g_activeProjIndex = 2; }
-        if (wParam == '4') { g_activeCaliberIndex = 3; g_activeProjIndex = 3; }
-        // R: keep legacy projectile-def cycle
-        if (wParam == 'R' && !g_projDefs.empty())
-            g_activeProjIndex = (g_activeProjIndex + 1) % static_cast<int>(g_projDefs.size());
-        // V: cycle loaded weapons when multiple exports exist
-        if (wParam == 'V' && !g_weapons.empty())
-            g_activeWeaponIndex = (g_activeWeaponIndex + 1) % static_cast<int>(g_weapons.size());
+        
+        // Menu navigation
+        if (g_appState == AppState::Menu) {
+            if (wParam == VK_UP) {
+                updateMenuSelection(-1);
+            } else if (wParam == VK_DOWN) {
+                updateMenuSelection(1);
+            } else if (wParam == '1' || wParam == VK_RETURN) {
+                // Play
+                g_appState = AppState::Playing;
+                lockCursor();
+            } else if (wParam == '2') {
+                // Settings (placeholder)
+            } else if (wParam == '3' || wParam == 'Q') {
+                g_running = false;
+                PostQuitMessage(0);
+            }
+        } else {
+            // Game controls (only when playing)
+            if (wParam == 'F') g_firePressed = true;
+            // 1-4: caliber / ammo cycle (light medium heavy energy_beam)
+            if (wParam == '1') { g_activeCaliberIndex = 0; g_activeProjIndex = 0; }
+            if (wParam == '2') { g_activeCaliberIndex = 1; g_activeProjIndex = 1; }
+            if (wParam == '3') { g_activeCaliberIndex = 2; g_activeProjIndex = 2; }
+            if (wParam == '4') { g_activeCaliberIndex = 3; g_activeProjIndex = 3; }
+            // R: keep legacy projectile-def cycle
+            if (wParam == 'R' && !g_projDefs.empty())
+                g_activeProjIndex = (g_activeProjIndex + 1) % static_cast<int>(g_projDefs.size());
+            // V: cycle loaded weapons when multiple exports exist
+            if (wParam == 'V' && !g_weapons.empty())
+                g_activeWeaponIndex = (g_activeWeaponIndex + 1) % static_cast<int>(g_weapons.size());
+        }
         return 0;
     case WM_KEYUP:
         if (wParam < 256) g_keys[wParam] = false;
@@ -1165,13 +1210,24 @@ static void createWindow() {
     if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         fail("RegisterClassEx failed");
 
-    RECT r{0, 0, WIDTH, HEIGHT};
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hwnd = CreateWindowExA(
-        0, wc.lpszClassName, "Voxel FPS 0.0 — WASD fly | LMB look | RMB/F fire | 1-4 caliber | R proj | V weapon | Esc",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
-        nullptr, nullptr, g_hInstance, nullptr);
+    if (g_fullscreen) {
+        // Fullscreen borderless window
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        g_hwnd = CreateWindowExA(
+            0, wc.lpszClassName, "Voxel FPS 0.0",
+            WS_POPUP | WS_VISIBLE,
+            0, 0, screenW, screenH,
+            nullptr, nullptr, g_hInstance, nullptr);
+    } else {
+        RECT r{0, 0, WIDTH, HEIGHT};
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        g_hwnd = CreateWindowExA(
+            0, wc.lpszClassName, "Voxel FPS 0.0 — WASD fly | LMB look | RMB/F fire | 1-4 caliber | R proj | V weapon | Esc",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+            nullptr, nullptr, g_hInstance, nullptr);
+    }
     if (!g_hwnd) fail("CreateWindowEx failed");
     // Lock cursor on startup
     lockCursor();
@@ -2096,7 +2152,11 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     vkBeginCommandBuffer(cmd, &bi);
 
     VkClearValue clears[2]{};
-    clears[0].color = {{0.03f, 0.035f, 0.05f, 1.0f}}; // night sky
+    if (g_appState == AppState::Menu) {
+        clears[0].color = {{0.05f, 0.04f, 0.06f, 1.0f}}; // dark purple menu bg
+    } else {
+        clears[0].color = {{0.03f, 0.035f, 0.05f, 1.0f}}; // night sky
+    }
     clears[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2165,6 +2225,13 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         VkDeviceSize mo = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &g_skyTileVB, &mo);
         vkCmdDraw(cmd, g_skyTileVertexCount, 1, 0, 0);
+    }
+
+    // Menu UI (drawn on top, at near Z)
+    if (g_appState == AppState::Menu && g_menuVB != VK_NULL_HANDLE && g_menuVertexCount > 0) {
+        VkDeviceSize mo = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_menuVB, &mo);
+        vkCmdDraw(cmd, g_menuVertexCount, 1, 0, 0);
     }
 
     vkCmdEndRenderPass(cmd);
@@ -3018,6 +3085,102 @@ static void uploadCharacterModel(const std::vector<Vertex>& verts) {
     vkFreeMemory(g_device, stagingMem, nullptr);
 }
 
+// Build menu vertex buffer (simple colored quads for each option)
+static void buildMenuMesh() {
+    std::vector<Vertex> verts;
+    verts.reserve(MENU_OPTIONS * 12); // 2 triangles (6 verts) per option * 2 layers
+    
+    float optionHeight = 0.08f;
+    float optionWidth = 0.4f;
+    float startY = 0.1f;
+    float spacing = 0.12f;
+    
+    for (int i = 0; i < MENU_OPTIONS; ++i) {
+        float optY = startY - i * spacing;
+        bool selected = (i == g_menuSelectedIndex);
+        
+        // Colors: selected = bright gold, unselected = dim gray
+        Vec3 color = selected ? Vec3(0.9f, 0.7f, 0.2f) : Vec3(0.4f, 0.4f, 0.45f);
+        Vec3 bgColor = selected ? Vec3(0.15f, 0.12f, 0.05f) : Vec3(0.08f, 0.08f, 0.1f);
+        
+        // Background quad (slightly larger)
+        float bgW = optionWidth + 0.02f;
+        float bgH = optionHeight + 0.01f;
+        float x = -bgW * 0.5f;
+        float y = optY - bgH * 0.5f;
+        
+        // Background (6 verts = 2 triangles)
+        verts.push_back(Vertex{x, y, 0.99f, 0,0,-1, bgColor.x, bgColor.y, bgColor.z, 0.0f});
+        verts.push_back(Vertex{x + bgW, y, 0.99f, 0,0,-1, bgColor.x, bgColor.y, bgColor.z, 0.0f});
+        verts.push_back(Vertex{x + bgW, y + bgH, 0.99f, 0,0,-1, bgColor.x, bgColor.y, bgColor.z, 0.0f});
+        verts.push_back(Vertex{x, y, 0.99f, 0,0,-1, bgColor.x, bgColor.y, bgColor.z, 0.0f});
+        verts.push_back(Vertex{x + bgW, y + bgH, 0.99f, 0,0,-1, bgColor.x, bgColor.y, bgColor.z, 0.0f});
+        verts.push_back(Vertex{x, y + bgH, 0.99f, 0,0,-1, bgColor.x, bgColor.y, bgColor.z, 0.0f});
+        
+        // Foreground text placeholder (colored rect)
+        float fgW = optionWidth;
+        float fgH = optionHeight;
+        x = -fgW * 0.5f;
+        y = optY - fgH * 0.5f;
+        
+        verts.push_back(Vertex{x, y, 0.98f, 0,0,-1, color.x, color.y, color.z, 0.0f});
+        verts.push_back(Vertex{x + fgW, y, 0.98f, 0,0,-1, color.x, color.y, color.z, 0.0f});
+        verts.push_back(Vertex{x + fgW, y + fgH, 0.98f, 0,0,-1, color.x, color.y, color.z, 0.0f});
+        verts.push_back(Vertex{x, y, 0.98f, 0,0,-1, color.x, color.y, color.z, 0.0f});
+        verts.push_back(Vertex{x + fgW, y + fgH, 0.98f, 0,0,-1, color.x, color.y, color.z, 0.0f});
+        verts.push_back(Vertex{x, y + fgH, 0.98f, 0,0,-1, color.x, color.y, color.z, 0.0f});
+    }
+    
+    uploadMenuMesh(verts);
+}
+
+// Upload menu mesh to GPU
+static void uploadMenuMesh(const std::vector<Vertex>& verts) {
+    if (verts.empty()) {
+        g_menuVertexCount = 0;
+        return;
+    }
+    vkDeviceWaitIdle(g_device);
+    if (g_menuVB) {
+        vkDestroyBuffer(g_device, g_menuVB, nullptr);
+        g_menuVB = VK_NULL_HANDLE;
+    }
+    if (g_menuMem) {
+        vkFreeMemory(g_device, g_menuMem, nullptr);
+        g_menuMem = VK_NULL_HANDLE;
+    }
+    
+    g_menuVertexCount = static_cast<uint32_t>(verts.size());
+    VkDeviceSize size = sizeof(Vertex) * verts.size();
+    
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 staging, stagingMem);
+    void* data = nullptr;
+    vkMapMemory(g_device, stagingMem, 0, size, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(size));
+    vkUnmapMemory(g_device, stagingMem);
+    
+    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, g_menuVB, g_menuMem);
+    
+    VkCommandBuffer cmd = beginOneTime();
+    VkBufferCopy copy{0, 0, size};
+    vkCmdCopyBuffer(cmd, staging, g_menuVB, 1, &copy);
+    endOneTime(cmd);
+    
+    vkDestroyBuffer(g_device, staging, nullptr);
+    vkFreeMemory(g_device, stagingMem, nullptr);
+}
+
+// Update menu selection
+static void updateMenuSelection(int direction) {
+    g_menuSelectedIndex = (g_menuSelectedIndex + direction + MENU_OPTIONS) % MENU_OPTIONS;
+    buildMenuMesh();
+}
+
 // Update character model (rebuilds mesh each frame for animation)
 static void updateCharacterModel(float dt, float timeSec) {
     // Rebuild character mesh each frame for animation (vertices in world space)
@@ -3064,8 +3227,10 @@ static void unlockCursor() {
 static void togglePause() {
     g_paused = !g_paused;
     if (g_paused) {
+        g_appState = AppState::Paused;
         unlockCursor();
     } else {
+        g_appState = AppState::Playing;
         lockCursor();
     }
 }
@@ -3158,14 +3323,24 @@ static void updateUBO(uint32_t frameIndex, float timeSec, float dt) {
 }
 
 
+// Simple menu rendering - draws colored quads for menu options
+static void renderMenu(float timeSec) {
+    // Clear with dark background
+    // Menu will be rendered via the existing pipeline
+    // For now, just clear to a menu color
+}
+
 static void drawFrame(float timeSec, float dt) {
-    if (!g_paused) {
+    if (g_appState == AppState::Menu) {
+        // Menu state - no game updates, just render menu
+        // Clear with menu background color
+    } else if (g_appState == AppState::Playing) {
         updateMovement(dt);
         updateCameraOrientation(dt);
         updatePlayerCurrentAndWeight(dt);
         updateCharacterModel(dt, timeSec);
-    } else {
-        // Still update camera orientation for pause menu rendering if needed
+    } else if (g_appState == AppState::Paused) {
+        // Paused - minimal updates
         updateCameraOrientation(0.0f);
     }
 
@@ -3257,6 +3432,15 @@ if (g_skyTileVB) {
         g_charMem = VK_NULL_HANDLE;
     }
     g_charVertexCount = 0;
+    if (g_menuVB) {
+        vkDestroyBuffer(g_device, g_menuVB, nullptr);
+        g_menuVB = VK_NULL_HANDLE;
+    }
+    if (g_menuMem) {
+        vkFreeMemory(g_device, g_menuMem, nullptr);
+        g_menuMem = VK_NULL_HANDLE;
+    }
+    g_menuVertexCount = 0;
     if (g_vertexBuffer) vkDestroyBuffer(g_device, g_vertexBuffer, nullptr);
     if (g_vertexMem) vkFreeMemory(g_device, g_vertexMem, nullptr);
     if (g_cmdPool) vkDestroyCommandPool(g_device, g_cmdPool, nullptr);
@@ -3341,6 +3525,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                       g_projDefs.size(), g_weapons.size());
         OutputDebugStringA(msg);
         uploadMesh(mesh);
+
+        // Initialize menu mesh
+        buildMenuMesh();
 
         auto start = std::chrono::steady_clock::now();
         auto last = start;
