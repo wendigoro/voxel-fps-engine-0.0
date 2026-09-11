@@ -2590,6 +2590,25 @@ static std::vector<Vertex> buildCharacterModel(const MoveState& m, float timeSec
     else if (m.stance == Stance::Crouch) { bobAmount = 0.0008f; swayAmount = 0.0004f; }
     else if (m.stance == Stance::Prone) { bobAmount = 0.0003f; swayAmount = 0.0002f; }
     
+    // Idle animation reduction based on stamina
+    // At 100% stamina: no idle animation (completely still)
+    // At 70-100%: linearly reduced intensity and frequency
+    // Below 70%: full idle animation
+    if (m.gait == Gait::Walk || m.gait == Gait::Run || 
+        m.stance == Stance::Crouch || m.stance == Stance::Prone) {
+        if (m.stamina >= 100.0f) {
+            bobAmount = 0.0f;
+            swayAmount = 0.0f;
+        } else if (m.stamina > 70.0f) {
+            float t = (m.stamina - 70.0f) / 30.0f; // 0 at 70%, 1 at 100%
+            float reduction = t * t; // quadratic ease-out
+            bobAmount *= (1.0f - reduction * 0.9f); // 90% reduction at 100%
+            swayAmount *= (1.0f - reduction * 0.9f);
+            // Also reduce frequency
+            animPhase *= (1.0f - reduction * 0.5f); // 50% frequency reduction at 100%
+        }
+    }
+    
     // Apply dash animation
     if (m.dashing) {
         bobAmount *= 2.0f;
@@ -2624,9 +2643,11 @@ static std::vector<Vertex> buildCharacterModel(const MoveState& m, float timeSec
         {0, 0, 0}                             // animRot
     };
     
-    // Head
+    // Head - lowered so top is at/below eye level to avoid camera clipping
+    // Eye at STANCE_EYE_HEIGHT above feet; head is 5 voxels (0.005) tall
+    float headBottomVoxels = (STANCE_EYE_HEIGHT[static_cast<int>(m.stance)] / voxelScale) - 5.0f;
     CharPart head = {
-        {0, 22 * crouchFactor, 0},
+        {0, headBottomVoxels * crouchFactor, 0},
         {5, 5, 5},
         {0.85f, 0.70f, 0.55f}, // skin tone
         0.0f,
@@ -2914,8 +2935,11 @@ static void updateCameraOrientation(float dt) {
 }
 
 static void updateUBO(uint32_t frameIndex, float timeSec) {
-    Vec3 eye = g_camPos;
-    Vec3 center = g_camPos + cameraForward();
+    // Camera slightly forward of eye to avoid clipping with character head
+    Vec3 fwd = cameraForward();
+    float camForwardOffset = 0.012f; // ~1.2cm forward
+    Vec3 eye = g_camPos + fwd * camForwardOffset;
+    Vec3 center = eye + fwd;
     float aspect = g_extent.height > 0
                        ? static_cast<float>(g_extent.width) / static_cast<float>(g_extent.height)
                        : 1.0f;
