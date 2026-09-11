@@ -336,6 +336,12 @@ static Mat4 g_charModelMatrix{};
 static float g_charBobOffset = 0.0f;
 static float g_charSwayOffset = 0.0f;
 
+// Camera smoothing - camera follows animated head with interpolation
+static Vec3 g_cameraSmoothedPos = {0,0,0};
+static Vec3 g_cameraTargetPos = {0,0,0};
+static float g_cameraSmoothSpeed = 15.0f; // interpolation speed
+static bool g_cameraInitialized = false;
+
 static std::string g_exeDir;
 
 static void fail(const std::string& msg) {
@@ -2934,11 +2940,45 @@ static void updateCameraOrientation(float dt) {
     (void)dt;
 }
 
-static void updateUBO(uint32_t frameIndex, float timeSec) {
-    // Camera slightly forward of eye to avoid clipping with character head
+static void updateUBO(uint32_t frameIndex, float timeSec, float dt) {
+    // Camera follows animated head with smoothing
+    // Head position = character collision pos + head offset + animated bob/sway
+    float stanceHeight = STANCE_COLLISION_HEIGHT[static_cast<int>(g_move.stance)];
+    float eyeHeight = STANCE_EYE_HEIGHT[static_cast<int>(g_move.stance)];
+    
+    // Head world position (without yaw rotation - camera handles rotation)
+    // Head is positioned so top is at eye level: headBottom = eyeHeight - headHeight(5 voxels)
+    float voxelScale = VOXEL_SIZE;
+    float headHeightVoxels = 5.0f;
+    float headBottomVoxels = (eyeHeight / voxelScale) - headHeightVoxels;
+    float crouchFactor = (g_move.stance == Stance::Crouch) ? 0.6f : 
+                         (g_move.stance == Stance::Prone) ? 0.3f : 1.0f;
+    float headLocalY = headBottomVoxels * crouchFactor * voxelScale;
+    
+    // Animated offsets (same as buildCharacterModel)
+    float headBob = g_charBobOffset * 0.5f;
+    float headSway = g_charSwayOffset * 0.0f; // no horizontal head sway by default
+    
+    // Target camera position = collision pos + head offset + animation
     Vec3 fwd = cameraForward();
-    float camForwardOffset = 0.012f; // ~1.2cm forward
-    Vec3 eye = g_camPos + fwd * camForwardOffset;
+    Vec3 right = cameraRight();
+    g_cameraTargetPos = g_camPos;
+    g_cameraTargetPos.y += headLocalY - eyeHeight + headBob; // adjust from eye to head
+    g_cameraTargetPos = g_cameraTargetPos + right * headSway;
+    g_cameraTargetPos = g_cameraTargetPos + fwd * 0.012f; // forward offset
+    
+    // Smooth camera position toward target
+    if (!g_cameraInitialized) {
+        g_cameraSmoothedPos = g_cameraTargetPos;
+        g_cameraInitialized = true;
+    }
+    float t = 1.0f - std::exp(-g_cameraSmoothSpeed * dt);
+    g_cameraSmoothedPos.x += (g_cameraTargetPos.x - g_cameraSmoothedPos.x) * t;
+    g_cameraSmoothedPos.y += (g_cameraTargetPos.y - g_cameraSmoothedPos.y) * t;
+    g_cameraSmoothedPos.z += (g_cameraTargetPos.z - g_cameraSmoothedPos.z) * t;
+    
+    // Use smoothed position for view
+    Vec3 eye = g_cameraSmoothedPos;
     Vec3 center = eye + fwd;
     float aspect = g_extent.height > 0
                        ? static_cast<float>(g_extent.width) / static_cast<float>(g_extent.height)
@@ -3000,7 +3040,7 @@ static void drawFrame(float timeSec, float dt) {
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) fail("acquire failed");
 
     vkResetFences(g_device, 1, &g_inFlight[g_frame]);
-    updateUBO(static_cast<uint32_t>(g_frame), timeSec);
+    updateUBO(static_cast<uint32_t>(g_frame), timeSec, dt);
     updateMoonSkyTile();
     recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
 
