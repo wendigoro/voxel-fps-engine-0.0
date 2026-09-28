@@ -18,6 +18,11 @@
 #include <string>
 #include <vector>
 
+// Block identity, grid dimensions, and the sim/view chunk types. These sit at
+// the top of the translation unit because the globals below alias them.
+#include "sim_world.hpp"
+#include "view_chunk.hpp"
+
 #include "debris.hpp"
 #include "destruction.hpp"
 #include "fisheye.hpp"
@@ -27,6 +32,24 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ---- grid aliases ----
+// Block identity, scale, and the authoritative grid now live in sim_world.hpp.
+// The engine aliases them so existing call sites keep working; the aliases are
+// the seam, not a second definition.
+using Block = sim::Block;
+using SimChunk = sim::Chunk;
+using ViewChunk = view::ViewChunk;
+using SentCells = view::SentCells;
+
+static constexpr int CHUNK_SIZE = sim::kChunkSize;
+static constexpr int CHUNKS_X = sim::kChunksX;
+static constexpr int CHUNKS_Y = sim::kChunksY;
+static constexpr int CHUNKS_Z = sim::kChunksZ;
+static constexpr int WORLD_W = sim::kWorldW;
+static constexpr int WORLD_H = sim::kWorldH;
+static constexpr int WORLD_D = sim::kWorldD;
+static constexpr int VOXELS_PER_CHUNK = sim::kVoxelsPerChunk;
 
 static constexpr int WIDTH = 1280;
 static constexpr int HEIGHT = 720;
@@ -52,16 +75,9 @@ static double g_tickAccum = 0.0;
 
 // Unit voxel grid: 1000x smaller than original 1.0 blocks. Every solid is 1x1x1 voxels
 // (no stretched planes). Impact / destruction use integer grid indices only.
-// Single source of truth for the scale is materials.hpp (kVoxelSize).
+// Single source of truth for the scale is materials.hpp (kVoxelSize); the grid
+// dimensions now live in sim_world.hpp alongside the authority rules they serve.
 static constexpr float VOXEL_SIZE = kVoxelSize;
-static constexpr int CHUNK_SIZE = 32;         // voxels per chunk axis
-static constexpr int CHUNKS_X = 6;            // warehouse + river bank
-static constexpr int CHUNKS_Y = 2;            // height for walls/roof girders
-static constexpr int CHUNKS_Z = 5;            // extended depth for river slice
-static constexpr int WORLD_W = CHUNKS_X * CHUNK_SIZE; // 160
-static constexpr int WORLD_H = CHUNKS_Y * CHUNK_SIZE; // 64
-static constexpr int WORLD_D = CHUNKS_Z * CHUNK_SIZE; // 128
-static constexpr int VOXELS_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 // Warehouse layout in unit voxels (grid space)
 static constexpr int DIRT_MARGIN = 10;        // dirt apron around building
@@ -217,9 +233,17 @@ struct PlayerBody {
 static PlayerBody g_player;
 static bool g_wantJump = false;
 
-// Projectile destruction state (g_chunks assigned after Chunk type exists)
-struct Chunk;
-static std::vector<Chunk>* g_chunks = nullptr;
+// The two halves of the world, deliberately separate objects:
+//
+//   g_world  - authoritative occupancy. Read by simulation only.
+//   g_views  - per-chunk snapshots + meshes. Read by the render path only.
+//
+// Nothing in the render path takes g_world, and nothing in the simulation takes
+// g_views except to *write* fresh snapshots into it. That asymmetry is the
+// enforcement mechanism for the view/sim split; the comments above each are
+// load-bearing, so keep them with the declarations.
+static sim::World* g_world = nullptr;
+static std::vector<ViewChunk>* g_views = nullptr;
 static std::vector<ProjectileDef> g_projDefs;
 static std::vector<AmmoDef> g_ammoDefs;
 static std::vector<ProjectileRuntime> g_projectiles;
@@ -423,19 +447,6 @@ static void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
 }
 
 // ---- fine voxel + chunk system (sharp face vertices) ----
-enum class Block : uint8_t {
-    Air = 0,
-    Dirt,
-    Concrete,
-    SheetMetal,
-    Girder,
-    Wood,
-    WoodDark,
-    Water,        // still unit cubes; may occupy WATER_CELL multi-cell clumps
-    WaterCurrent, // moving water source (same visual, current sampling)
-    Moon,         // cool emissive crescent grid
-    LightBulb     // warm emissive indoor bulbs
-};
 
 // Water is painted as slightly larger *logical* cells (2x2x2 unit cubes) for volume/tide.
 static constexpr int WATER_CELL = 2;
@@ -467,18 +478,10 @@ static bool isSolidBlock(Block b) {
     return true;
 }
 
-struct Chunk {
-    int cx = 0, cy = 0, cz = 0; // chunk coords
-    std::vector<Block> voxels;  // CHUNK_SIZE^3
-    std::vector<Vertex> mesh;   // sharp unique face verts
-    bool dirty = true;
-    uint32_t firstVertex = 0;
-    uint32_t vertexCount = 0;
-    // Vertices reserved in the world VB for this chunk. A chunk may shrink freely
-    // but must not exceed it without triggering a full repack.
-    uint32_t slotCapacity = 0;
-    bool wasVisible = true;
-};
+// The engine's chunk pair: authoritative occupancy on the sim side, and the
+// snapshot + mesh the view derived from it. Kept as one parallel vector pair so
+// chunkIndex() addresses both; the two are never merged into a single struct,
+// because that merge is the coupling this split removes.
 
 static Vec3 blockColor(Block b) {
     switch (b) {
@@ -496,46 +499,29 @@ static Vec3 blockColor(Block b) {
     }
 }
 
-static inline int chunkIndex(int cx, int cy, int cz) {
-    return (cy * CHUNKS_Z + cz) * CHUNKS_X + cx;
-}
-
 static inline int localIndex(int lx, int ly, int lz) {
-    return (ly * CHUNK_SIZE + lz) * CHUNK_SIZE + lx;
+    return sim::World::localIndex(lx, ly, lz);
 }
 
 static bool worldInBounds(int x, int y, int z) {
-    return x >= 0 && y >= 0 && z >= 0 && x < WORLD_W && y < WORLD_H && z < WORLD_D;
+    return sim::World::inBounds(x, y, z);
 }
 
-static Block getWorldBlock(const std::vector<Chunk>& chunks, int x, int y, int z) {
-    if (!worldInBounds(x, y, z)) return Block::Air;
-    int cx = x / CHUNK_SIZE;
-    int cy = y / CHUNK_SIZE;
-    int cz = z / CHUNK_SIZE;
-    int lx = x - cx * CHUNK_SIZE;
-    int ly = y - cy * CHUNK_SIZE;
-    int lz = z - cz * CHUNK_SIZE;
-    return chunks[chunkIndex(cx, cy, cz)].voxels[localIndex(lx, ly, lz)];
+// The authoritative occupancy accessors. These are simulation-side reads; view
+// code must use ViewChunk::sent instead.
+static Block getWorldBlock(const sim::World& w, int x, int y, int z) {
+    return w.get(x, y, z);
 }
 
-static void setWorldBlock(std::vector<Chunk>& chunks, int x, int y, int z, Block b) {
-    if (!worldInBounds(x, y, z)) return;
-    int cx = x / CHUNK_SIZE;
-    int cy = y / CHUNK_SIZE;
-    int cz = z / CHUNK_SIZE;
-    int lx = x - cx * CHUNK_SIZE;
-    int ly = y - cy * CHUNK_SIZE;
-    int lz = z - cz * CHUNK_SIZE;
-    chunks[chunkIndex(cx, cy, cz)].voxels[localIndex(lx, ly, lz)] = b;
-    chunks[chunkIndex(cx, cy, cz)].dirty = true;
+static void setWorldBlock(sim::World& w, int x, int y, int z, Block b) {
+    w.set(x, y, z, b);
 }
 
 // Harvest bulb lights by reading Block::LightBulb out of the grid, then folding
 // vertically adjacent cells into one light per fixture. The grid is the only
 // authority on where a light is: the map can be repainted or a painter edit can
 // move a fixture, and lighting follows without a second list to keep in sync.
-static void harvestBulbLights(const std::vector<Chunk>& chunks,
+static void harvestBulbLights(const sim::World& world,
                               std::vector<BulbLight>& out) {
     out.clear();
     std::vector<char> consumed(static_cast<size_t>(WORLD_W) * WORLD_H * WORLD_D, 0);
@@ -546,13 +532,13 @@ static void harvestBulbLights(const std::vector<Chunk>& chunks,
         for (int y = 0; y < WORLD_H; ++y) {
             for (int x = 0; x < WORLD_W; ++x) {
                 if (consumed[idx(x, y, z)]) continue;
-                if (getWorldBlock(chunks, x, y, z) != Block::LightBulb) continue;
+                if (getWorldBlock(world, x, y, z) != Block::LightBulb) continue;
                 // Absorb the whole vertical run so a two-cell fixture is one light.
                 int runTop = y;
                 int cells = 0;
                 float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
                 while (runTop < WORLD_H &&
-                       getWorldBlock(chunks, x, runTop, z) == Block::LightBulb) {
+                       getWorldBlock(world, x, runTop, z) == Block::LightBulb) {
                     consumed[idx(x, runTop, z)] = 1;
                     sumX += (x + 0.5f) * VOXEL_SIZE;
                     sumY += (runTop + 0.5f) * VOXEL_SIZE;
@@ -575,7 +561,7 @@ static void harvestBulbLights(const std::vector<Chunk>& chunks,
 }
 
 // Fill a solid axis-aligned box with unit voxels (inclusive).
-static void fillBox(std::vector<Chunk>& chunks, int x0, int y0, int z0,
+static void fillBox(sim::World& world, int x0, int y0, int z0,
                     int x1, int y1, int z1, Block b) {
     if (x0 > x1) std::swap(x0, x1);
     if (y0 > y1) std::swap(y0, y1);
@@ -583,96 +569,96 @@ static void fillBox(std::vector<Chunk>& chunks, int x0, int y0, int z0,
     for (int z = z0; z <= z1; ++z)
         for (int y = y0; y <= y1; ++y)
             for (int x = x0; x <= x1; ++x)
-                setWorldBlock(chunks, x, y, z, b);
+                setWorldBlock(world, x, y, z, b);
 }
 
 // Vertical I-beam girder (unit voxels only): flanges + web.
-static void placeGirderColumn(std::vector<Chunk>& chunks, int cx, int zc,
+static void placeGirderColumn(sim::World& world, int cx, int zc,
                               int y0, int y1) {
     for (int y = y0; y <= y1; ++y) {
         // web
-        setWorldBlock(chunks, cx, y, zc, Block::Girder);
-        setWorldBlock(chunks, cx, y, zc + 1, Block::Girder);
+        setWorldBlock(world, cx, y, zc, Block::Girder);
+        setWorldBlock(world, cx, y, zc + 1, Block::Girder);
         // flanges
         for (int dx = -2; dx <= 2; ++dx) {
-            setWorldBlock(chunks, cx + dx, y, zc - 1, Block::Girder);
-            setWorldBlock(chunks, cx + dx, y, zc + 2, Block::Girder);
+            setWorldBlock(world, cx + dx, y, zc - 1, Block::Girder);
+            setWorldBlock(world, cx + dx, y, zc + 2, Block::Girder);
         }
     }
 }
 
 // Horizontal I-beam along X at fixed y,z.
-static void placeGirderBeamX(std::vector<Chunk>& chunks, int x0, int x1, int y, int zc) {
+static void placeGirderBeamX(sim::World& world, int x0, int x1, int y, int zc) {
     for (int x = x0; x <= x1; ++x) {
-        setWorldBlock(chunks, x, y, zc, Block::Girder);
-        setWorldBlock(chunks, x, y, zc + 1, Block::Girder);
+        setWorldBlock(world, x, y, zc, Block::Girder);
+        setWorldBlock(world, x, y, zc + 1, Block::Girder);
         for (int dy = -2; dy <= 2; ++dy) {
-            setWorldBlock(chunks, x, y + dy, zc - 1, Block::Girder);
-            setWorldBlock(chunks, x, y + dy, zc + 2, Block::Girder);
+            setWorldBlock(world, x, y + dy, zc - 1, Block::Girder);
+            setWorldBlock(world, x, y + dy, zc + 2, Block::Girder);
         }
     }
 }
 
 // Horizontal I-beam along Z.
-static void placeGirderBeamZ(std::vector<Chunk>& chunks, int z0, int z1, int y, int xc) {
+static void placeGirderBeamZ(sim::World& world, int z0, int z1, int y, int xc) {
     for (int z = z0; z <= z1; ++z) {
-        setWorldBlock(chunks, xc, y, z, Block::Girder);
-        setWorldBlock(chunks, xc + 1, y, z, Block::Girder);
+        setWorldBlock(world, xc, y, z, Block::Girder);
+        setWorldBlock(world, xc + 1, y, z, Block::Girder);
         for (int dy = -2; dy <= 2; ++dy) {
-            setWorldBlock(chunks, xc - 1, y + dy, z, Block::Girder);
-            setWorldBlock(chunks, xc + 2, y + dy, z, Block::Girder);
+            setWorldBlock(world, xc - 1, y + dy, z, Block::Girder);
+            setWorldBlock(world, xc + 2, y + dy, z, Block::Girder);
         }
     }
 }
 
 // Sheet-metal wall panel: 1-voxel-thick unit cubes (corrugation via alternate offset).
-static void placeSheetWallX(std::vector<Chunk>& chunks, int x, int y0, int y1, int z0, int z1) {
+static void placeSheetWallX(sim::World& world, int x, int y0, int y1, int z0, int z1) {
     for (int z = z0; z <= z1; ++z) {
         for (int y = y0; y <= y1; ++y) {
             int xo = x + ((z + y) & 1); // slight corrugation still unit voxels
-            setWorldBlock(chunks, xo, y, z, Block::SheetMetal);
+            setWorldBlock(world, xo, y, z, Block::SheetMetal);
         }
     }
 }
 
-static void placeSheetWallZ(std::vector<Chunk>& chunks, int z, int y0, int y1, int x0, int x1) {
+static void placeSheetWallZ(sim::World& world, int z, int y0, int y1, int x0, int x1) {
     for (int x = x0; x <= x1; ++x) {
         for (int y = y0; y <= y1; ++y) {
             int zo = z + ((x + y) & 1);
-            setWorldBlock(chunks, x, y, zo, Block::SheetMetal);
+            setWorldBlock(world, x, y, zo, Block::SheetMetal);
         }
     }
 }
 
 // Wooden crate made of unit voxels.
-static void placeCrate(std::vector<Chunk>& chunks, int x0, int y0, int z0, int s) {
-    fillBox(chunks, x0, y0, z0, x0 + s - 1, y0 + s - 1, z0 + s - 1, Block::Wood);
+static void placeCrate(sim::World& world, int x0, int y0, int z0, int s) {
+    fillBox(world, x0, y0, z0, x0 + s - 1, y0 + s - 1, z0 + s - 1, Block::Wood);
     // darker edge frame
     for (int i = 0; i < s; ++i) {
-        setWorldBlock(chunks, x0 + i, y0, z0, Block::WoodDark);
-        setWorldBlock(chunks, x0 + i, y0, z0 + s - 1, Block::WoodDark);
-        setWorldBlock(chunks, x0, y0, z0 + i, Block::WoodDark);
-        setWorldBlock(chunks, x0 + s - 1, y0, z0 + i, Block::WoodDark);
-        setWorldBlock(chunks, x0 + i, y0 + s - 1, z0, Block::WoodDark);
-        setWorldBlock(chunks, x0 + i, y0 + s - 1, z0 + s - 1, Block::WoodDark);
+        setWorldBlock(world, x0 + i, y0, z0, Block::WoodDark);
+        setWorldBlock(world, x0 + i, y0, z0 + s - 1, Block::WoodDark);
+        setWorldBlock(world, x0, y0, z0 + i, Block::WoodDark);
+        setWorldBlock(world, x0 + s - 1, y0, z0 + i, Block::WoodDark);
+        setWorldBlock(world, x0 + i, y0 + s - 1, z0, Block::WoodDark);
+        setWorldBlock(world, x0 + i, y0 + s - 1, z0 + s - 1, Block::WoodDark);
     }
 }
 
 // Simple warehouse map: dirt apron, concrete slab, sheet-metal walls,
 // red-oxide girder frame — every element is unit voxels on the impact grid.
-static std::vector<Chunk> buildWarehouseMap() {
-    std::vector<Chunk> chunks(CHUNKS_X * CHUNKS_Y * CHUNKS_Z);
+static sim::World buildWarehouseMap() {
+    sim::World world;
+    world.alloc();
     for (int cy = 0; cy < CHUNKS_Y; ++cy)
         for (int cz = 0; cz < CHUNKS_Z; ++cz)
             for (int cx = 0; cx < CHUNKS_X; ++cx) {
-                Chunk& c = chunks[chunkIndex(cx, cy, cz)];
+                SimChunk& c = world.chunks[sim::World::chunkIndex(cx, cy, cz)];
                 c.cx = cx; c.cy = cy; c.cz = cz;
                 c.voxels.assign(VOXELS_PER_CHUNK, Block::Air);
-                c.dirty = true;
             }
 
     // 1) Dirt apron (single unit layer under map - keeps occupancy grid, fewer faces)
-    fillBox(chunks, 0, 0, 0, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
+    fillBox(world, 0, 0, 0, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
 
     const int bx0 = DIRT_MARGIN;
     const int bz0 = DIRT_MARGIN;
@@ -682,7 +668,7 @@ static std::vector<Chunk> buildWarehouseMap() {
     const int roofY = 1 + wallH;   // underside of roof beams
 
     // 2) Concrete slab (multi-voxel thick — not a stretched plane).
-    fillBox(chunks, bx0, 1, bz0, bx1, 1 + SLAB_THICK - 1, bz1, Block::Concrete);
+    fillBox(world, bx0, 1, bz0, bx1, 1 + SLAB_THICK - 1, bz1, Block::Concrete);
 
     // Outer dirt remains as apron (already filled); clear building footprint dirt top under slab already overwritten.
 
@@ -691,46 +677,46 @@ static std::vector<Chunk> buildWarehouseMap() {
     const int colsZ[] = { bz0 + 2, (bz0 + bz1) / 2, bz1 - 3 };
     for (int ix = 0; ix < 3; ++ix)
         for (int iz = 0; iz < 3; ++iz)
-            placeGirderColumn(chunks, colsX[ix], colsZ[iz], 1 + SLAB_THICK, roofY);
+            placeGirderColumn(world, colsX[ix], colsZ[iz], 1 + SLAB_THICK, roofY);
 
     // 4) Roof girder grid (unit I-beams).
     for (int iz = 0; iz < 3; ++iz)
-        placeGirderBeamX(chunks, bx0 + 2, bx1 - 2, roofY, colsZ[iz]);
+        placeGirderBeamX(world, bx0 + 2, bx1 - 2, roofY, colsZ[iz]);
     for (int ix = 0; ix < 3; ++ix)
-        placeGirderBeamZ(chunks, bz0 + 2, bz1 - 2, roofY, colsX[ix]);
+        placeGirderBeamZ(world, bz0 + 2, bz1 - 2, roofY, colsX[ix]);
 
     // 5) Sheet-metal walls — 1-voxel-thick unit panels (open bay on +Z front).
-    placeSheetWallX(chunks, bx0, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // -X wall
-    placeSheetWallX(chunks, bx1, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // +X wall
-    placeSheetWallZ(chunks, bz0, 1 + SLAB_THICK, roofY - 1, bx0, bx1);           // -Z back wall
+    placeSheetWallX(world, bx0, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // -X wall
+    placeSheetWallX(world, bx1, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // +X wall
+    placeSheetWallZ(world, bz0, 1 + SLAB_THICK, roofY - 1, bx0, bx1);           // -Z back wall
     // Front (+Z): partial side wings, open center doorway
-    placeSheetWallZ(chunks, bz1, 1 + SLAB_THICK, roofY - 1, bx0, bx0 + 35);
-    placeSheetWallZ(chunks, bz1, 1 + SLAB_THICK, roofY - 1, bx1 - 35, bx1);
+    placeSheetWallZ(world, bz1, 1 + SLAB_THICK, roofY - 1, bx0, bx0 + 35);
+    placeSheetWallZ(world, bz1, 1 + SLAB_THICK, roofY - 1, bx1 - 35, bx1);
     // Door lintel strip of sheet metal
-    placeSheetWallZ(chunks, bz1, roofY - 8, roofY - 1, bx0 + 36, bx1 - 36);
+    placeSheetWallZ(world, bz1, roofY - 8, roofY - 1, bx0 + 36, bx1 - 36);
 
     // 6) Roof sheet deck: unit metal cubes on top of beams (not a single quad).
     for (int z = bz0; z <= bz1; ++z)
         for (int x = bx0; x <= bx1; ++x) {
             // skip every other for light vents still unit cubes
             if (((x + z) & 3) == 0) continue;
-            setWorldBlock(chunks, x, roofY + 3, z, Block::SheetMetal);
+            setWorldBlock(world, x, roofY + 3, z, Block::SheetMetal);
         }
 
     // 7) A few unit-voxel crates inside for material variety / targets.
-    placeCrate(chunks, bx0 + 20, 1 + SLAB_THICK, bz0 + 24, 8);
-    placeCrate(chunks, bx0 + 40, 1 + SLAB_THICK, bz0 + 30, 10);
-    placeCrate(chunks, bx1 - 30, 1 + SLAB_THICK, bz0 + 20, 8);
+    placeCrate(world, bx0 + 20, 1 + SLAB_THICK, bz0 + 24, 8);
+    placeCrate(world, bx0 + 40, 1 + SLAB_THICK, bz0 + 30, 10);
+    placeCrate(world, bx1 - 30, 1 + SLAB_THICK, bz0 + 20, 8);
 
     // 7b) Warm light bulbs inside (unit voxels hanging near roof girders).
     {
         const int by = roofY - 2;
         auto bulb = [&](int x, int z) {
-            setWorldBlock(chunks, x, by, z, Block::LightBulb);
-            setWorldBlock(chunks, x, by - 1, z, Block::LightBulb);
+            setWorldBlock(world, x, by, z, Block::LightBulb);
+            setWorldBlock(world, x, by - 1, z, Block::LightBulb);
             // small cage
-            setWorldBlock(chunks, x + 1, by, z, Block::Girder);
-            setWorldBlock(chunks, x - 1, by, z, Block::Girder);
+            setWorldBlock(world, x + 1, by, z, Block::Girder);
+            setWorldBlock(world, x - 1, by, z, Block::Girder);
         };
         bulb((bx0 + bx1) / 2, (bz0 + bz1) / 2);
         bulb(bx0 + 28, bz0 + 28);
@@ -746,7 +732,7 @@ static std::vector<Chunk> buildWarehouseMap() {
         const int mx = WORLD_W / 2 + 24;
         const int mz = 6;
         const int my = WORLD_H - 6;
-        setWorldBlock(chunks, mx, my, mz, Block::Moon);
+        setWorldBlock(world, mx, my, mz, Block::Moon);
     }
 
     // 8) River slice beyond +Z apron: WATER_CELL (2x2) unit cubes, deep channel with current.
@@ -757,7 +743,7 @@ static std::vector<Chunk> buildWarehouseMap() {
         const int riverX0 = 8;
         const int riverX1 = WORLD_W - 9;
         // Ensure dirt banks around river
-        fillBox(chunks, 0, 0, riverZ0 - 2, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
+        fillBox(world, 0, 0, riverZ0 - 2, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
         // Deep channel center (unit voxels stacked)
         const int surfaceY = 4;
         const int deepY0 = 0;
@@ -776,24 +762,31 @@ static std::vector<Chunk> buildWarehouseMap() {
                 for (int y = 0; y <= localDeep && y < WORLD_H; ++y) {
                     // place as WATER_CELL clumps: still unit cubes on grid
                     Block wb = (dist < 10 && y <= localDeep) ? Block::WaterCurrent : Block::Water;
-                    setWorldBlock(chunks, x, y, z, wb);
+                    setWorldBlock(world, x, y, z, wb);
                     // thicken visually with adjacent unit cells (larger water voxels)
                     // WATER_CELL clumps only on even layers to cut fill-rate
                     if ((y & 1) == 0 && (x % WATER_CELL) == 0 && (z % WATER_CELL) == 0) {
                         for (int dz = 0; dz < WATER_CELL; ++dz)
                             for (int dx = 0; dx < WATER_CELL; ++dx)
-                                if (dx || dz) setWorldBlock(chunks, x + dx, y, z + dz, wb);
+                                if (dx || dz) setWorldBlock(world, x + dx, y, z + dz, wb);
                     }
                 }
             }
         }
     }
 
-    return chunks;
+    return world;
+}
+
+// A block as read out of a sent snapshot. This is the ONLY way view-side code
+// learns occupancy — it has no other source.
+static Block sentBlockAt(const ViewChunk& vc, int lx, int ly, int lz) {
+    if (!SentCells::inSkirt(lx, ly, lz)) return Block::Air; // world edge
+    return static_cast<Block>(vc.sent.cells[SentCells::skirtIndex(lx, ly, lz)].id);
 }
 
 // Sharp vertex face emit: 6 unique verts/face (2 tris), hard face normals, no sharing.
-static void emitSharpFace(std::vector<Vertex>& out, int ix, int iy, int iz,
+static void emitSharpFace(std::vector<ViewChunk::Vertex>& out, int ix, int iy, int iz,
                           int face, const Vec3& color, float mat = 0.0f) {
     // unit cube corners in voxel space, scaled to world by VOXEL_SIZE
     static const float F[6][4][3] = {
@@ -818,7 +811,7 @@ static void emitSharpFace(std::vector<Vertex>& out, int ix, int iy, int iz,
 
     for (int i = 0; i < 6; ++i) {
         const float* p = F[face][IDX[i]];
-        out.push_back(Vertex{
+        out.push_back(ViewChunk::Vertex{
             ox + p[0] * VOXEL_SIZE,
             oy + p[1] * VOXEL_SIZE,
             oz + p[2] * VOXEL_SIZE,
@@ -829,12 +822,17 @@ static void emitSharpFace(std::vector<Vertex>& out, int ix, int iy, int iz,
     }
 }
 
-static void meshChunk(Chunk& chunk, const std::vector<Chunk>& chunks) {
+// Build a chunk's mesh from the cells the sim SENT, and nothing else.
+//
+// Note the signature: there is no sim::World parameter. That absence is the
+// point. Every face-exposure question ("is my neighbour empty?") is answered
+// from the 1-cell skirt the sim included in the snapshot, so this function
+// physically cannot consult occupancy the client was not shown. A view client
+// given this struct and its SentCells can produce the identical mesh, and has
+// no path to anything else.
+static void meshChunk(ViewChunk& chunk) {
     chunk.mesh.clear();
     chunk.mesh.reserve(4096);
-    const int ox[6] = {1,-1,0,0,0,0};
-    const int oy[6] = {0,0,1,-1,0,0};
-    const int oz[6] = {0,0,0,0,1,-1};
 
     const int baseX = chunk.cx * CHUNK_SIZE;
     const int baseY = chunk.cy * CHUNK_SIZE;
@@ -843,13 +841,17 @@ static void meshChunk(Chunk& chunk, const std::vector<Chunk>& chunks) {
     for (int ly = 0; ly < CHUNK_SIZE; ++ly) {
         for (int lz = 0; lz < CHUNK_SIZE; ++lz) {
             for (int lx = 0; lx < CHUNK_SIZE; ++lx) {
-                Block b = chunk.voxels[localIndex(lx, ly, lz)];
+                const Block b = sentBlockAt(chunk, lx, ly, lz);
                 if (b == Block::Air) continue;
-                int x = baseX + lx, y = baseY + ly, z = baseZ + lz;
+                const int x = baseX + lx, y = baseY + ly, z = baseZ + lz;
                 Vec3 col = blockColor(b);
 
                 for (int f = 0; f < 6; ++f) {
-                    Block nb = getWorldBlock(chunks, x + ox[f], y + oy[f], z + oz[f]);
+                    // Read the neighbour out of the skirt. lx+1 == CHUNK_SIZE
+                    // is still inside the snapshot, so this never leaves the
+                    // data the sim sent.
+                    const Block nb = sentBlockAt(
+                        chunk, lx + sim::kFaceOX[f], ly + sim::kFaceOY[f], lz + sim::kFaceOZ[f]);
                     // Unit-cube face exposed only against empty grid cells.
                     bool expose = false;
                     if (isWaterBlock(b)) {
@@ -869,22 +871,57 @@ static void meshChunk(Chunk& chunk, const std::vector<Chunk>& chunks) {
             }
         }
     }
-    chunk.dirty = false;
+}
+
+// ---- the send path: sim -> view ----
+// Everything the view will ever know about occupancy passes through here. This
+// is the anti-cheat boundary: a client is sent the cells it is allowed to see
+// and nothing else, so it cannot infer or fabricate the rest.
+
+static void sentSetBlock(ViewChunk& vc, int lx, int ly, int lz, Block b) {
+    if (!SentCells::inSkirt(lx, ly, lz)) return;
+    vc.sent.cells[SentCells::skirtIndex(lx, ly, lz)].id = static_cast<uint8_t>(b);
+}
+
+// Copy one chunk's occupancy plus its 1-cell skirt into the client's snapshot.
+//
+// This is the ONLY writer of ViewChunk::sent. Because it is the only writer,
+// the invariant "the view holds exactly the cells the sim chose to send" is
+// structural rather than a convention someone has to remember.
+static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc) {
+    if (!vc.hasSnapshot) vc.sent.alloc();
+    const int baseX = vc.cx * CHUNK_SIZE;
+    const int baseY = vc.cy * CHUNK_SIZE;
+    const int baseZ = vc.cz * CHUNK_SIZE;
+    for (int ly = -view::kSkirt; ly < CHUNK_SIZE + view::kSkirt; ++ly) {
+        for (int lz = -view::kSkirt; lz < CHUNK_SIZE + view::kSkirt; ++lz) {
+            for (int lx = -view::kSkirt; lx < CHUNK_SIZE + view::kSkirt; ++lx) {
+                const Block b = world.get(baseX + lx, baseY + ly, baseZ + lz);
+                sentSetBlock(vc, lx, ly, lz, b);
+            }
+        }
+    }
+    vc.hasSnapshot = true;
 }
 
 // Per-chunk upload. Each chunk owns a contiguous region of the world vertex
 // buffer, so a remesh copies only the chunks whose voxels actually changed
 // instead of rebuilding and re-uploading the whole world every time.
 
-// Re-mesh only chunks whose voxels changed. Returns the chunks that were
+// Re-mesh only chunks whose occupancy changed. Returns the chunks that were
 // rebuilt, so the caller uploads exactly those and nothing else.
-static std::vector<const Chunk*> remeshDirtyChunks(std::vector<Chunk>& chunks) {
-    std::vector<const Chunk*> touched;
-    for (auto& c : chunks) {
-        if (!c.dirty) continue;
-        meshChunk(c, chunks);
+static std::vector<ViewChunk*> remeshStaleChunks(const sim::World& world,
+                                                 std::vector<ViewChunk>& views) {
+    std::vector<ViewChunk*> touched;
+    for (auto& c : views) {
+        const sim::Chunk& sc = world.chunks[sim::World::chunkIndex(c.cx, c.cy, c.cz)];
+        if (!c.snapshotStale(sc.version)) continue;
+        // Refresh the snapshot first, then mesh from it. meshChunk has no access
+        // to the world, so this ordering is what keeps the two in step.
+        sendChunkSnapshot(world, c);
+        meshChunk(c);
         c.vertexCount = static_cast<uint32_t>(c.mesh.size());
-        c.dirty = false;
+        c.meshedVersion = sc.version;
         touched.push_back(&c);
         if (c.vertexCount > c.slotCapacity) {
             // A chunk outgrew its reserved region: force a full repack so every
@@ -895,7 +932,7 @@ static std::vector<const Chunk*> remeshDirtyChunks(std::vector<Chunk>& chunks) {
     return touched;
 }
 
-static void repackChunkSlots(std::vector<Chunk>& chunks) {
+static void repackChunkSlots(std::vector<ViewChunk>& chunks) {
     uint32_t cursor = 0;
     for (auto& c : chunks) {
         c.firstVertex = cursor;
@@ -913,7 +950,7 @@ static void repackChunkSlots(std::vector<Chunk>& chunks) {
 
 // Upload a chunk's mesh into its reserved slot. Returns false when the chunk
 // needs a larger buffer, in which case the caller must repack and retry.
-static bool uploadChunkRange(const Chunk& c) {
+static bool uploadChunkRange(const ViewChunk& c) {
     if (c.vertexCount == 0) return true;
     VkDeviceSize offsetBytes = sizeof(Vertex) * c.firstVertex;
     VkDeviceSize size = sizeof(Vertex) * c.vertexCount;
@@ -960,7 +997,7 @@ static bool aabbVisible(const Frustum& f, float minx, float miny, float minz,
     return true;
 }
 
-static void chunkWorldAABB(const Chunk& c, float& minx, float& miny, float& minz,
+static void chunkWorldAABB(const ViewChunk& c, float& minx, float& miny, float& minz,
                            float& maxx, float& maxy, float& maxz) {
     minx = c.cx * CHUNK_SIZE * VOXEL_SIZE;
     miny = c.cy * CHUNK_SIZE * VOXEL_SIZE;
@@ -982,7 +1019,7 @@ static void chunkWorldAABB(const Chunk& c, float& minx, float& miny, float& minz
 // chunk the shader would have drawn. Tightening this to the shader's real disc
 // needs a projected-sphere test rather than a box test, and is left as a later
 // optimisation rather than a correctness fix.
-static bool chunkNotSeen(const Chunk& c, const Frustum& fr, const Vec3& eye, const Vec3& forward) {
+static bool chunkNotSeen(const ViewChunk& c, const Frustum& fr, const Vec3& eye, const Vec3& forward) {
     if (c.vertexCount == 0) return true;
     float minx,miny,minz,maxx,maxy,maxz;
     chunkWorldAABB(c, minx,miny,minz,maxx,maxy,maxz);
@@ -1922,22 +1959,22 @@ static bool ensureVertexCapacity(uint32_t verts) {
 }
 
 static void destroyVoxelAt(int x, int y, int z) {
-    if (!g_chunks || !worldInBounds(x, y, z)) return;
-    Block b = getWorldBlock(*g_chunks, x, y, z);
+    if (!g_world || !worldInBounds(x, y, z)) return;
+    Block b = getWorldBlock(*g_world, x, y, z);
     if (b == Block::Air) return;
     MaterialId mat = blockMaterial(b);
     // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
     g_debris.spawnFromVoxel(x, y, z, mat,
                             g_lastImpactDx, g_lastImpactDy, g_lastImpactDz,
                             g_lastImpactEnergy, VOXEL_SIZE, g_lastAoeScale);
-    setWorldBlock(*g_chunks, x, y, z, Block::Air);
+    setWorldBlock(*g_world, x, y, z, Block::Air);
     g_meshDirty = true;
     ++g_voxelsDestroyed;
 }
 
 static void applySplash(int cx, int cy, int cz, float radius, float energy,
                         const ProjectileDef& def) {
-    if (!g_chunks || radius <= 0.0f) return;
+    if (!g_world || radius <= 0.0f) return;
     // Expand splash by caliber/damage AOE, then density-scale per cell.
     const float aoe = impactAoeScale(def);
     float effectiveR = radius * std::max(0.5f, aoe);
@@ -1952,7 +1989,7 @@ static void applySplash(int cx, int cy, int cz, float radius, float energy,
                 int x = cx + dx, y = cy + dy, z = cz + dz;
                 if (!worldInBounds(x, y, z)) continue;
                 float dist = std::sqrt(float(dx * dx + dy * dy + dz * dz)) * VOXEL_SIZE;
-                Block b = getWorldBlock(*g_chunks, x, y, z);
+                Block b = getWorldBlock(*g_world, x, y, z);
     MaterialId mat = blockMaterial(b);
     // Removing a fixture changes the light set, not just the surface mesh.
     if (b == Block::LightBulb) g_bulbsDirty = true;
@@ -2049,7 +2086,7 @@ static Vec3 aimForward(const WeaponDef& w) {
 
 // Unit-grid DDA ray (Amanatides & Woo). Hitscan/energy only — gravity_scale=0 path.
 static int fireHitscanRay(const ProjectileDef& def, float energyScale, const Vec3& aimDir) {
-    if (!g_chunks) return 0;
+    if (!g_world) return 0;
     Vec3 fwd = aimDir.normalized();
     // Start slightly forward of camera in world space.
     float ox = (g_camPos.x + fwd.x * 0.02f) / VOXEL_SIZE;
@@ -2098,7 +2135,7 @@ static int fireHitscanRay(const ProjectileDef& def, float energyScale, const Vec
 
     for (int step = 0; step < maxSteps; ++step) {
         if (worldInBounds(ix, iy, iz)) {
-            Block b = getWorldBlock(*g_chunks, ix, iy, iz);
+            Block b = getWorldBlock(*g_world, ix, iy, iz);
             MaterialId mat = blockMaterial(b);
             if (mat != MaterialId::Air) {
                 float e = energy * effectMultiplier(def.effect, mat);
@@ -2195,7 +2232,7 @@ static Vec3 spreadAim(const Vec3& forward, float spreadDeg, int pelletIndex, int
 }
 
 static void fireProjectile() {
-    if (!g_chunks) return;
+    if (!g_world) return;
     if (g_fireCooldown > 0.0f) return;
 
     WeaponDef weapon = activeWeaponOrDefault();
@@ -2346,7 +2383,7 @@ static void tryLoadWeapons() {
 }
 
 static void updateProjectiles(float dt) {
-    if (!g_chunks) return;
+    if (!g_world) return;
     for (auto& p : g_projectiles) {
         if (!p.alive) continue;
         // Gravity (matches Python WORLD_GRAVITY * gravity_scale)
@@ -2372,7 +2409,7 @@ static void updateProjectiles(float dt) {
                 continue;
             }
 
-            Block b = getWorldBlock(*g_chunks, ix, iy, iz);
+            Block b = getWorldBlock(*g_world, ix, iy, iz);
             MaterialId mat = blockMaterial(b);
             if (mat == MaterialId::Air) continue;
 
@@ -2465,11 +2502,11 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     // Not-seen rendering: frustum + behind-camera cull per chunk
     g_drawnChunks = 0;
     g_culledChunks = 0;
-    if (g_chunks && g_vertexBuffer != VK_NULL_HANDLE) {
+    if (g_views && g_vertexBuffer != VK_NULL_HANDLE) {
         Frustum fr = frustumFromVP(g_viewProjCull);
         Vec3 eye = g_camPos;
         Vec3 forward = cameraForward();
-        for (auto& c : *g_chunks) {
+        for (auto& c : *g_views) {
             if (chunkNotSeen(c, fr, eye, forward)) {
                 ++g_culledChunks;
                 c.wasVisible = false;
@@ -2525,14 +2562,14 @@ struct SubmersionInfo {
     bool fullySubmerged = false;
 };
 
-static SubmersionInfo sampleCharacterWater(const std::vector<Chunk>& chunks, int gx, int gy, int gz) {
+static SubmersionInfo sampleCharacterWater(const sim::World& world, int gx, int gy, int gz) {
     SubmersionInfo info;
     info.total = kCharUnitCount;
     for (int i = 0; i < kCharUnitCount; ++i) {
         int x = gx + kCharUnits[i][0];
         int y = gy + kCharUnits[i][1];
         int z = gz + kCharUnits[i][2];
-        Block b = getWorldBlock(chunks, x, y, z);
+        Block b = getWorldBlock(world, x, y, z);
         if (isWaterBlock(b)) {
             info.touching++;
             if (b == Block::WaterCurrent) {
@@ -2547,7 +2584,7 @@ static SubmersionInfo sampleCharacterWater(const std::vector<Chunk>& chunks, int
 
 // True if player AABB at (px,py,pz) intersects any solid unit voxel.
 static bool playerHitsSolid(float px, float py, float pz) {
-    if (!g_chunks) return false;
+    if (!g_world) return false;
     const float r = g_player.radius;
     const float h = g_player.height;
     const float eps = VOXEL_SIZE * 0.02f;
@@ -2565,18 +2602,18 @@ static bool playerHitsSolid(float px, float py, float pz) {
                     if (y < 0 || y >= WORLD_H) continue;
                     return true;
                 }
-                if (isSolidBlock(getWorldBlock(*g_chunks, x, y, z))) return true;
+                if (isSolidBlock(getWorldBlock(*g_world, x, y, z))) return true;
             }
     return false;
 }
 
-static void spawnPlayerOnMap(const std::vector<Chunk>& chunks) {
+static void spawnPlayerOnMap(const sim::World& world) {
     // Stand on the concrete apron just inside the open bay, looking -Z into the warehouse.
     const int sx = WORLD_W / 2;
     const int sz = WORLD_D - DIRT_MARGIN - 18;
     int gy = 1 + SLAB_THICK; // default slab top
     for (int y = WORLD_H - 2; y >= 0; --y) {
-        Block b = getWorldBlock(chunks, sx, y, sz);
+        Block b = getWorldBlock(world, sx, y, sz);
         if (isSolidBlock(b)) { gy = y + 1; break; }
     }
     g_player.px = (sx + 0.5f) * VOXEL_SIZE;
@@ -2593,11 +2630,11 @@ static void spawnPlayerOnMap(const std::vector<Chunk>& chunks) {
 
 // Water current + weight sampling from physics feet (not free-fly camera).
 static void updatePlayerCurrentAndWeight(float dt) {
-    if (!g_chunks) return;
+    if (!g_world) return;
     g_playerGX = static_cast<int>(std::floor(g_player.px / VOXEL_SIZE)) - 2;
     g_playerGY = static_cast<int>(std::floor(g_player.py / VOXEL_SIZE));
     g_playerGZ = static_cast<int>(std::floor(g_player.pz / VOXEL_SIZE)) - 0;
-    auto info = sampleCharacterWater(*g_chunks, g_playerGX, g_playerGY, g_playerGZ);
+    auto info = sampleCharacterWater(*g_world, g_playerGX, g_playerGY, g_playerGZ);
     g_touchingWaterUnits = info.touching;
     g_characterUnitCount = info.total;
     g_currentTriggered = info.anyCurrent && info.touching > 0;
@@ -2657,7 +2694,7 @@ static void syncCameraToPlayer() {
 // Reads the tick's intent, not the keyboard: the sim must behave identically
 // whether intent came from a window, a replay script, or a remote client.
 static void updatePlayerPhysics(float dt, const SimInput& in) {
-    if (!g_chunks) return;
+    if (!g_world) return;
 
     // --- lean: intent axis, clamped here so an out-of-range request is ignored ---
     g_player.leanTarget = std::max(-1.0f, std::min(1.0f, in.leanAxis));
@@ -2812,8 +2849,8 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
 
     // Warm bulbs harvested from Block::LightBulb occupancy. Unknown slots are
     // zeroed so the shader's fixed loop sees intensity 0 and skips them.
-    if (g_bulbsDirty && g_chunks) {
-        harvestBulbLights(*g_chunks, g_bulbs);
+    if (g_bulbsDirty && g_world) {
+        harvestBulbLights(*g_world, g_bulbs);
         g_bulbsDirty = false;
     }
     std::memset(ubo.bulbPos, 0, sizeof(ubo.bulbPos));
@@ -2832,7 +2869,7 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
 
 
 static void flushDirtyMesh() {
-    if (!g_meshDirty || !g_chunks) return;
+    if (!g_meshDirty || !g_world || !g_views) return;
     // Under heavy fire, remeshing every frame dominates CPU. Coalesce dirty updates.
     // The gap is measured in simulation ticks, not frames, so it is reproducible.
     const int minGap = g_stress ? 3 : 1;
@@ -2847,43 +2884,45 @@ static void flushDirtyMesh() {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
-    auto touched = remeshDirtyChunks(*g_chunks);
+    // Push fresh snapshots for stale chunks, then mesh each one purely from the
+    // snapshot it was sent. This is the whole sim->view contract in one call.
+    auto touched = remeshStaleChunks(*g_world, *g_views);
 
     // A chunk outgrew its slot, or the buffer was never sized: repack everything
     // and re-upload. This is the rare path; normal impacts only touch their chunk.
     uint32_t needed = 0;
-    for (const auto& c : *g_chunks) needed += c.slotCapacity;
+    for (const auto& c : *g_views) needed += c.slotCapacity;
     const bool repack = g_needsFullMeshRepack || needed > (g_vertexCapacity / sizeof(Vertex));
     g_needsFullMeshRepack = false;
 
     if (repack) {
-        repackChunkSlots(*g_chunks);
+        repackChunkSlots(*g_views);
         uint32_t total = 0;
-        for (const auto& c : *g_chunks) total += c.slotCapacity;
+        for (const auto& c : *g_views) total += c.slotCapacity;
         if (!ensureVertexCapacity(total)) return;
-        for (const auto& c : *g_chunks) uploadChunkRange(c);
+        for (const auto& c : *g_views) uploadChunkRange(c);
         g_vertexCount = total;
         ++g_meshRepackCount;
     } else {
         // Incremental: copy only the chunks whose occupancy changed. Slots are
         // stable, so offsets recorded at the last repack remain valid.
         bool ok = true;
-        for (const Chunk* c : touched) {
+        for (const ViewChunk* c : touched) {
             if (!uploadChunkRange(*c)) { ok = false; break; }
         }
         if (!ok) {
             // Should not happen: ensureVertexCapacity sized the buffer above.
-            repackChunkSlots(*g_chunks);
+            repackChunkSlots(*g_views);
             uint32_t total = 0;
-            for (const auto& c : *g_chunks) total += c.slotCapacity;
+            for (const auto& c : *g_views) total += c.slotCapacity;
             if (!ensureVertexCapacity(total)) return;
-            for (const auto& c : *g_chunks) uploadChunkRange(c);
+            for (const auto& c : *g_views) uploadChunkRange(c);
             g_vertexCount = total;
             ++g_meshRepackCount;
         }
     }
     g_liveVertexCount = 0;
-    for (const auto& c : *g_chunks) g_liveVertexCount += c.vertexCount;
+    for (const auto& c : *g_views) g_liveVertexCount += c.vertexCount;
 
     QueryPerformanceCounter(&t1);
     const double us = (double(t1.QuadPart - t0.QuadPart) * 1e6) / double(freq.QuadPart);
@@ -3209,15 +3248,27 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         if (!createPipeline()) {
             // Shader assets are missing; bail out cleanly instead of running a
             // frame loop with a null pipeline.
-            g_chunks = nullptr;
+            g_world = nullptr;
+            g_views = nullptr;
             cleanup();
             return 1;
         }
         createSync();
 
-auto chunks = buildWarehouseMap();
-        g_chunks = &chunks;
-        spawnPlayerOnMap(chunks);
+        sim::World world = buildWarehouseMap();
+        g_world = &world;
+        spawnPlayerOnMap(world);
+
+        // The view's chunk list. It starts empty of world knowledge: every
+        // cell in it arrives via sendChunkSnapshot() below.
+        std::vector<ViewChunk> views(sim::World::chunkCount());
+        for (int cy = 0; cy < CHUNKS_Y; ++cy)
+            for (int cz = 0; cz < CHUNKS_Z; ++cz)
+                for (int cx = 0; cx < CHUNKS_X; ++cx) {
+                    ViewChunk& c = views[sim::World::chunkIndex(cx, cy, cz)];
+                    c.cx = cx; c.cy = cy; c.cz = cz;
+                }
+        g_views = &views;
 
         // Load Python-exported projectile + ammo defs (gravity + effects)
         const std::string projCandidates[] = {
@@ -3238,19 +3289,20 @@ auto chunks = buildWarehouseMap();
         // Weapon defs from data/weapons or build/weapons
         tryLoadWeapons();
 
-        // Initial build: mesh every chunk, then lay out stable per-chunk slots
-        // so later impacts only re-upload the chunk they damaged.
-        for (auto& c : chunks) c.dirty = true;
-        remeshDirtyChunks(chunks);
-        repackChunkSlots(chunks);
+        // Initial build: send every chunk's snapshot, mesh each one from that
+        // snapshot, then lay out stable per-chunk slots so later impacts only
+        // re-upload the chunk they damaged.
+        remeshStaleChunks(world, views);
+        repackChunkSlots(views);
         uint32_t slotTotal = 0;
-        for (const auto& c : chunks) slotTotal += c.slotCapacity;
+        for (const auto& c : views) slotTotal += c.slotCapacity;
         if (!ensureVertexCapacity(slotTotal)) {
-            g_chunks = nullptr;
+            g_world = nullptr;
+            g_views = nullptr;
             cleanup();
             return 1;
         }
-        for (const auto& c : chunks) uploadChunkRange(c);
+        for (const auto& c : views) uploadChunkRange(c);
 
         char msg[256];
         std::snprintf(msg, sizeof(msg),
@@ -3316,7 +3368,8 @@ auto chunks = buildWarehouseMap();
         }
 
         vkDeviceWaitIdle(g_device);
-        g_chunks = nullptr;
+        g_world = nullptr;
+        g_views = nullptr;
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
