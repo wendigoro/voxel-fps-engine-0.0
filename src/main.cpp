@@ -22,6 +22,7 @@
 #include "destruction.hpp"
 #include "fisheye.hpp"
 #include "materials.hpp"
+#include "sim_input.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -187,6 +188,9 @@ static int g_height = HEIGHT;
 static bool g_keys[256]{};
 static bool g_mouseDown = false;
 static int g_mouseX = 0, g_mouseY = 0, g_lastMouseX = 0, g_lastMouseY = 0;
+// The view's raw device state. The simulation never reads this: buildSimInput()
+// translates it into player intent, and that intent is all sim::tick() receives.
+static SimInput g_pendingInput;
 // Free-float first-person POV camera (radians)
 static float g_yaw = 0.0f;          // 0 = looking toward -Z
 static float g_pitch = -0.28f; // slightly down with higher fisheye POV
@@ -1253,40 +1257,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_running = false;
             PostQuitMessage(0);
         }
-if (wParam == 'F') {
-            g_firePressed = true;
-            g_fireHeld = true;
+        // Everything below is a *request* to the simulation. The view does not
+        // decide the active caliber, weapon, ammo, or fire mode itself; it says
+        // what the player asked for and sim::tick() validates it against the
+        // authoritative inventory. This is what stops a modified client from
+        // selecting a weapon it was never given.
+        if (wParam == 'F') {
+            g_pendingInput.firePressed = true;
+            g_pendingInput.fireHeld = true;
         }
-        if (wParam == VK_SPACE) g_wantJump = true;
+        if (wParam == VK_SPACE) g_pendingInput.jump = true;
         // 1-4: caliber class (light medium heavy energy)
-        if (wParam == '1') { g_activeCaliberIndex = 0; g_activeAmmoIndex = 0; }
-        if (wParam == '2') { g_activeCaliberIndex = 1; g_activeAmmoIndex = 0; }
-        if (wParam == '3') { g_activeCaliberIndex = 2; g_activeAmmoIndex = 0; }
-        if (wParam == '4') { g_activeCaliberIndex = 3; g_activeAmmoIndex = 0; }
-        // R: cycle ammo subtypes for the active caliber (Python ammo table)
-        if (wParam == 'R') {
-            std::string cal = (g_activeCaliberIndex >= 0 && g_activeCaliberIndex < 4)
-                                  ? kCaliberIds[g_activeCaliberIndex] : "medium";
-            auto list = ammosForCaliber(g_ammoDefs, cal);
-            if (!list.empty())
-                g_activeAmmoIndex = (g_activeAmmoIndex + 1) % static_cast<int>(list.size());
-        }
-        // V: cycle loaded weapons when multiple exports exist
-        if (wParam == 'V' && !g_weapons.empty())
-            g_activeWeaponIndex = (g_activeWeaponIndex + 1) % static_cast<int>(g_weapons.size());
-        // B: cycle fire mode on active weapon (semi/auto/bolt) for playtests
-        if (wParam == 'B' && !g_weapons.empty()) {
-            WeaponDef& w = g_weapons[std::min(g_activeWeaponIndex,
-                                             static_cast<int>(g_weapons.size()) - 1)];
-            if (w.fireMode == "semi") w.fireMode = "auto";
-            else if (w.fireMode == "auto") w.fireMode = "bolt";
-            else w.fireMode = "semi";
-            g_lastFireMode = w.fireMode;
-        }
+        if (wParam == '1') g_pendingInput.selectCaliber = 0;
+        if (wParam == '2') g_pendingInput.selectCaliber = 1;
+        if (wParam == '3') g_pendingInput.selectCaliber = 2;
+        if (wParam == '4') g_pendingInput.selectCaliber = 3;
+        if (wParam == 'R') g_pendingInput.cycleAmmo = true;
+        if (wParam == 'V') g_pendingInput.cycleWeapon = true;
+        if (wParam == 'B') g_pendingInput.cycleFireMode = true;
         return 0;
     case WM_KEYUP:
         if (wParam < 256) g_keys[wParam] = false;
-        if (wParam == 'F') g_fireHeld = false;
+        if (wParam == 'F') g_pendingInput.fireHeld = false;
         return 0;
     case WM_LBUTTONDOWN:
         g_mouseDown = true;
@@ -1299,23 +1291,21 @@ if (wParam == 'F') {
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
-        g_firePressed = true;
-        g_fireHeld = true;
+        g_pendingInput.firePressed = true;
+        g_pendingInput.fireHeld = true;
         return 0;
     case WM_RBUTTONUP:
-        g_fireHeld = false;
+        g_pendingInput.fireHeld = false;
         return 0;
     case WM_MOUSEMOVE:
         g_mouseX = static_cast<short>(LOWORD(lParam));
         g_mouseY = static_cast<short>(HIWORD(lParam));
-    if (g_mouseDown) {
-            int dx = g_mouseX - g_lastMouseX;
-            int dy = g_mouseY - g_lastMouseY;
-            float sens = g_lookSens * (g_ads ? 0.55f : 1.0f);
-            g_yaw += dx * sens;
-            g_pitch -= dy * sens; // drag up = look up
-            const float lim = static_cast<float>(M_PI) * 0.49f;
-            g_pitch = std::max(-lim, std::min(lim, g_pitch));
+        if (g_mouseDown) {
+            // Accumulate the raw pixel delta; sim::tick() applies it. Applying
+            // yaw here instead would make aim depend on how often Windows
+            // delivers WM_MOUSEMOVE, which is not reproducible across machines.
+            g_pendingInput.lookDx += static_cast<float>(g_mouseX - g_lastMouseX);
+            g_pendingInput.lookDy += static_cast<float>(g_mouseY - g_lastMouseY);
             g_lastMouseX = g_mouseX;
             g_lastMouseY = g_mouseY;
         }
@@ -2664,30 +2654,27 @@ static void syncCameraToPlayer() {
 }
 
 // Physics-bound walk/jump + unit-grid hitbox; Q/E side lean (not up/down fly).
-static void updatePlayerPhysics(float dt) {
+// Reads the tick's intent, not the keyboard: the sim must behave identically
+// whether intent came from a window, a replay script, or a remote client.
+static void updatePlayerPhysics(float dt, const SimInput& in) {
     if (!g_chunks) return;
 
-    // --- lean targets: Q left, E right ---
-    g_player.leanTarget = 0.0f;
-    if (g_keys['Q']) g_player.leanTarget -= 1.0f;
-    if (g_keys['E']) g_player.leanTarget += 1.0f;
-    g_player.leanTarget = std::max(-1.0f, std::min(1.0f, g_player.leanTarget));
+    // --- lean: intent axis, clamped here so an out-of-range request is ignored ---
+    g_player.leanTarget = std::max(-1.0f, std::min(1.0f, in.leanAxis));
     const float leanRate = 8.0f;
     g_player.lean += (g_player.leanTarget - g_player.lean) * (1.0f - std::exp(-leanRate * dt));
 
-    // --- desired horizontal velocity (WASD walk, Shift sprint) ---
+    // --- desired horizontal velocity (analog wish axes, Shift sprint) ---
     float speed = g_moveSpeed;
-    if (g_keys[VK_SHIFT]) speed *= 1.65f;
+    if (in.sprint) speed *= 1.65f;
     // Lean slows strafe slightly (shoulder into cover).
     speed *= (1.0f - 0.18f * std::fabs(g_player.lean));
 
     Vec3 wish(0, 0, 0);
     Vec3 f = flatForward();
     Vec3 r = flatRight();
-    if (g_keys['W'] || g_keys[VK_UP]) wish = wish + f;
-    if (g_keys['S'] || g_keys[VK_DOWN]) wish = wish - f;
-    if (g_keys['A'] || g_keys[VK_LEFT]) wish = wish - r;
-    if (g_keys['D'] || g_keys[VK_RIGHT]) wish = wish + r;
+    if (std::fabs(in.moveForward) > 1e-6f) wish = wish + f * in.moveForward;
+    if (std::fabs(in.moveRight) > 1e-6f) wish = wish + r * in.moveRight;
     if (wish.length() > 1e-5f) wish = wish.normalized() * speed;
 
     // Accelerate / friction on horizontal plane.
@@ -2769,11 +2756,13 @@ const float prevVel = vel;
     syncCameraToPlayer();
 }
 
-// Kept name for call sites: water weight + physics body + locked camera.
-static void updateCamera(float dt) {
+// Water weight + physics body + locked camera. Renamed from the misleading
+// "updateCamera": the camera is a view output, but this advances the body and
+// water buoyancy, which are simulation.
+static void updatePlayerAndEye(float dt, const SimInput& in) {
     updatePlayerCurrentAndWeight(dt);
     if (!g_smoke) {
-        updatePlayerPhysics(dt);
+        updatePlayerPhysics(dt, in);
     } else {
         // Headless smoke: keep body planted, only yaw/pitch scripted; still lock eye.
         syncCameraToPlayer();
@@ -3037,61 +3026,132 @@ static std::string getExeDir() {
 // welded to the frame loop. World state after tick N must depend only on
 // g_tick and on the input that arrived by then — never on how long the frame
 // took to draw.
-static void simulateOnce(float dt) {
+// Scripted player intent for the functional smoke/stress runs.
+//
+// This deliberately produces a SimInput rather than poking g_firePressed /
+// g_activeCaliberIndex directly. A scripted run is just another *client* of the
+// simulation, so exercising the same seam a real view uses keeps the headless
+// harness honest: if the intent path breaks, the smoke test breaks with it.
+//
+// Scripted off g_tick, never the frame count, so the scenario is reproducible
+// regardless of render speed.
+static SimInput scriptedInput(float dt) {
+    SimInput s;
+    if (g_stress) {
+        // Keep aim into bay; hammer shotgun to max debris/projectile load.
+        g_pitch = -0.10f;
+        g_yaw += dt * 0.05f;
+        s.selectCaliber = 0; // light -> shotgun_light
+        // Fire every 3 ticks once warmed - heavy enough without remesh thrash.
+        if (g_tick >= 3 && (g_tick % 3) == 0) {
+            g_fireCooldown = 0.0f;
+            s.firePressed = true;
+            s.fireHeld = true;
+            ++g_stressFireCount;
+        }
+    } else {
+        g_yaw += dt * 0.20f;
+        if (g_tick < 20) {
+            g_pitch = -0.12f;
+            if (g_tick == 4) {
+                s.selectCaliber = 1; // medium ballistic
+                g_fireCooldown = 0.0f;
+                s.firePressed = true;
+            }
+            if (g_tick == 8) {
+                s.selectCaliber = 0; // shotgun light
+                g_fireCooldown = 0.0f;
+                s.firePressed = true;
+            }
+            if (g_tick == 14) {
+                s.selectCaliber = 3; // energy hitscan
+                g_fireCooldown = 0.0f;
+                s.firePressed = true;
+            }
+        } else {
+            g_pitch = 0.42f; // sky tiles + moon
+        }
+    }
+    return s;
+}
+
+// Translate this frame's raw device state into one tick of player intent.
+//
+// This is the whole of the view's authority over the simulation. Everything the
+// window handler has already recorded in g_pendingInput (fire edges, loadout
+// requests, look deltas) is merged with the currently-held keys, and nothing
+// else crosses.
+static SimInput buildSimInput() {
+    SimInput in = g_pendingInput;
+    simInputClearEdges(g_pendingInput);
+
+    // Held movement keys -> analog wish axes.
+    float fwd = 0.0f, right = 0.0f;
+    if (g_keys['W'] || g_keys[VK_UP]) fwd += 1.0f;
+    if (g_keys['S'] || g_keys[VK_DOWN]) fwd -= 1.0f;
+    if (g_keys['D'] || g_keys[VK_RIGHT]) right += 1.0f;
+    if (g_keys['A'] || g_keys[VK_LEFT]) right -= 1.0f;
+    in.moveForward = std::max(-1.0f, std::min(1.0f, fwd));
+    in.moveRight = std::max(-1.0f, std::min(1.0f, right));
+    in.sprint = g_keys[VK_SHIFT] != 0;
+    in.ads = in.ads || (g_keys['X'] != 0);
+
+    // Held lean keys -> one axis, so a view cannot send contradictory Q and E.
+    float lean = 0.0f;
+    if (g_keys['E']) lean += 1.0f;
+    if (g_keys['Q']) lean -= 1.0f;
+    in.leanAxis = lean;
+    return in;
+}
+
+static void simulateOnce(float dt, const SimInput& in) {
+    // --- consume this tick's player intent ---
+    // Look is applied here rather than in WndProc so aim depends on the tick
+    // count, not on how many WM_MOUSEMOVE messages Windows delivered.
+    {
+        const float sens = g_lookSens * (in.ads ? 0.55f : 1.0f);
+        g_yaw += in.lookDx * sens;
+        g_pitch -= in.lookDy * sens; // drag up = look up
+        const float lim = static_cast<float>(M_PI) * 0.49f;
+        g_pitch = std::max(-lim, std::min(lim, g_pitch));
+    }
+    g_ads = in.ads;
+    g_wantJump = in.jump;
+    g_firePressed = in.firePressed;
+    g_fireHeld = in.fireHeld;
+    // Loadout requests are validated against the authoritative lists here, in
+    // the simulation. A view cannot grant itself a weapon by asking for one.
+    if (in.selectCaliber >= 0 && in.selectCaliber < 4) {
+        g_activeCaliberIndex = in.selectCaliber;
+        g_activeAmmoIndex = 0;
+    }
+    if (in.cycleAmmo) {
+        const std::string cal = (g_activeCaliberIndex >= 0 && g_activeCaliberIndex < 4)
+                                    ? kCaliberIds[g_activeCaliberIndex] : "medium";
+        auto list = ammosForCaliber(g_ammoDefs, cal);
+        if (!list.empty())
+            g_activeAmmoIndex = (g_activeAmmoIndex + 1) % static_cast<int>(list.size());
+    }
+    if (in.cycleWeapon && !g_weapons.empty()) {
+        g_activeWeaponIndex = (g_activeWeaponIndex + 1) % static_cast<int>(g_weapons.size());
+    }
+    if (in.cycleFireMode && !g_weapons.empty()) {
+        WeaponDef& w = g_weapons[std::min(g_activeWeaponIndex,
+                                          static_cast<int>(g_weapons.size()) - 1)];
+        if (w.fireMode == "semi") w.fireMode = "auto";
+        else if (w.fireMode == "auto") w.fireMode = "bolt";
+        else w.fireMode = "semi";
+        g_lastFireMode = w.fireMode;
+    }
+
     if (g_fireCooldown > 0.0f) {
         g_fireCooldown -= dt;
         if (g_fireCooldown < 0.0f) g_fireCooldown = 0.0f;
     }
 
-    g_ads = g_keys['X'] != 0;
     updateRecoilRecovery(dt);
     // Player body physics + water weight, and lock the eye to the body.
-    updateCamera(dt);
-
-    // Functional smoke / stress: fire into warehouse bay. Scripted off the tick
-    // counter, not the frame count, so the scenario is reproducible regardless
-    // of render speed.
-    if (g_smoke) {
-        if (g_stress) {
-            // Keep aim into bay; hammer shotgun to max debris/projectile load.
-            g_pitch = -0.10f;
-            g_yaw += dt * 0.05f;
-            g_activeCaliberIndex = 0; // light -> shotgun_light
-            g_activeAmmoIndex = 0;
-            // Fire every 3 ticks once warmed - heavy enough without remesh thrash.
-            if (g_tick >= 3 && (g_tick % 3) == 0) {
-                g_fireCooldown = 0.0f;
-                g_firePressed = true;
-                g_fireHeld = true;
-                ++g_stressFireCount;
-            }
-        } else {
-            g_yaw += dt * 0.20f;
-            if (g_tick < 20) {
-                g_pitch = -0.12f;
-                if (g_tick == 4) {
-                    g_activeCaliberIndex = 1; // medium ballistic
-                    g_activeAmmoIndex = 0;
-                    g_fireCooldown = 0.0f;
-                    g_firePressed = true;
-                }
-                if (g_tick == 8) {
-                    g_activeCaliberIndex = 0; // shotgun light
-                    g_activeAmmoIndex = 0;
-                    g_fireCooldown = 0.0f;
-                    g_firePressed = true;
-                }
-                if (g_tick == 14) {
-                    g_activeCaliberIndex = 3; // energy hitscan
-                    g_activeAmmoIndex = 0;
-                    g_fireCooldown = 0.0f;
-                    g_firePressed = true;
-                }
-            } else {
-                g_pitch = 0.42f; // sky tiles + moon
-            }
-        }
-    }
+    updatePlayerAndEye(dt, in);
 
     // Fire modes: semi/bolt = edge; auto = held (RMB/F) with cooldown cadence.
     {
@@ -3229,7 +3289,16 @@ auto chunks = buildWarehouseMap();
                 g_tickAccum -= TICK_DT;
                 ++g_tick;
                 ++g_ticksSinceRemesh;
-                simulateOnce(static_cast<float>(TICK_DT));
+                // One tick of intent, produced by whichever client is driving:
+                // the local window, the scripted smoke harness, or (later) a
+                // remote client. The simulation cannot tell the difference.
+                SimInput in;
+                if (g_smoke) {
+                    in = scriptedInput(static_cast<float>(TICK_DT));
+                } else {
+                    in = buildSimInput();
+                }
+                simulateOnce(static_cast<float>(TICK_DT), in);
                 ++steps;
             }
             // Hit the per-frame cap: drop the backlog instead of chasing it, so a
