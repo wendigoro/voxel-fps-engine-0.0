@@ -14,10 +14,16 @@
 
 #pragma once
 
+// A named guard in addition to #pragma once, so the view-isolation self-test
+// (src/view_isolation_check.cpp) can detect a forbidden include. #pragma once
+// is invisible to the preprocessor; this is not.
+#define SIM_WORLD_HPP
+
 #include <cstdint>
 #include <vector>
 
 #include "materials.hpp"
+#include "voxel_wire.hpp"
 
 namespace sim {
 
@@ -31,25 +37,49 @@ enum class Block : uint8_t {
     Girder,
     Wood,
     WoodDark,
-    Water,
-    WaterCurrent,
-    Moon,
-    LightBulb,
+    Water,        // still unit cubes; may occupy multi-cell clumps
+    WaterCurrent, // moving water source (same visual, current sampling)
+    Moon,         // cool emissive crescent grid
+    LightBulb     // warm emissive indoor bulbs
 };
+
+// Agreement with the wire is asserted, never assumed. A view reads
+// wire::BlockId; if the two enums ever drift, a client silently renders the
+// wrong voxel. Failing at compile time is the only cheap moment to catch that.
+static_assert(static_cast<uint8_t>(Block::Air) == static_cast<uint8_t>(wire::BlockId::Air));
+static_assert(static_cast<uint8_t>(Block::Dirt) == static_cast<uint8_t>(wire::BlockId::Dirt));
+static_assert(static_cast<uint8_t>(Block::Concrete) == static_cast<uint8_t>(wire::BlockId::Concrete));
+static_assert(static_cast<uint8_t>(Block::SheetMetal) == static_cast<uint8_t>(wire::BlockId::SheetMetal));
+static_assert(static_cast<uint8_t>(Block::Girder) == static_cast<uint8_t>(wire::BlockId::Girder));
+static_assert(static_cast<uint8_t>(Block::Wood) == static_cast<uint8_t>(wire::BlockId::Wood));
+static_assert(static_cast<uint8_t>(Block::WoodDark) == static_cast<uint8_t>(wire::BlockId::WoodDark));
+static_assert(static_cast<uint8_t>(Block::Water) == static_cast<uint8_t>(wire::BlockId::Water));
+static_assert(static_cast<uint8_t>(Block::WaterCurrent) == static_cast<uint8_t>(wire::BlockId::WaterCurrent));
+static_assert(static_cast<uint8_t>(Block::Moon) == static_cast<uint8_t>(wire::BlockId::Moon));
+static_assert(static_cast<uint8_t>(Block::LightBulb) == static_cast<uint8_t>(wire::BlockId::LightBulb));
 
 // Unit cube. Every solid is 1x1x1 voxels on the impact grid; no stretched
 // planes. Scale comes from materials.hpp (kVoxelSize) — the single source of
 // truth, deliberately not redefined here.
 static constexpr float kVoxelSize = ::kVoxelSize;
 
-static constexpr int kChunkSize = 32;                 // voxels per chunk axis
-static constexpr int kChunksX = 6;                    // warehouse + river bank
-static constexpr int kChunksY = 2;                    // height for walls/roof girders
-static constexpr int kChunksZ = 5;                    // extended depth for river slice
-static constexpr int kWorldW = kChunksX * kChunkSize; // 160
-static constexpr int kWorldH = kChunksY * kChunkSize; // 64
-static constexpr int kWorldD = kChunksZ * kChunkSize; // 128
+static constexpr int kChunkSize = wire::kChunkSize;
+static constexpr int kChunksX = wire::kChunksX;
+static constexpr int kChunksY = wire::kChunksY;
+static constexpr int kChunksZ = wire::kChunksZ;
+static constexpr int kWorldW = wire::kWorldW;
+static constexpr int kWorldH = wire::kWorldH;
+static constexpr int kWorldD = wire::kWorldD;
 static constexpr int kVoxelsPerChunk = kChunkSize * kChunkSize * kChunkSize;
+
+// A skirted snapshot is the chunk plus a 1-cell shell, so a view can answer
+// edge-face questions on its own. Stripping the shell must recover the chunk.
+static_assert(kVoxelsPerChunk ==
+                  static_cast<int>((wire::kSlice - 2 * wire::kSkirt) *
+                                   (wire::kSlice - 2 * wire::kSkirt) *
+                                   (wire::kSlice - 2 * wire::kSkirt)),
+              "stripping the skirt must recover exactly the chunk volume");
+static_assert(wire::kSkirt >= 1, "a skirt of 0 would force the view to ask the sim about edges");
 
 // The 6 unit-cube face directions, shared by the occupancy writer and the
 // mesher so they can never disagree about which neighbours matter.

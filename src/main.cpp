@@ -781,8 +781,9 @@ static sim::World buildWarehouseMap() {
 // A block as read out of a sent snapshot. This is the ONLY way view-side code
 // learns occupancy — it has no other source.
 static Block sentBlockAt(const ViewChunk& vc, int lx, int ly, int lz) {
-    if (!SentCells::inSkirt(lx, ly, lz)) return Block::Air; // world edge
-    return static_cast<Block>(vc.sent.cells[SentCells::skirtIndex(lx, ly, lz)].id);
+    // The wire enum and the sim enum are asserted equal in sim_world.hpp, so
+    // this is a checked reinterpretation, not a cast of convenience.
+    return static_cast<Block>(static_cast<uint8_t>(vc.sent.get(lx, ly, lz)));
 }
 
 // Sharp vertex face emit: 6 unique verts/face (2 tris), hard face normals, no sharing.
@@ -878,16 +879,16 @@ static void meshChunk(ViewChunk& chunk) {
 // is the anti-cheat boundary: a client is sent the cells it is allowed to see
 // and nothing else, so it cannot infer or fabricate the rest.
 
-static void sentSetBlock(ViewChunk& vc, int lx, int ly, int lz, Block b) {
-    if (!SentCells::inSkirt(lx, ly, lz)) return;
-    vc.sent.cells[SentCells::skirtIndex(lx, ly, lz)].id = static_cast<uint8_t>(b);
-}
-
 // Copy one chunk's occupancy plus its 1-cell skirt into the client's snapshot.
 //
 // This is the ONLY writer of ViewChunk::sent. Because it is the only writer,
 // the invariant "the view holds exactly the cells the sim chose to send" is
 // structural rather than a convention someone has to remember.
+//
+// The sim::Block -> wire::BlockId conversion happens HERE, at the boundary.
+// sim_world.hpp static_asserts the two enums agree, so this crossing is checked
+// rather than trusted, and it is the single place world data becomes client
+// data.
 static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc) {
     if (!vc.hasSnapshot) vc.sent.alloc();
     const int baseX = vc.cx * CHUNK_SIZE;
@@ -897,7 +898,7 @@ static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc) {
         for (int lz = -view::kSkirt; lz < CHUNK_SIZE + view::kSkirt; ++lz) {
             for (int lx = -view::kSkirt; lx < CHUNK_SIZE + view::kSkirt; ++lx) {
                 const Block b = world.get(baseX + lx, baseY + ly, baseZ + lz);
-                sentSetBlock(vc, lx, ly, lz, b);
+                vc.sent.set(lx, ly, lz, static_cast<wire::BlockId>(static_cast<uint8_t>(b)));
             }
         }
     }
