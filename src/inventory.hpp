@@ -267,6 +267,9 @@ struct ItemDef {
 
     // Armor: zone this piece must fit, -1 = any zone
     int armorZone = -1;
+    // Armor: mitigation points. Each point absorbs 0.5% of incoming damage
+    // (see health::armorAbsorption), capped so armor is never invulnerability.
+    float armorPoints = 0.0f;
 
     // RULES.md rule 12 authoring contract (unit grid only).
     int unit = 1;
@@ -882,6 +885,8 @@ inline ItemDef parseItemObject(const std::string& text) {
         d.packSZ = pack[2];
     }
     d.armorZone = armorZoneFromName(jsonExtractString(obj, "armor_zone", ""));
+    d.armorPoints = jsonExtractFloat(obj, "armor_points", 0.0f);
+    if (d.armorPoints < 0.0f) d.armorPoints = 0.0f;
     return d;
 }
 

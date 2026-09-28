@@ -5,6 +5,7 @@
   "voxel_size": 0.001,
   "class": "armor",
   "armor_zone": "arms",
+  "armor_points": 35,
   "material": "sheet_metal",
   "color": [0.50, 0.30, 0.24],
   "size": [3, 3, 3]

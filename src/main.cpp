@@ -20,6 +20,7 @@
 
 #include "debris.hpp"
 #include "destruction.hpp"
+#include "health.hpp"
 #include "inventory.hpp"
 #include "materials.hpp"
 
@@ -187,6 +188,20 @@ struct PlayerBody {
 static PlayerBody g_player;
 static bool g_wantJump = false;
 
+// Player health (RULES.md rule 15). Kept as a distinct ActorHealth rather than
+// fields on PlayerBody so a second actor is a new type, not a refactor.
+static health::ActorHealth g_health;
+// Peak downward speed of the current airborne arc, used to price a landing.
+static float g_fallPeakSpeed = 0.0f;
+static bool g_wasOnGround = true;
+// Lifetime counters for the smoke report.
+static int g_fallDamageEvents = 0;
+static int g_drownDamageTicks = 0;
+static int g_bodyHits = 0;
+static int g_deaths = 0;
+static int g_respawns = 0;
+static bool g_deathHandled = false;
+
 // Projectile destruction state (g_chunks assigned after Chunk type exists)
 struct Chunk;
 static std::vector<Chunk>* g_chunks = nullptr;
@@ -224,6 +239,41 @@ static DebrisSystem g_debris;
 static ItemTable g_itemDefs;
 static Inventory g_inventory;
 static bool g_inventoryOpen = false;
+
+// ---- health / damage bridge (RULES.md rule 15) ---------------------------
+// Armor mitigation comes from whatever piece is actually equipped over the hit
+// zone, so the 0.5%-per-point rule is data-driven and an empty slot is simply
+// no mitigation.
+static float equippedArmorPoints(ArmorZone zone) {
+    if (zone >= ArmorZone::Count) return 0.0f;
+    const int slot = static_cast<int>(zoneEquipSlot(zone));
+    const int defIdx = g_inventory.slotDef[slot];
+    if (defIdx < 0) return 0.0f;
+    const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+    return d ? d->armorPoints : 0.0f;
+}
+
+// Convert an impact's voxel-destruction energy into HP loss on the player's body
+// and apply it at `zone`. Returns the HP actually removed.
+static float damagePlayerAtZone(float energy, const std::string& effect, ArmorZone zone) {
+    if (g_health.dead) return 0.0f;
+    const float bio = health::biologicalDamage(energy, effect);
+    if (bio <= 0.0f) return 0.0f;
+    const health::DamageResult r =
+        health::applyDamage(g_health, bio, zone, equippedArmorPoints(zone));
+    if (r.applied > 0.0f) ++g_bodyHits;
+    return r.applied;
+}
+
+// Segment-vs-body test in the player's cell space. Returns the hit zone, or
+// ArmorZone::Count on a miss.
+static ArmorZone projectileHitZone(float x0, float y0, float z0, float x1, float y1, float z1,
+                                   float radiusCells) {
+    if (g_health.dead) return ArmorZone::Count;
+    const health::BodyCellOrigin org = health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
+    const health::BodyHit h = health::segmentHitBody(org, x0, y0, z0, x1, y1, z1, radiusCells);
+    return h.zone;
+}
 // One-shot input latches raised by the window proc and drained once per frame.
 static bool g_inventoryClick = false;  // LMB: lift a packed item / place the held one
 static bool g_inventoryStow = false;   // RMB: stow the held item back into the pack
@@ -1080,6 +1130,68 @@ static void emitInventoryCube(const Vec3& origin, const Vec3& right, const Vec3&
                  right, up, fwd, x0, y0, z0, VOXEL_SIZE, cr, cg, cb, matId);
 }
 
+// Mat-7 segment health/breath HUD (RULES.md rule 15). Appended to the same
+// overlay buffer as the inventory lattice, so the overlay pass now runs whenever
+// either the lattice or the HUD is present. Same camera-relative unit-cube basis
+// as the lattice, so there is no second projection to keep in sync.
+// No numeric readout: the engine has no glyph system, and a 3x5 digit font is a
+// separate task.
+static constexpr int kHudHealthCells = 10;
+static constexpr int kHudHealthCols = 5;
+static constexpr int kHudBreathCells = 5;
+
+static uint32_t emitHealthHud(uint32_t wi) {
+    if (!g_inventoryMapped) return wi;
+    Vec3 fwd = cameraForward();
+    Vec3 right = cameraRight();
+    if (right.length() < 1e-5f) right = Vec3(1, 0, 0);
+    right = right.normalized();
+    const Vec3 up = right.cross(fwd).normalized();
+    // Same distance as the lattice so both sit on one visual grid; the HUD is
+    // anchored below the panel and to its left.
+    const float dist = 0.006f;
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0062f) + right * (0.0009f);
+    const float matId = static_cast<float>(kInventoryMatId);
+
+    const float frac = g_health.healthFraction();
+    const int filled = static_cast<int>(std::lround(frac * kHudHealthCells));
+    float hr, hg, hb;
+    if (g_health.dead) {
+        hr = 0.55f; hg = 0.08f; hb = 0.08f;
+    } else if (frac > 0.5f) {
+        hr = 0.28f; hg = 0.85f; hb = 0.36f;
+    } else if (frac > 0.2f) {
+        hr = 0.90f; hg = 0.74f; hb = 0.20f;
+    } else {
+        hr = 0.90f; hg = 0.22f; hb = 0.20f;
+    }
+
+    // Health: 5x2 segment block. Cells fill left-to-right, bottom row first.
+    for (int i = 0; i < kHudHealthCells; ++i) {
+        const int col = i % kHudHealthCols;
+        const int row = i / kHudHealthCols;
+        const bool on = i < filled && !g_health.dead;
+        const float cr = on ? hr : 0.13f;
+        const float cg = on ? hg : 0.13f;
+        const float cb = on ? hb : 0.15f;
+        emitInventoryCube(origin, right, up, fwd, static_cast<float>(col),
+                          static_cast<float>(row), 0.0f, cr, cg, cb, matId, wi);
+    }
+
+    // Breath: a second 5-cell row below, skipped while dead.
+    if (!g_health.dead) {
+        const float bf = std::max(0.0f, std::min(1.0f, g_health.breath / health::kBreathSeconds));
+        const int bfilled = static_cast<int>(std::lround(bf * kHudBreathCells));
+        for (int i = 0; i < kHudBreathCells; ++i) {
+            const bool on = i < bfilled;
+            emitInventoryCube(origin, right, up, fwd, static_cast<float>(i), -2.0f, 0.0f,
+                              on ? 0.25f : 0.13f, on ? 0.55f : 0.13f, on ? 0.95f : 0.15f,
+                              matId, wi);
+        }
+    }
+    return wi;
+}
+
 // World point -> client pixels. mat 7 skips the vertex fisheye, so plain
 // perspective projection reproduces exactly the pixels the GPU drew.
 static bool projectToScreen(const Vec3& p, float& outX, float& outY) {
@@ -1118,7 +1230,9 @@ static bool cellScreenRect(const InventoryDisplay& d, float x0, float y0, float 
 // verts) because the display basis follows the camera.
 static void updateInventoryMesh() {
     if (!g_inventoryOpen) {
-        g_inventoryVertexCount = 0;
+        // Lattice closed, but the mat-7 HUD still draws in the overlay pass.
+        ensureInventoryBuffer();
+        g_inventoryVertexCount = g_inventoryMapped ? emitHealthHud(0) : 0;
         g_invDisplay.valid = false;
         g_invHover = InventoryHover{};
         return;
@@ -1303,7 +1417,7 @@ static void updateInventoryMesh() {
                           static_cast<float>(kInventoryMatId), wi);
     }
 
-    g_inventoryVertexCount = wi;
+    g_inventoryVertexCount = emitHealthHud(wi);
 }
 
 // ---- world item pickups -------------------------------------------------
@@ -2695,6 +2809,23 @@ static void applySplash(int cx, int cy, int cz, float radius, float energy,
                 g_lastImpactEnergy = e;
                 if (e >= thr * 0.8f) destroyVoxelAt(x, y, z);
             }
+
+    // Splash reaches bodies too. Self damage is ON, so the player's own grenade
+    // hurts them; the shooter is only excluded from their own bullet's
+    // *direct* hit (see ProjectileRuntime::ownerIsPlayer).
+    if (health::kSelfFireDamage) {
+        const float impactX = (static_cast<float>(cx) + 0.5f) * VOXEL_SIZE;
+        const float impactY = (static_cast<float>(cy) + 0.5f) * VOXEL_SIZE;
+        const float impactZ = (static_cast<float>(cz) + 0.5f) * VOXEL_SIZE;
+        const health::BodyCellOrigin org = health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
+        const float bodyDist = health::distanceToBody(org, impactX, impactY, impactZ);
+        if (bodyDist <= effectiveR) {
+            const float fall =
+                std::pow(std::max(0.0f, 1.0f - bodyDist / std::max(effectiveR, 1e-6f)), def.splashFalloff);
+            const ArmorZone zone = health::zoneNearestPoint(org, impactX, impactY, impactZ);
+            damagePlayerAtZone(energy * fall * 0.65f, def.effect, zone);
+        }
+    }
 }
 
 static WeaponDef activeWeaponOrDefault() {
@@ -2822,8 +2953,38 @@ static int fireHitscanRay(const ProjectileDef& def, float energyScale, const Vec
     float traveled = 0.0f;
     int breaks = 0;
     const int maxSteps = static_cast<int>(maxDist / VOXEL_SIZE) + 2;
+    // One bullet, one body: the sweep is sampled per cell, and the 5-cell-wide
+    // player would otherwise be counted once per cell it spans. The shooter's
+    // own shot is excluded (the ray origin is inside their head); enemy fire
+    // will use the same path once it exists.
+    bool bodyHit = false;
+    const float radiusCells = std::max(0.5f, std::min(2.0f, def.radius / VOXEL_SIZE));
+    float prevWx = g_camPos.x + fwd.x * 0.02f;
+    float prevWy = g_camPos.y + fwd.y * 0.02f;
+    float prevWz = g_camPos.z + fwd.z * 0.02f;
 
     for (int step = 0; step < maxSteps; ++step) {
+        // Body sweep for this cell, tested in cell space against the same box
+        // the armor zones tile.
+        {
+            const float curWx = (static_cast<float>(ix) + 0.5f) * VOXEL_SIZE;
+            const float curWy = (static_cast<float>(iy) + 0.5f) * VOXEL_SIZE;
+            const float curWz = (static_cast<float>(iz) + 0.5f) * VOXEL_SIZE;
+            if (!bodyHit) {
+                const ArmorZone zone =
+                    projectileHitZone(prevWx, prevWy, prevWz, curWx, curWy, curWz, radiusCells);
+                if (zone != ArmorZone::Count) {
+                    bodyHit = true;
+                    damagePlayerAtZone(energy, def.effect, zone);
+                    // Soft target: a penetrating round keeps going, weaker.
+                    energy *= (1.0f - std::min(0.95f, def.penetration));
+                    if (energy < 0.05f) break;
+                }
+            }
+            prevWx = curWx;
+            prevWy = curWy;
+            prevWz = curWz;
+        }
         if (worldInBounds(ix, iy, iz)) {
             Block b = getWorldBlock(*g_chunks, ix, iy, iz);
             MaterialId mat = blockMaterial(b);
@@ -2900,6 +3061,7 @@ static void spawnBallisticProjectile(const ProjectileDef& def, const Vec3& aimDi
     p.vz = fwd.z * def.speed;
     p.energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f);
     p.alive = true;
+    p.ownerIsPlayer = true; // never self-inflicted by the shooter's own bullet
     g_projectiles.push_back(p);
 }
 
@@ -2923,6 +3085,7 @@ static Vec3 spreadAim(const Vec3& forward, float spreadDeg, int pelletIndex, int
 
 static void fireProjectile() {
     if (!g_chunks) return;
+    if (g_health.dead) return; // a dead player cannot shoot
     if (g_fireCooldown > 0.0f) return;
 
     WeaponDef weapon = activeWeaponOrDefault();
@@ -3123,6 +3286,8 @@ struct InventorySmokeReport {
     int overlayVerts = 0;
     int overlayLatticeVerts = 0;
     int overlaySlotVerts = 0;
+    int overlayHudVerts = 0;
+    bool hudBuilt = false;
     bool overlayBuilt = false;
     bool overlayUnitCubes = false;
     // look-and-click hand path
@@ -3143,6 +3308,184 @@ struct InventorySmokeReport {
 };
 
 static InventorySmokeReport g_invSmoke;
+
+// Health smoke (RULES.md rule 15). --smoke skips player physics, so fall damage
+// and drowning can never be reached through the frame loop; every check here
+// drives the same health:: functions the game calls, on a local actor so the
+// live state is untouched.
+struct HealthSmokeReport {
+    bool maxHealthOk = false;
+    bool armorAbsorbOk = false;
+    bool zoneHitOk = false;
+    bool damageOk = false;
+    bool singleHitCapOk = false;
+    bool fallOk = false;
+    bool drownOk = false;
+    bool deathOk = false;
+    bool equippedArmorOk = false;
+    bool selfFireExcludedOk = false;
+    int mediumShotHp = 0;   // HP cost of one starter-rifle medium-caliber hit
+    int helmetPoints = 0;   // armor_points actually parsed from data/items
+    int chestPoints = 0;
+};
+
+static HealthSmokeReport g_healthSmoke;
+
+static HealthSmokeReport runHealthSmoke() {
+    HealthSmokeReport rep;
+    health::ActorHealth h;
+    rep.maxHealthOk = std::fabs(h.maxHealth - 125.0f) < 1e-4f &&
+                      std::fabs(h.health - 125.0f) < 1e-4f && !h.dead;
+
+    // 0.5% per point, hard-capped so armor is never invulnerability.
+    rep.armorAbsorbOk = std::fabs(health::armorAbsorption(0.0f)) < 1e-6f &&
+                        std::fabs(health::armorAbsorption(20.0f) - 0.10f) < 1e-5f &&
+                        std::fabs(health::armorAbsorption(100.0f) - 0.50f) < 1e-5f &&
+                        std::fabs(health::armorAbsorption(400.0f) - 0.50f) < 1e-5f;
+
+    // Segment -> zone, in cell space. Origin (0,0,0) means world (0,0,0) is the
+    // body-centre cell at the feet.
+    {
+        const health::BodyCellOrigin org{0, 0, 0};
+        const health::BodyHit head = health::segmentHitBody(
+            org, -0.010f, 0.0175f, 0.0f, 0.010f, 0.0175f, 0.0f);
+        const health::BodyHit chest = health::segmentHitBody(
+            org, -0.010f, 0.0125f, 0.0f, 0.010f, 0.0125f, 0.0f);
+        const health::BodyHit legs = health::segmentHitBody(
+            org, -0.010f, 0.0035f, 0.0f, 0.010f, 0.0035f, 0.0f);
+        const health::BodyHit miss = health::segmentHitBody(
+            org, -0.010f, 0.0035f, 0.060f, 0.010f, 0.0035f, 0.060f);
+        // Radial pricing: a blast at the feet resolves to legs, one at the
+        // camera height to head.
+        const health::BodyCellOrigin live =
+            health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
+        const health::BodyHit atEye = health::segmentHitBody(
+            live, g_camPos.x, g_camPos.y, g_camPos.z, g_camPos.x, g_camPos.y, g_camPos.z);
+        rep.zoneHitOk = head.zone == ArmorZone::Head && chest.zone == ArmorZone::Chest &&
+                        legs.zone == ArmorZone::Legs && miss.zone == ArmorZone::Count &&
+                        atEye.zone == ArmorZone::Head;
+    }
+
+    // Absorption: 20 HP unarmored costs 20, the same 20 HP behind 100 points
+    // (a 50% soak) costs 10.
+    {
+        health::ActorHealth bare;
+        health::ActorHealth armored;
+        const health::DamageResult a = health::applyDamage(bare, 20.0f, ArmorZone::Chest, 0.0f);
+        const health::DamageResult b = health::applyDamage(armored, 20.0f, ArmorZone::Chest, 100.0f);
+        rep.damageOk = std::fabs(a.applied - 20.0f) < 1e-4f &&
+                       std::fabs(a.absorbed) < 1e-4f &&
+                       std::fabs(b.applied - 10.0f) < 1e-4f &&
+                       std::fabs(b.absorbed - 10.0f) < 1e-4f &&
+                       std::fabs(armored.absorbed[static_cast<int>(ArmorZone::Chest)] - 10.0f) < 1e-4f;
+    }
+
+    // No single application may exceed 60% of the pool.
+    {
+        health::ActorHealth c;
+        const health::DamageResult r = health::applyDamage(c, 1000.0f, ArmorZone::Chest, 0.0f);
+        rep.singleHitCapOk = !r.killed && c.dead == false &&
+                             std::fabs(c.health - (125.0f - 75.0f)) < 1e-3f;
+    }
+
+    // Fall curve: free at/below a one-voxel step, monotonic above it, capped.
+    {
+        const float step = health::fallDamageForImpactSpeed(0.083f);
+        const float mid = health::fallDamageForImpactSpeed(0.16f);
+        const float maxV = health::fallDamageForImpactSpeed(0.25f);
+        const float over = health::fallDamageForImpactSpeed(9.0f);
+        rep.fallOk = step <= 0.0f && mid > step && mid < maxV && maxV <= 40.0f + 1e-4f &&
+                     over <= 40.0f + 1e-4f;
+    }
+
+    // Breath: drains submerged, refills in air, damages only once it is empty.
+    {
+        health::ActorHealth b;
+        for (int i = 0; i < 260; ++i) health::updateBreath(b, true, 0.1f);
+        const bool heldUnder = b.breath <= 0.0f && b.health < 125.0f;
+        for (int i = 0; i < 40; ++i) health::updateBreath(b, false, 0.1f);
+        const bool refilled = b.breath > 0.0f && b.health < 125.0f; // no HP back
+        health::ActorHealth c;
+        for (int i = 0; i < 100; ++i) health::updateBreath(c, true, 0.1f);
+        const bool noEarlyDmg = std::fabs(c.health - 125.0f) < 1e-4f;
+        rep.drownOk = heldUnder && refilled && noEarlyDmg;
+    }
+
+    // Death + respawn: drain, confirm dead/timer, then run out the countdown.
+    {
+        health::ActorHealth d;
+        health::DamageResult last{};
+        for (int i = 0; i < 40 && !d.dead; ++i)
+            last = health::applyDamage(d, 10.0f, ArmorZone::Chest, 0.0f);
+        const bool died = d.dead && last.killed && d.health <= 0.0f &&
+                          d.respawnTimer > 0.0f;
+        bool respawned = false;
+        for (int i = 0; i < 200 && !respawned; ++i)
+            respawned = health::updateActorHealth(d, 0.05f);
+        rep.deathOk = died && respawned && !d.dead &&
+                      std::fabs(d.health - d.maxHealth) < 1e-4f;
+    }
+
+    // Equipped armor actually drives mitigation, and it is data-driven.
+    {
+        const int chest = itemIndexById("armor_chest_plate");
+        const int helmet = itemIndexById("armor_helmet");
+        if (chest >= 0) rep.chestPoints = static_cast<int>(g_itemDefs[static_cast<size_t>(chest)].armorPoints);
+        if (helmet >= 0) rep.helmetPoints = static_cast<int>(g_itemDefs[static_cast<size_t>(helmet)].armorPoints);
+        const int slot = static_cast<int>(zoneEquipSlot(ArmorZone::Chest));
+        const int saved = g_inventory.slotDef[slot];
+        const float empty = equippedArmorPoints(ArmorZone::Chest);
+        bool ok = empty <= 0.0f;
+        if (chest >= 0) {
+            g_inventory.slotDef[slot] = chest;
+            const float worn = equippedArmorPoints(ArmorZone::Chest);
+            ok = ok && worn > 0.0f;
+            // 100 points of soak really is 50% off a 20 HP chest hit.
+            health::ActorHealth test;
+            const health::DamageResult r = health::applyDamage(test, 20.0f, ArmorZone::Chest, worn);
+            ok = ok && std::fabs(r.applied - 20.0f * (1.0f - health::armorAbsorption(worn))) < 1e-3f;
+        }
+        g_inventory.slotDef[slot] = saved;
+        rep.equippedArmorOk = ok && rep.chestPoints > 0 && rep.helmetPoints > 0;
+    }
+
+    // Self damage is ON, but a shooter is never hurt by their own bullet: the
+    // hitscan origin sits inside the player's head, so the exclusion is the only
+    // thing standing between firing and suicide. Prove both halves: the ray
+    // really does intersect the body, and no engine-spawned projectile is
+    // unowned.
+    {
+        bool allOwned = true;
+        for (const auto& p : g_projectiles)
+            if (!p.ownerIsPlayer) allOwned = false;
+        const health::BodyCellOrigin live =
+            health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
+        const Vec3 f = cameraForward();
+        const health::BodyHit selfRay = health::segmentHitBody(
+            live, g_camPos.x, g_camPos.y, g_camPos.z, g_camPos.x + f.x * 0.05f,
+            g_camPos.y + f.y * 0.05f, g_camPos.z + f.z * 0.05f);
+        rep.selfFireExcludedOk = health::kSelfFireDamage && allOwned &&
+                                 selfRay.zone == ArmorZone::Head;
+    }
+
+    // One starter-rifle medium hit, priced through the real conversion, so the
+    // HP-per-shot number is measured rather than asserted.
+    {
+        int medium = -1;
+        for (size_t i = 0; i < g_projDefs.size(); ++i)
+            if (g_projDefs[i].caliber == "medium" && !g_projDefs[i].hitscan) {
+                medium = static_cast<int>(i);
+                break;
+            }
+        if (medium >= 0) {
+            ProjectileDef def = scaleProjectileForWeapon(g_projDefs[static_cast<size_t>(medium)],
+                                                         activeWeaponOrDefault());
+            const float e = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f);
+            rep.mediumShotHp = static_cast<int>(std::lround(health::biologicalDamage(e, def.effect)));
+        }
+    }
+    return rep;
+}
 
 static InventorySmokeReport runInventorySmoke() {
     InventorySmokeReport rep;
@@ -3230,6 +3573,9 @@ static InventorySmokeReport runInventorySmoke() {
     const int wasHeld = g_inventory.held;
     g_inventory.held = -1;
     g_inventoryOpen = true;
+    // Deterministic HUD geometry: the live run may have taken splash damage or
+    // be mid-respawn, and the HUD segment count depends on health/breath state.
+    health::respawnActor(g_health);
     updateInventoryMesh();
     g_inventoryOpen = wasOpen;
     g_inventory.held = wasHeld;
@@ -3238,8 +3584,11 @@ static InventorySmokeReport runInventorySmoke() {
     const int cells = g_inventory.vol.cells();
     rep.overlayLatticeVerts = cells * 36;
     rep.overlaySlotVerts = kEquipSlotCount * 36;
-    rep.overlayBuilt = rep.overlayVerts == rep.overlayLatticeVerts + rep.overlaySlotVerts &&
-                       rep.overlayVerts <= static_cast<int>(kInventoryMaxVerts);
+    // HUD is appended to the same buffer: 10 health + 5 breath unit cells.
+    rep.overlayHudVerts = (kHudHealthCells + kHudBreathCells) * 36;
+    rep.hudBuilt = rep.overlayVerts ==
+                   rep.overlayLatticeVerts + rep.overlaySlotVerts + rep.overlayHudVerts;
+    rep.overlayBuilt = rep.hudBuilt && rep.overlayVerts <= static_cast<int>(kInventoryMaxVerts);
 
     // Unit-cube check. The cell is rotated in world space, so a world AABB
     // would be larger than VOXEL_SIZE; what must hold is that the cell spans
@@ -3501,10 +3850,24 @@ static void updateProjectiles(float dt) {
 
         const int steps = 4;
         const float sdt = dt / static_cast<float>(steps);
+        const float radiusCells = std::max(0.5f, std::min(2.0f, p.def.radius / VOXEL_SIZE));
         for (int s = 0; s < steps && p.alive; ++s) {
+            const float prevWx = p.px, prevWy = p.py, prevWz = p.pz;
             p.px += p.vx * sdt;
             p.py += p.vy * sdt;
             p.pz += p.vz * sdt;
+
+            // Body sweep first, so a body is hit before the voxel it stands in.
+            // One bullet, one body (player::ownerIsPlayer excludes the shooter).
+            if (!p.ownerIsPlayer && health::kSelfFireDamage) {
+                const ArmorZone zone =
+                    projectileHitZone(prevWx, prevWy, prevWz, p.px, p.py, p.pz, radiusCells);
+                if (zone != ArmorZone::Count) {
+                    damagePlayerAtZone(p.energy, p.def.effect, zone);
+                    p.energy *= (1.0f - std::min(0.95f, p.def.penetration));
+                    if (p.energy < 0.05f) p.alive = false;
+                }
+            }
 
             int ix = static_cast<int>(std::floor(p.px / VOXEL_SIZE));
             int iy = static_cast<int>(std::floor(p.py / VOXEL_SIZE));
@@ -3657,10 +4020,11 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
 
     vkCmdEndRenderPass(cmd);
 
-    // Inventory overlay (RULES.md rule 12): second pass, color LOAD + depth
-    // DONT_CARE, so the lattice paints over the map while still self-occluding
-    // against a fresh depth buffer.
-    if (g_inventoryOpen && g_inventoryVB != VK_NULL_HANDLE && g_inventoryVertexCount > 0) {
+    // Inventory + HUD overlay (RULES.md rule 12/15): second pass, color LOAD +
+    // depth DONT_CARE, so the lattice paints over the map while still
+    // self-occluding against a fresh depth buffer. The pass runs when either the
+    // lattice or the health HUD produced vertices.
+    if (g_inventoryVB != VK_NULL_HANDLE && g_inventoryVertexCount > 0) {
         ++g_inventoryOverlayFrames;
         VkRenderPassBeginInfo ovp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         ovp.renderPass = g_overlayRenderPass;
@@ -3786,6 +4150,10 @@ static void updatePlayerCurrentAndWeight(float dt) {
     g_currentTriggered = info.anyCurrent && info.touching > 0;
     g_fullySubmerged = info.fullySubmerged;
 
+    // Breath / drowning (RULES.md rule 15). Reuses the existing character water
+    // probe rather than adding a second submersion test.
+    if (health::updateBreath(g_health, g_fullySubmerged, dt) > 0.0f) ++g_drownDamageTicks;
+
     g_playerWeight = g_playerBaseWeight;
     if (g_currentTriggered) g_playerWeight *= 2.0f;
     if (g_fullySubmerged) g_playerWeight *= 0.5f;
@@ -3834,6 +4202,35 @@ static void syncCameraToPlayer() {
     g_camPos.x = g_player.px + right.x * leanLat;
     g_camPos.y = g_player.py + g_player.eyeHeight - leanDrop;
     g_camPos.z = g_player.pz + right.z * leanLat;
+}
+
+// Death drops whatever is in hand as a normal mat-8 world pickup, reusing the
+// existing pickup path instead of inventing a drop system. Packed items and
+// equipped gear are untouched — death is a setback, not a wipe.
+static void dropHeldItemOnDeath() {
+    const int inst = g_inventory.held;
+    if (inst < 0 || inst >= static_cast<int>(g_inventory.items.size())) return;
+    const int defIdx = g_inventory.items[static_cast<size_t>(inst)].defIndex;
+    const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+    if (!d || !d->shape.valid()) return;
+    // One cell in front of the feet, so the drop is immediately grabbable with
+    // the existing G-to-take reach.
+    const health::BodyCellOrigin org = health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
+    const Vec3 f = flatForward();
+    int fx = static_cast<int>(std::round(f.x));
+    int fz = static_cast<int>(std::round(f.z));
+    if (fx == 0 && fz == 0) fz = 1; // never drop underfoot
+    WorldPickup p;
+    p.defIndex = defIdx;
+    p.cx = org.x + fx;
+    p.cy = org.y;
+    p.cz = org.z + fz;
+    p.rot = g_inventoryHandRot;
+    p.alive = true;
+    g_pickups.push_back(p);
+    g_pickupMeshDirty = true;
+    // removePacked clears `held` itself once the instance is gone.
+    removePacked(g_inventory, inst);
 }
 
 // Physics-bound walk/jump + unit-grid hitbox; Q/E side lean (not up/down fly).
@@ -3938,6 +4335,27 @@ const float prevVel = vel;
         g_player.vy = 0.0f;
         g_player.onGround = true;
     }
+
+    // Fall damage is priced from the peak downward speed of the whole arc, not
+    // from vy at the moment of landing, so it does not depend on which of the
+    // two landing paths (moveAxis block or ground probe) happened to zero vy
+    // first. Jumping is free because the apex return speed (jumpSpeed 0.055)
+    // sits under health::kFallSafeSpeed. --smoke skips physics entirely, so the
+    // smoke test exercises fallDamageForImpactSpeed() directly instead.
+    if (!g_player.onGround) {
+        g_fallPeakSpeed = std::max(g_fallPeakSpeed, -g_player.vy);
+    } else if (!g_wasOnGround) {
+        const float dmg = health::fallDamageForImpactSpeed(g_fallPeakSpeed);
+        if (dmg > 0.0f) {
+            // Routed through the same intake as impacts, so leg armor absorbs
+            // it like any other energy.
+            health::applyDamage(g_health, dmg, ArmorZone::Legs,
+                                equippedArmorPoints(ArmorZone::Legs));
+            ++g_fallDamageEvents;
+        }
+        g_fallPeakSpeed = 0.0f;
+    }
+    g_wasOnGround = g_player.onGround;
 
     syncCameraToPlayer();
 }
@@ -4284,6 +4702,32 @@ if (g_fireCooldown > 0.0f) {
             g_ads = g_keys['X'] != 0;
             updateRecoilRecovery(dt);
 
+            // Health tick (RULES.md rule 15), ahead of input so a dead player is
+            // frozen out of every control on the same frame. updateProjectiles
+            // ran before drawFrame last frame, so any damage it dealt has already
+            // landed; this only advances the flash and the respawn countdown.
+            if (health::updateActorHealth(g_health, dt)) {
+                ++g_respawns;
+                if (g_chunks) spawnPlayerOnMap(*g_chunks);
+                g_fallPeakSpeed = 0.0f;
+                g_wasOnGround = true;
+                g_deathHandled = false;
+            }
+            if (g_health.dead) {
+                if (!g_deathHandled) {
+                    g_deathHandled = true;
+                    ++g_deaths;
+                    dropHeldItemOnDeath();
+                }
+                g_inventoryOpen = false;
+                g_firePressed = false;
+                g_fireHeld = false;
+                g_pickupPressed = false;
+                g_wantJump = false;
+                g_mouseDown = false;
+                ReleaseCapture();
+            }
+
             // Functional smoke / stress: fire into warehouse bay
             if (g_smoke) {
                 if (g_stress) {
@@ -4380,6 +4824,7 @@ const bool wasDirty = g_meshDirty;
         // Write success marker for smoke / stress tests
         if (g_smoke) {
             g_invSmoke = runInventorySmoke();
+            g_healthSmoke = runHealthSmoke();
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
 out << "frames=" << frames << "\nvertices=" << g_vertexCount
@@ -4488,6 +4933,41 @@ out << "frames=" << frames << "\nvertices=" << g_vertexCount
                 << "\npickup_verts=" << g_invSmoke.pickupVerts
                 << "\npickup_unit_cubes=" << (g_invSmoke.pickupOk ? 1 : 0)
                 << "\npickup_taken=" << (g_invSmoke.pickupTaken ? 1 : 0)
+                << "\nhealth_max_hp=" << g_health.maxHealth
+                << "\nhealth_hp=" << g_health.health
+                << "\nhealth_dead=" << (g_health.dead ? 1 : 0)
+                << "\nhealth_self_fire=" << (health::kSelfFireDamage ? 1 : 0)
+                << "\nhealth_absorb_per_point=" << health::kArmorAbsorbPerPoint
+                << "\nhealth_absorb_cap=" << health::kMaxArmorAbsorb
+                << "\nhealth_medium_shot_hp=" << g_healthSmoke.mediumShotHp
+                << "\nhealth_armor_chest_points=" << g_healthSmoke.chestPoints
+                << "\nhealth_armor_helmet_points=" << g_healthSmoke.helmetPoints
+                << "\nhealth_max_health_ok=" << (g_healthSmoke.maxHealthOk ? 1 : 0)
+                << "\nhealth_armor_absorb_ok=" << (g_healthSmoke.armorAbsorbOk ? 1 : 0)
+                << "\nhealth_zone_hit_ok=" << (g_healthSmoke.zoneHitOk ? 1 : 0)
+                << "\nhealth_damage_ok=" << (g_healthSmoke.damageOk ? 1 : 0)
+                << "\nhealth_single_hit_cap_ok=" << (g_healthSmoke.singleHitCapOk ? 1 : 0)
+                << "\nhealth_fall_ok=" << (g_healthSmoke.fallOk ? 1 : 0)
+                << "\nhealth_drown_ok=" << (g_healthSmoke.drownOk ? 1 : 0)
+                << "\nhealth_death_ok=" << (g_healthSmoke.deathOk ? 1 : 0)
+                << "\nhealth_equipped_armor_ok=" << (g_healthSmoke.equippedArmorOk ? 1 : 0)
+                << "\nhealth_self_fire_excluded_ok=" << (g_healthSmoke.selfFireExcludedOk ? 1 : 0)
+                << "\nhealth_hud_verts=" << g_invSmoke.overlayHudVerts
+                << "\nhealth_hud_built=" << (g_invSmoke.hudBuilt ? 1 : 0)
+                << "\nhealth_body_hits=" << g_bodyHits
+                << "\nhealth_fall_events=" << g_fallDamageEvents
+                << "\nhealth_drown_ticks=" << g_drownDamageTicks
+                << "\nhealth_deaths=" << g_deaths
+                << "\nhealth_respawns=" << g_respawns
+                << "\nhealth_ok="
+                << ((g_healthSmoke.maxHealthOk && g_healthSmoke.armorAbsorbOk &&
+                     g_healthSmoke.zoneHitOk && g_healthSmoke.damageOk &&
+                     g_healthSmoke.singleHitCapOk && g_healthSmoke.fallOk &&
+                     g_healthSmoke.drownOk && g_healthSmoke.deathOk &&
+                     g_healthSmoke.equippedArmorOk && g_healthSmoke.selfFireExcludedOk &&
+                     g_healthSmoke.mediumShotHp > 0 && g_invSmoke.hudBuilt)
+                        ? 1
+                        : 0)
                 << "\ninventory_ok="
                 << ((!g_itemDefs.empty() && g_invSmoke.zonesTile && g_invSmoke.equipOk &&
                      g_invSmoke.wideArmRejected && g_invSmoke.classGateOk &&

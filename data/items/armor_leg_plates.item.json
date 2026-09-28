@@ -5,6 +5,7 @@
   "voxel_size": 0.001,
   "class": "armor",
   "armor_zone": "legs",
+  "armor_points": 45,
   "material": "carbon_fiber",
   "color": [0.26, 0.28, 0.30],
   "size": [3, 3, 3]
