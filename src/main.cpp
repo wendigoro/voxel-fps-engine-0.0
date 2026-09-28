@@ -20,6 +20,7 @@
 
 #include "debris.hpp"
 #include "destruction.hpp"
+#include "fisheye.hpp"
 #include "materials.hpp"
 
 #ifndef M_PI
@@ -31,13 +32,27 @@ static constexpr int HEIGHT = 720;
 static constexpr int MAX_FRAMES = 2;
 // Internal 3D render scale (downscale for fill-rate). Presented upscaled with bitcrush look in shader.
 static constexpr float RENDER_SCALE = 0.5f;
-static constexpr float DEFAULT_FOV_DEG = 101.5f; // 70 * 1.45 fisheye default
 static constexpr int INTERNAL_W = 640;  // WIDTH * 0.5
 static constexpr int INTERNAL_H = 360;  // HEIGHT * 0.5
+static constexpr float DEFAULT_FOV_DEG = 101.5f; // 70 * 1.45 fisheye default
+
+// ---- deterministic simulation clock ----
+// The simulation advances only in whole ticks of exactly TICK_DT. Wall clock is
+// used to decide HOW MANY ticks to run, never what a tick's dt is. That keeps
+// world state a pure function of g_tick, which is the prerequisite for the
+// view/sim split, for replay, and for moving systems onto other machines.
+static constexpr double TICK_HZ = 120.0;
+static constexpr double TICK_DT = 1.0 / TICK_HZ;
+// Cap ticks per frame so a long stall cannot spiral. The backlog is dropped
+// rather than chased, so a hitch costs time but not determinism.
+static constexpr int MAX_TICKS_PER_FRAME = 8;
+static uint64_t g_tick = 0;
+static double g_tickAccum = 0.0;
 
 // Unit voxel grid: 1000x smaller than original 1.0 blocks. Every solid is 1x1x1 voxels
 // (no stretched planes). Impact / destruction use integer grid indices only.
-static constexpr float VOXEL_SIZE = 0.001f;    // == materials.hpp kVoxelSize
+// Single source of truth for the scale is materials.hpp (kVoxelSize).
+static constexpr float VOXEL_SIZE = kVoxelSize;
 static constexpr int CHUNK_SIZE = 32;         // voxels per chunk axis
 static constexpr int CHUNKS_X = 6;            // warehouse + river bank
 static constexpr int CHUNKS_Y = 2;            // height for walls/roof girders
@@ -67,6 +82,14 @@ struct Vec3 {
         float l = length();
         return l > 1e-8f ? (*this) * (1.0f / l) : Vec3(0, 1, 0);
     }
+};
+
+// A light the view should shade with, derived from occupancy.
+struct BulbLight {
+    Vec3 pos;          // world-space centre
+    Vec3 color;
+    float intensity;
+    float radius;
 };
 
 struct Mat4 {
@@ -121,6 +144,10 @@ struct Vertex {
 float mat; // 0 solid, 1 water, 2 bulb, 3 moon, 4 sky, 5 debris cube, 6 muzzle flash
 };
 
+// Fixed light slots in the frame UBO. The shader loops this many, so it is a
+// layout constant, not a tuning knob.
+static constexpr int kMaxBulbs = 4;
+
 struct FrameUBO {
     float viewProj[16];
     float sunDir[3];
@@ -134,13 +161,13 @@ struct FrameUBO {
     float muzzleFlash;     // 0..1 fire pulse (shader overlay + lighting kick)
     float fireOverlay;     // 0..1 frame-border burn
     float _fxPad[2];
-    float bulbPos[4][4];   // xyz, intensity
-    float bulbColor[4][4]; // rgb, radius
+    float bulbPos[kMaxBulbs][4];   // xyz, intensity
+    float bulbColor[kMaxBulbs][4]; // rgb, radius
 };
 
-// Time system
+// Time system. g_timeOfDay is frozen: the world ships as permanent night, and
+// the dead g_timeScale that was meant to advance it is gone.
 static float g_timeOfDay = 0.88f; // night
-static float g_timeScale = 0.0f;  // frozen night unless changed
 static bool g_isNight = true;
 
 struct QueueFamilyIndices {
@@ -280,17 +307,25 @@ static VkDeviceMemory g_vertexMem = VK_NULL_HANDLE;
 static void* g_vertexMapped = nullptr;
 static VkDeviceSize g_vertexCapacity = 0; // bytes
 static uint32_t g_vertexCount = 0;
+// Vertices currently occupied across all chunk slots. Kept separate from
+// g_vertexCount (buffer capacity in vertices) so telemetry reports real geometry.
+static uint32_t g_liveVertexCount = 0;
+static bool g_needsFullMeshRepack = false;
+static int g_meshRepackCount = 0;
 static double g_meshUploadUsMax = 0.0;
 static double g_meshUploadUsSum = 0.0;
 static int g_meshUploadSamples = 0;
-static int g_framesSinceRemesh = 99;
+static int g_ticksSinceRemesh = 99;
 static int g_remeshSkipCount = 0;
 // Headless modes (declared early — used by debris draw + remesh throttle).
 static bool g_smoke = false;
 static bool g_stress = false;
-static int g_smokeFrames = 300;
+static uint64_t g_smokeTicks = 300;
 static int g_projLivePeak = 0;
 static int g_stressFireCount = 0;
+// Real count of occupancy cells destroyed. Previously inferred by diffing the
+// rendered vertex count, which made the simulation read render state.
+static int g_voxelsDestroyed = 0;
 static VkBuffer g_uboBuffers[MAX_FRAMES]{};
 static VkDeviceMemory g_uboMems[MAX_FRAMES]{};
 static void* g_uboMapped[MAX_FRAMES]{};
@@ -313,7 +348,15 @@ static VkBuffer g_skyTileVB = VK_NULL_HANDLE;
 static VkDeviceMemory g_skyTileMem = VK_NULL_HANDLE;
 static void* g_skyTileMapped = nullptr;
 static uint32_t g_skyTileVertexCount = 0;
+// Eye the mapped sky vertices were last written for. The tile is camera-relative,
+// so it is rebuilt only when the eye moves, not on every frame.
+static Vec3 g_skyTileEye = {0, 0, 0};
+static bool g_skyTileBuilt = false;
 static Vec3 g_moonWorldPos = {0, 0, 0};
+// Bulb lights harvested from Block::LightBulb occupancy. Cached because the grid
+// is 1.3M cells; re-harvested only when a fixture is actually destroyed.
+static std::vector<BulbLight> g_bulbs;
+static bool g_bulbsDirty = true;
 static Vec3 g_moonDirWorld = {0.32f, 0.82f, -0.48f}; // fixed sky bearing (light source)
 static float g_moonTileSize = 0.034f;
 static float g_skyRadius = 0.55f;
@@ -375,29 +418,6 @@ static void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     vkBindBufferMemory(g_device, buffer, memory, 0);
 }
 
-static VkCommandBuffer beginOneTime() {
-    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = g_cmdPool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(g_device, &ai, &cmd);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-    return cmd;
-}
-
-static void endOneTime(VkCommandBuffer cmd) {
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(g_graphicsQueue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(g_graphicsQueue);
-    vkFreeCommandBuffers(g_device, g_cmdPool, 1, &cmd);
-}
-
 // ---- fine voxel + chunk system (sharp face vertices) ----
 enum class Block : uint8_t {
     Air = 0,
@@ -450,6 +470,9 @@ struct Chunk {
     bool dirty = true;
     uint32_t firstVertex = 0;
     uint32_t vertexCount = 0;
+    // Vertices reserved in the world VB for this chunk. A chunk may shrink freely
+    // but must not exceed it without triggering a full repack.
+    uint32_t slotCapacity = 0;
     bool wasVisible = true;
 };
 
@@ -481,23 +504,6 @@ static bool worldInBounds(int x, int y, int z) {
     return x >= 0 && y >= 0 && z >= 0 && x < WORLD_W && y < WORLD_H && z < WORLD_D;
 }
 
-static float hashNoise(int x, int z) {
-    uint32_t n = static_cast<uint32_t>(x * 374761393u + z * 668265263u);
-    n = (n ^ (n >> 13)) * 1274126177u;
-    n ^= n >> 16;
-    return (n & 0xFFFFu) / 65535.0f;
-}
-
-static float valueNoise(int x, int z) {
-    // cheap multi-octave for micro-terrain
-    float n = 0.0f;
-    n += hashNoise(x, z) * 1.0f;
-    n += hashNoise(x / 2, z / 2) * 2.0f;
-    n += hashNoise(x / 4, z / 4) * 4.0f;
-    n += hashNoise(x / 8, z / 8) * 6.0f;
-    return n / 13.0f;
-}
-
 static Block getWorldBlock(const std::vector<Chunk>& chunks, int x, int y, int z) {
     if (!worldInBounds(x, y, z)) return Block::Air;
     int cx = x / CHUNK_SIZE;
@@ -521,12 +527,47 @@ static void setWorldBlock(std::vector<Chunk>& chunks, int x, int y, int z, Block
     chunks[chunkIndex(cx, cy, cz)].dirty = true;
 }
 
-static int groundHeight(const std::vector<Chunk>& chunks, int x, int z) {
-    for (int y = WORLD_H - 1; y >= 0; --y) {
-        Block b = getWorldBlock(chunks, x, y, z);
-        if (b != Block::Air) return y;
+// Harvest bulb lights by reading Block::LightBulb out of the grid, then folding
+// vertically adjacent cells into one light per fixture. The grid is the only
+// authority on where a light is: the map can be repainted or a painter edit can
+// move a fixture, and lighting follows without a second list to keep in sync.
+static void harvestBulbLights(const std::vector<Chunk>& chunks,
+                              std::vector<BulbLight>& out) {
+    out.clear();
+    std::vector<char> consumed(static_cast<size_t>(WORLD_W) * WORLD_H * WORLD_D, 0);
+    auto idx = [](int x, int y, int z) {
+        return (static_cast<size_t>(z) * WORLD_H + y) * WORLD_W + x;
+    };
+    for (int z = 0; z < WORLD_D; ++z) {
+        for (int y = 0; y < WORLD_H; ++y) {
+            for (int x = 0; x < WORLD_W; ++x) {
+                if (consumed[idx(x, y, z)]) continue;
+                if (getWorldBlock(chunks, x, y, z) != Block::LightBulb) continue;
+                // Absorb the whole vertical run so a two-cell fixture is one light.
+                int runTop = y;
+                int cells = 0;
+                float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
+                while (runTop < WORLD_H &&
+                       getWorldBlock(chunks, x, runTop, z) == Block::LightBulb) {
+                    consumed[idx(x, runTop, z)] = 1;
+                    sumX += (x + 0.5f) * VOXEL_SIZE;
+                    sumY += (runTop + 0.5f) * VOXEL_SIZE;
+                    sumZ += (z + 0.5f) * VOXEL_SIZE;
+                    ++cells;
+                    ++runTop;
+                }
+                if (cells <= 0) continue;
+                const float inv = 1.0f / static_cast<float>(cells);
+                BulbLight l;
+                l.pos = Vec3(sumX * inv, sumY * inv, sumZ * inv);
+                l.color = Vec3(1.00f, 0.75f, 0.45f);
+                // Brighter and wider for a taller fixture, capped at the slot count.
+                l.intensity = std::min(1.8f, 1.2f + 0.2f * static_cast<float>(cells));
+                l.radius = std::min(0.09f, 0.06f + 0.01f * static_cast<float>(cells));
+                out.push_back(l);
+            }
+        }
     }
-    return 0;
 }
 
 // Fill a solid axis-aligned box with unit voxels (inclusive).
@@ -693,13 +734,14 @@ static std::vector<Chunk> buildWarehouseMap() {
         bulb((bx0 + bx1) / 2, bz1 - 18);
     }
 
-    // 7c) Moon light-source sky tile anchor (sprite drawn as billboard; light via UBO moonDir).
+    // 7c) Moon: one solid emissive unit voxel high on the -Z sky side.
+    // The billboard sprite and the light direction are view concerns derived from
+    // g_moonDirWorld in updateMoonSkyTile(); map construction must not write
+    // render state, so nothing here touches a view global.
     {
         const int mx = WORLD_W / 2 + 24;
         const int mz = 6;
         const int my = WORLD_H - 6;
-        g_moonWorldPos = Vec3((mx + 0.5f) * VOXEL_SIZE, (my + 0.5f) * VOXEL_SIZE, (mz + 0.5f) * VOXEL_SIZE);
-        // Single unit voxel anchor (optional debug marker); main visual is sky tile sprite.
         setWorldBlock(chunks, mx, my, mz, Block::Moon);
     }
 
@@ -826,19 +868,55 @@ static void meshChunk(Chunk& chunk, const std::vector<Chunk>& chunks) {
     chunk.dirty = false;
 }
 
-static std::vector<Vertex> meshAllChunks(std::vector<Chunk>& chunks) {
-    std::vector<Vertex> verts;
-    verts.reserve(400000);
+// Per-chunk upload. Each chunk owns a contiguous region of the world vertex
+// buffer, so a remesh copies only the chunks whose voxels actually changed
+// instead of rebuilding and re-uploading the whole world every time.
+
+// Re-mesh only chunks whose voxels changed. Returns the chunks that were
+// rebuilt, so the caller uploads exactly those and nothing else.
+static std::vector<const Chunk*> remeshDirtyChunks(std::vector<Chunk>& chunks) {
+    std::vector<const Chunk*> touched;
+    for (auto& c : chunks) {
+        if (!c.dirty) continue;
+        meshChunk(c, chunks);
+        c.vertexCount = static_cast<uint32_t>(c.mesh.size());
+        c.dirty = false;
+        touched.push_back(&c);
+        if (c.vertexCount > c.slotCapacity) {
+            // A chunk outgrew its reserved region: force a full repack so every
+            // chunk's offset is recomputed consistently before uploading.
+            g_needsFullMeshRepack = true;
+        }
+    }
+    return touched;
+}
+
+static void repackChunkSlots(std::vector<Chunk>& chunks) {
     uint32_t cursor = 0;
     for (auto& c : chunks) {
-        if (c.dirty) meshChunk(c, chunks);
         c.firstVertex = cursor;
         c.vertexCount = static_cast<uint32_t>(c.mesh.size());
-        if (!c.mesh.empty())
-            verts.insert(verts.end(), c.mesh.begin(), c.mesh.end());
-        cursor += c.vertexCount;
+        // Reserve headroom so ordinary destruction (which exposes new interior
+        // faces and grows the mesh) does not immediately force another repack.
+        // A chunk may still shrink freely; only growth past this cap repacks.
+        uint32_t want = c.vertexCount + c.vertexCount / 4 + 1024;
+        if (c.slotCapacity < want) c.slotCapacity = want;
+        cursor += c.slotCapacity;
     }
-    return verts;
+    g_liveVertexCount = 0;
+    for (const auto& c : chunks) g_liveVertexCount += c.vertexCount;
+}
+
+// Upload a chunk's mesh into its reserved slot. Returns false when the chunk
+// needs a larger buffer, in which case the caller must repack and retry.
+static bool uploadChunkRange(const Chunk& c) {
+    if (c.vertexCount == 0) return true;
+    VkDeviceSize offsetBytes = sizeof(Vertex) * c.firstVertex;
+    VkDeviceSize size = sizeof(Vertex) * c.vertexCount;
+    if (offsetBytes + size > g_vertexCapacity) return false;
+    std::memcpy(static_cast<Vertex*>(g_vertexMapped) + c.firstVertex,
+                c.mesh.data(), static_cast<size_t>(size));
+    return true;
 }
 
 struct Frustum { float p[6][4]; };
@@ -892,6 +970,14 @@ static void chunkWorldAABB(const Chunk& c, float& minx, float& miny, float& minz
 }
 
 // true => not seen (skip draw)
+//
+// The vertex shader expands NDC radially (see shaders/voxel.vert), so it only
+// draws out to about kFisheyeVisibleRadius of the unit disc, while the box test
+// below keeps anything inside the unit cube. That makes culling conservative:
+// it can hold on to geometry the shader will discard, but it can never drop a
+// chunk the shader would have drawn. Tightening this to the shader's real disc
+// needs a projected-sphere test rather than a box test, and is left as a later
+// optimisation rather than a correctness fix.
 static bool chunkNotSeen(const Chunk& c, const Frustum& fr, const Vec3& eye, const Vec3& forward) {
     if (c.vertexCount == 0) return true;
     float minx,miny,minz,maxx,maxy,maxz;
@@ -904,6 +990,10 @@ static bool chunkNotSeen(const Chunk& c, const Frustum& fr, const Vec3& eye, con
     return false;
 }
 
+// Presentation-side frame pacer. Sleeping here shapes how often the view
+// presents; it never touches world state, so it cannot affect determinism.
+// Whether the sim runs 0, 1 or several ticks this frame is decided separately
+// by the accumulator in the main loop.
 static void paceFrame120() {
     if (!g_qpcInit) {
         QueryPerformanceFrequency(&g_qpcFreq);
@@ -1064,6 +1154,16 @@ static Vec3 skyDir(float u, float v) {
 }
 
 static void updateMoonSkyTile() {
+    // The sky tile is camera-relative (every vertex is eye + dir * radius), so it
+    // genuinely moves with the eye — but not with rotation, and not at all while
+    // the player stands still. Rebuild only when the eye actually moved, which
+    // turns a per-frame 2.4k-vertex rewrite into a no-op when stationary.
+    if (g_skyTileBuilt) {
+        const Vec3 d = g_camPos - g_skyTileEye;
+        if (d.x * d.x + d.y * d.y + d.z * d.z < 1e-12f) return;
+    }
+    g_skyTileEye = g_camPos;
+    g_skyTileBuilt = true;
     ensureSkyTileBuffer();
     Vertex* verts = reinterpret_cast<Vertex*>(g_skyTileMapped);
     Vec3 eye = g_camPos;
@@ -1634,18 +1734,38 @@ static void createDescriptors() {
     }
 }
 
-static void createPipeline() {
-    std::string vertPath = g_exeDir + "\\shaders\\voxel.vert.spv";
-    std::string fragPath = g_exeDir + "\\shaders\\voxel.frag.spv";
-    // Also try relative to project if running from build/
-    if (GetFileAttributesA(vertPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        vertPath = g_exeDir + "\\..\\shaders\\voxel.vert.spv";
-        fragPath = g_exeDir + "\\..\\shaders\\voxel.frag.spv";
+// Shader lookup is by search, never by a baked-in absolute path. A view process
+// may be launched from any working directory, and the whole point of the split is
+// that this binary is relocatable. KSHADER_DIR overrides the search for
+// deployments that keep assets somewhere else entirely.
+static std::string resolveShaderPath(const char* name) {
+    const std::string file = std::string("shaders\\") + name + ".spv";
+    std::vector<std::string> roots;
+    if (const char* env = std::getenv("KSHADER_DIR")) {
+        if (*env) roots.push_back(env);
     }
-    if (GetFileAttributesA(vertPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        vertPath = "C:\\Users\\gryph\\voxel_engine\\build\\shaders\\voxel.vert.spv";
-        fragPath = "C:\\Users\\gryph\\voxel_engine\\build\\shaders\\voxel.frag.spv";
+    roots.push_back(g_exeDir);
+    roots.push_back(g_exeDir + "\\..");
+    roots.push_back(g_exeDir + "\\..\\build");
+    char cwd[MAX_PATH];
+    if (GetCurrentDirectoryA(MAX_PATH, cwd)) roots.push_back(cwd);
+
+    for (const std::string& root : roots) {
+        std::string candidate = root + "\\" + file;
+        if (GetFileAttributesA(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return candidate;
     }
+    std::string tried;
+    for (const std::string& root : roots) { tried += "\n  " + root + "\\" + file; }
+    MessageBoxA(nullptr, ("Could not locate " + file + ". Set KSHADER_DIR to the folder containing shaders\\" + file + ". Tried:" + tried).c_str(),
+                "voxel_engine: missing shader", MB_ICONERROR);
+    return std::string();
+}
+
+static bool createPipeline() {
+    const std::string vertPath = resolveShaderPath("voxel.vert");
+    const std::string fragPath = resolveShaderPath("voxel.frag");
+    if (vertPath.empty() || fragPath.empty()) return false;
 
     VkShaderModule vert = loadShader(vertPath);
     VkShaderModule frag = loadShader(fragPath);
@@ -1744,6 +1864,7 @@ rs.cullMode = VK_CULL_MODE_NONE; // sky dome + moon billboard + world
 
     vkDestroyShaderModule(g_device, vert, nullptr);
     vkDestroyShaderModule(g_device, frag, nullptr);
+    return true;
 }
 
 static void createCommandPoolAndBuffers() {
@@ -1791,39 +1912,23 @@ static void destroyWorldMeshBuffer() {
 }
 
 // Host-visible persistent world VB: memcpy only, no staging + QueueWaitIdle (main spike source).
-static void uploadMesh(const std::vector<Vertex>& verts) {
-    LARGE_INTEGER t0{}, t1{}, freq{};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-
-    if (verts.empty()) {
-        g_vertexCount = 0;
-        return;
-    }
-    // Caller waits on in-flight fence before this so GPU is done with the previous mapping.
-    g_vertexCount = static_cast<uint32_t>(verts.size());
-    VkDeviceSize size = sizeof(Vertex) * static_cast<VkDeviceSize>(verts.size());
-    // Grow with headroom so repeated impact remeshes rarely reallocate.
+// Incremental chunk updates go through uploadChunkRange; this only sizes and clears
+// the buffer. The caller waits on the in-flight fence before touching shared buffers.
+static bool ensureVertexCapacity(uint32_t verts) {
+    if (verts == 0) return true;
+    VkDeviceSize size = sizeof(Vertex) * static_cast<VkDeviceSize>(verts);
+    if (g_vertexBuffer && g_vertexCapacity >= size) return true;
+    // Grow with headroom so a small repack rarely reallocates.
     VkDeviceSize need = size + size / 8;
     if (need < size) need = size;
-
-    if (!g_vertexBuffer || g_vertexCapacity < size) {
-        destroyWorldMeshBuffer();
-        createBuffer(need, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     g_vertexBuffer, g_vertexMem);
-        vkMapMemory(g_device, g_vertexMem, 0, need, 0, &g_vertexMapped);
-        g_vertexCapacity = need;
-    }
-    if (g_vertexMapped) {
-        std::memcpy(g_vertexMapped, verts.data(), static_cast<size_t>(size));
-    }
-
-    QueryPerformanceCounter(&t1);
-    const double us = (double(t1.QuadPart - t0.QuadPart) * 1e6) / double(freq.QuadPart);
-    g_meshUploadUsSum += us;
-    if (us > g_meshUploadUsMax) g_meshUploadUsMax = us;
-    ++g_meshUploadSamples;
+    destroyWorldMeshBuffer();
+    createBuffer(need, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_vertexBuffer, g_vertexMem);
+    vkMapMemory(g_device, g_vertexMem, 0, need, 0, &g_vertexMapped);
+    g_vertexCapacity = need;
+    g_vertexCount = verts;
+    return g_vertexMapped != nullptr;
 }
 
 static void destroyVoxelAt(int x, int y, int z) {
@@ -1837,6 +1942,7 @@ static void destroyVoxelAt(int x, int y, int z) {
                             g_lastImpactEnergy, VOXEL_SIZE, g_lastAoeScale);
     setWorldBlock(*g_chunks, x, y, z, Block::Air);
     g_meshDirty = true;
+    ++g_voxelsDestroyed;
 }
 
 static void applySplash(int cx, int cy, int cz, float radius, float energy,
@@ -1857,7 +1963,9 @@ static void applySplash(int cx, int cy, int cz, float radius, float energy,
                 if (!worldInBounds(x, y, z)) continue;
                 float dist = std::sqrt(float(dx * dx + dy * dy + dz * dz)) * VOXEL_SIZE;
                 Block b = getWorldBlock(*g_chunks, x, y, z);
-                MaterialId mat = blockMaterial(b);
+    MaterialId mat = blockMaterial(b);
+    // Removing a fixture changes the light set, not just the surface mesh.
+    if (b == Block::LightBulb) g_bulbsDirty = true;
                 if (mat == MaterialId::Air || mat == MaterialId::Plexiglass) continue;
                 float cellR = densityScaledSplash(effectiveR, mat);
                 if (dist > cellR) continue;
@@ -2382,8 +2490,8 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
             vkCmdDraw(cmd, c.vertexCount, 1, c.firstVertex, 0);
             ++g_drawnChunks;
         }
-    } else if (g_vertexCount > 0) {
-        vkCmdDraw(cmd, g_vertexCount, 1, 0, 0);
+    } else if (g_liveVertexCount > 0) {
+        vkCmdDraw(cmd, g_liveVertexCount, 1, 0, 0);
         g_drawnChunks = 1;
     }
 
@@ -2713,16 +2821,22 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
     ubo._fxPad[0] = 0.0f;
     ubo._fxPad[1] = 0.0f;
 
-    // Warm bulbs (world-space); match warehouse placements roughly
-    auto setBulb = [&](int i, float x, float y, float z, float inten, float r, float g, float b, float radius) {
-        ubo.bulbPos[i][0] = x; ubo.bulbPos[i][1] = y; ubo.bulbPos[i][2] = z; ubo.bulbPos[i][3] = inten;
-        ubo.bulbColor[i][0] = r; ubo.bulbColor[i][1] = g; ubo.bulbColor[i][2] = b; ubo.bulbColor[i][3] = radius;
-    };
-    // Convert grid guesses to world using VOXEL_SIZE
-    setBulb(0, WORLD_W * 0.5f * VOXEL_SIZE, 0.040f, WORLD_D * 0.35f * VOXEL_SIZE, 1.8f, 1.0f, 0.72f, 0.42f, 0.09f);
-    setBulb(1, 0.038f, 0.040f, 0.038f, 1.4f, 1.0f, 0.7f, 0.4f, 0.07f);
-    setBulb(2, 0.12f, 0.040f, 0.042f, 1.4f, 1.0f, 0.68f, 0.38f, 0.07f);
-    setBulb(3, WORLD_W * 0.5f * VOXEL_SIZE, 0.040f, 0.095f, 1.2f, 1.0f, 0.75f, 0.45f, 0.08f);
+    // Warm bulbs harvested from Block::LightBulb occupancy. Unknown slots are
+    // zeroed so the shader's fixed loop sees intensity 0 and skips them.
+    if (g_bulbsDirty && g_chunks) {
+        harvestBulbLights(*g_chunks, g_bulbs);
+        g_bulbsDirty = false;
+    }
+    std::memset(ubo.bulbPos, 0, sizeof(ubo.bulbPos));
+    std::memset(ubo.bulbColor, 0, sizeof(ubo.bulbColor));
+    for (int i = 0; i < kMaxBulbs; ++i) {
+        if (i >= static_cast<int>(g_bulbs.size())) break;
+        const BulbLight& l = g_bulbs[i];
+        ubo.bulbPos[i][0] = l.pos.x; ubo.bulbPos[i][1] = l.pos.y; ubo.bulbPos[i][2] = l.pos.z;
+        ubo.bulbPos[i][3] = l.intensity;
+        ubo.bulbColor[i][0] = l.color.x; ubo.bulbColor[i][1] = l.color.y; ubo.bulbColor[i][2] = l.color.z;
+        ubo.bulbColor[i][3] = l.radius;
+    }
 
     std::memcpy(g_uboMapped[frameIndex], &ubo, sizeof(ubo));
 }
@@ -2731,20 +2845,68 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
 static void flushDirtyMesh() {
     if (!g_meshDirty || !g_chunks) return;
     // Under heavy fire, remeshing every frame dominates CPU. Coalesce dirty updates.
+    // The gap is measured in simulation ticks, not frames, so it is reproducible.
     const int minGap = g_stress ? 3 : 1;
-    if (g_framesSinceRemesh < minGap) {
+    if (g_ticksSinceRemesh < minGap) {
         ++g_remeshSkipCount;
         return;
     }
-    auto mesh = meshAllChunks(*g_chunks);
-    uploadMesh(mesh);
     g_meshDirty = false;
-    g_framesSinceRemesh = 0;
+    g_ticksSinceRemesh = 0;
+
+    LARGE_INTEGER t0{}, t1{}, freq{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    auto touched = remeshDirtyChunks(*g_chunks);
+
+    // A chunk outgrew its slot, or the buffer was never sized: repack everything
+    // and re-upload. This is the rare path; normal impacts only touch their chunk.
+    uint32_t needed = 0;
+    for (const auto& c : *g_chunks) needed += c.slotCapacity;
+    const bool repack = g_needsFullMeshRepack || needed > (g_vertexCapacity / sizeof(Vertex));
+    g_needsFullMeshRepack = false;
+
+    if (repack) {
+        repackChunkSlots(*g_chunks);
+        uint32_t total = 0;
+        for (const auto& c : *g_chunks) total += c.slotCapacity;
+        if (!ensureVertexCapacity(total)) return;
+        for (const auto& c : *g_chunks) uploadChunkRange(c);
+        g_vertexCount = total;
+        ++g_meshRepackCount;
+    } else {
+        // Incremental: copy only the chunks whose occupancy changed. Slots are
+        // stable, so offsets recorded at the last repack remain valid.
+        bool ok = true;
+        for (const Chunk* c : touched) {
+            if (!uploadChunkRange(*c)) { ok = false; break; }
+        }
+        if (!ok) {
+            // Should not happen: ensureVertexCapacity sized the buffer above.
+            repackChunkSlots(*g_chunks);
+            uint32_t total = 0;
+            for (const auto& c : *g_chunks) total += c.slotCapacity;
+            if (!ensureVertexCapacity(total)) return;
+            for (const auto& c : *g_chunks) uploadChunkRange(c);
+            g_vertexCount = total;
+            ++g_meshRepackCount;
+        }
+    }
+    g_liveVertexCount = 0;
+    for (const auto& c : *g_chunks) g_liveVertexCount += c.vertexCount;
+
+    QueryPerformanceCounter(&t1);
+    const double us = (double(t1.QuadPart - t0.QuadPart) * 1e6) / double(freq.QuadPart);
+    g_meshUploadUsSum += us;
+    if (us > g_meshUploadUsMax) g_meshUploadUsMax = us;
+    ++g_meshUploadSamples;
 }
 
-static void drawFrame(float timeSec, float dt) {
-    // updateCamera runs physics body + water weight + locks eye to player.
-    updateCamera(dt);
+static void drawFrame(float timeSec) {
+    // Presentation only. This must never advance simulation state: physics,
+    // destruction and damage all run from simulateOnce(). The render path
+    // reads simulation output, never the other way round.
 
     // Wait for this frame slot's prior GPU work before touching shared mesh buffers.
     vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
@@ -2869,6 +3031,97 @@ static std::string getExeDir() {
     return p == std::string::npos ? "." : s.substr(0, p);
 }
 
+// ---- one fixed simulation tick ----
+// dt is always TICK_DT. It stays a parameter so this remains a callable unit
+// (replay, a headless host, or a later remote tick loop) rather than something
+// welded to the frame loop. World state after tick N must depend only on
+// g_tick and on the input that arrived by then — never on how long the frame
+// took to draw.
+static void simulateOnce(float dt) {
+    if (g_fireCooldown > 0.0f) {
+        g_fireCooldown -= dt;
+        if (g_fireCooldown < 0.0f) g_fireCooldown = 0.0f;
+    }
+
+    g_ads = g_keys['X'] != 0;
+    updateRecoilRecovery(dt);
+    // Player body physics + water weight, and lock the eye to the body.
+    updateCamera(dt);
+
+    // Functional smoke / stress: fire into warehouse bay. Scripted off the tick
+    // counter, not the frame count, so the scenario is reproducible regardless
+    // of render speed.
+    if (g_smoke) {
+        if (g_stress) {
+            // Keep aim into bay; hammer shotgun to max debris/projectile load.
+            g_pitch = -0.10f;
+            g_yaw += dt * 0.05f;
+            g_activeCaliberIndex = 0; // light -> shotgun_light
+            g_activeAmmoIndex = 0;
+            // Fire every 3 ticks once warmed - heavy enough without remesh thrash.
+            if (g_tick >= 3 && (g_tick % 3) == 0) {
+                g_fireCooldown = 0.0f;
+                g_firePressed = true;
+                g_fireHeld = true;
+                ++g_stressFireCount;
+            }
+        } else {
+            g_yaw += dt * 0.20f;
+            if (g_tick < 20) {
+                g_pitch = -0.12f;
+                if (g_tick == 4) {
+                    g_activeCaliberIndex = 1; // medium ballistic
+                    g_activeAmmoIndex = 0;
+                    g_fireCooldown = 0.0f;
+                    g_firePressed = true;
+                }
+                if (g_tick == 8) {
+                    g_activeCaliberIndex = 0; // shotgun light
+                    g_activeAmmoIndex = 0;
+                    g_fireCooldown = 0.0f;
+                    g_firePressed = true;
+                }
+                if (g_tick == 14) {
+                    g_activeCaliberIndex = 3; // energy hitscan
+                    g_activeAmmoIndex = 0;
+                    g_fireCooldown = 0.0f;
+                    g_firePressed = true;
+                }
+            } else {
+                g_pitch = 0.42f; // sky tiles + moon
+            }
+        }
+    }
+
+    // Fire modes: semi/bolt = edge; auto = held (RMB/F) with cooldown cadence.
+    {
+        WeaponDef wFire = activeWeaponOrDefault();
+        const std::string mode = wFire.fireMode.empty() ? "semi" : wFire.fireMode;
+        bool shouldFire = false;
+        if (mode == "auto") {
+            shouldFire = g_fireHeld || g_firePressed;
+        } else {
+            // semi + bolt: one shot per press edge
+            shouldFire = g_firePressed;
+        }
+        if (shouldFire) fireProjectile();
+        g_firePressed = false;
+    }
+
+    g_debris.beginFrame();
+    updateProjectiles(dt);
+    if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
+        g_projLivePeak = static_cast<int>(g_projectiles.size());
+    g_debris.update(dt, kWorldGravity);
+    // Decay fire VFX (overlay + muzzle cubes).
+    if (g_muzzleFlash > 0.0f || g_fireOverlay > 0.0f) {
+        g_muzzleFlash = std::max(0.0f, g_muzzleFlash - dt * 6.5f);
+        g_fireOverlay = std::max(0.0f, g_fireOverlay - dt * 4.2f);
+        g_debris.meshDirty = true;
+    }
+    // Remeshing is deferred to drawFrame via g_meshDirty.
+}
+
 // Optional headless-ish smoke/stress (globals declared near top).
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
@@ -2877,7 +3130,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
     if (cmd.find("--stress") != std::string::npos) {
         g_stress = true;
         g_smoke = true; // reuse headless quit path
-        g_smokeFrames = 600; // longer soak
+        g_smokeTicks = 600; // longer soak
     }
 
     try {
@@ -2893,7 +3146,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createDepthResources();
         createFramebuffers();
         createDescriptors();
-        createPipeline();
+        if (!createPipeline()) {
+            // Shader assets are missing; bail out cleanly instead of running a
+            // frame loop with a null pipeline.
+            g_chunks = nullptr;
+            cleanup();
+            return 1;
+        }
         createSync();
 
 auto chunks = buildWarehouseMap();
@@ -2919,14 +3178,26 @@ auto chunks = buildWarehouseMap();
         // Weapon defs from data/weapons or build/weapons
         tryLoadWeapons();
 
-        auto mesh = meshAllChunks(chunks);
+        // Initial build: mesh every chunk, then lay out stable per-chunk slots
+        // so later impacts only re-upload the chunk they damaged.
+        for (auto& c : chunks) c.dirty = true;
+        remeshDirtyChunks(chunks);
+        repackChunkSlots(chunks);
+        uint32_t slotTotal = 0;
+        for (const auto& c : chunks) slotTotal += c.slotCapacity;
+        if (!ensureVertexCapacity(slotTotal)) {
+            g_chunks = nullptr;
+            cleanup();
+            return 1;
+        }
+        for (const auto& c : chunks) uploadChunkRange(c);
+
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "Chunks=%dx%dx%d voxel=%.4f verts=%zu projs=%zu weapons=%zu\n",
-                      CHUNKS_X, CHUNKS_Y, CHUNKS_Z, VOXEL_SIZE, mesh.size(),
+                      "Chunks=%dx%dx%d voxel=%.4f verts=%u projs=%zu weapons=%zu\n",
+                      CHUNKS_X, CHUNKS_Y, CHUNKS_Z, VOXEL_SIZE, g_liveVertexCount,
                       g_projDefs.size(), g_weapons.size());
         OutputDebugStringA(msg);
-        uploadMesh(mesh);
 
         // Prewarm debris VB so first impact does not allocate mid-frame (spike fix).
         ensureDebrisBuffer();
@@ -2935,7 +3206,6 @@ auto chunks = buildWarehouseMap();
         auto start = std::chrono::steady_clock::now();
         auto last = start;
         int frames = 0;
-        int destroysApprox = 0;
 
         MSG msgWin{};
         while (g_running) {
@@ -2946,102 +3216,32 @@ auto chunks = buildWarehouseMap();
             }
             if (!g_running) break;
 
+            // Wall clock decides only HOW MANY fixed ticks to run. It never
+            // becomes a dt that touches world state.
             auto now = std::chrono::steady_clock::now();
-            float dt = std::chrono::duration<float>(now - last).count();
+            double wall = std::chrono::duration<double>(now - last).count();
             last = now;
-            if (dt > 0.05f) dt = 0.05f;
-            float t = std::chrono::duration<float>(now - start).count();
+            if (wall > 0.25) wall = 0.25; // cap catch-up after a long stall
+            g_tickAccum += wall;
 
-if (g_fireCooldown > 0.0f) {
-                g_fireCooldown -= dt;
-                if (g_fireCooldown < 0.0f) g_fireCooldown = 0.0f;
+            int steps = 0;
+            while (g_tickAccum >= TICK_DT && steps < MAX_TICKS_PER_FRAME) {
+                g_tickAccum -= TICK_DT;
+                ++g_tick;
+                ++g_ticksSinceRemesh;
+                simulateOnce(static_cast<float>(TICK_DT));
+                ++steps;
             }
+            // Hit the per-frame cap: drop the backlog instead of chasing it, so a
+            // stall costs elapsed time but never desynchronises the sim clock.
+            if (steps == MAX_TICKS_PER_FRAME) g_tickAccum = 0.0;
 
-            g_ads = g_keys['X'] != 0;
-            updateRecoilRecovery(dt);
-
-            // Functional smoke / stress: fire into warehouse bay
-            if (g_smoke) {
-                if (g_stress) {
-                    // Keep aim into bay; hammer shotgun to max debris/projectile load.
-                    g_pitch = -0.10f;
-                    g_yaw += dt * 0.05f;
-                    g_activeCaliberIndex = 0; // light → shotgun_light
-                    g_activeAmmoIndex = 0;
-                    // Fire every 3 frames once warmed — heavy enough without remesh thrash.
-                    if (frames >= 3 && (frames % 3) == 0) {
-                        g_fireCooldown = 0.0f;
-                        g_firePressed = true;
-                        g_fireHeld = true;
-                        ++g_stressFireCount;
-                    }
-                } else {
-                    g_yaw += dt * 0.20f;
-                    if (frames < 20) {
-                        g_pitch = -0.12f;
-                        if (frames == 4) {
-                            g_activeCaliberIndex = 1; // medium ballistic
-                            g_activeAmmoIndex = 0;
-                            g_fireCooldown = 0.0f;
-                            g_firePressed = true;
-                        }
-                        if (frames == 8) {
-                            g_activeCaliberIndex = 0; // shotgun light
-                            g_activeAmmoIndex = 0;
-                            g_fireCooldown = 0.0f;
-                            g_firePressed = true;
-                        }
-                        if (frames == 14) {
-                            g_activeCaliberIndex = 3; // energy hitscan
-                            g_activeAmmoIndex = 0;
-                            g_fireCooldown = 0.0f;
-                            g_firePressed = true;
-                        }
-                    } else {
-                        g_pitch = 0.42f; // sky tiles + moon
-                    }
-                }
-            }
-
-            // Fire modes: semi/bolt = edge; auto = held (RMB/F) with cooldown cadence.
-            {
-                WeaponDef wFire = activeWeaponOrDefault();
-                const std::string mode = wFire.fireMode.empty() ? "semi" : wFire.fireMode;
-                bool shouldFire = false;
-                if (mode == "auto") {
-                    shouldFire = g_fireHeld || g_firePressed;
-                } else {
-                    // semi + bolt: one shot per press edge
-                    shouldFire = g_firePressed;
-                }
-                if (shouldFire) fireProjectile();
-                g_firePressed = false;
-            }
-
-const bool wasDirty = g_meshDirty;
-            g_debris.beginFrame();
-            updateProjectiles(dt);
-            if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
-                g_projLivePeak = static_cast<int>(g_projectiles.size());
-            g_debris.update(dt, kWorldGravity);
-            // Decay fire VFX (overlay + muzzle cubes).
-            if (g_muzzleFlash > 0.0f || g_fireOverlay > 0.0f) {
-                g_muzzleFlash = std::max(0.0f, g_muzzleFlash - dt * 6.5f);
-                g_fireOverlay = std::max(0.0f, g_fireOverlay - dt * 4.2f);
-                g_debris.meshDirty = true;
-            }
-            if (wasDirty || g_meshDirty) { /* remesh deferred to drawFrame */ }
-            // Count live projectile impacts indirectly via remesh flag consumption
-            static int lastVertCount = -1;
-            if (lastVertCount >= 0 && static_cast<int>(g_vertexCount) < lastVertCount)
-                destroysApprox += (lastVertCount - static_cast<int>(g_vertexCount)) / 6;
-            lastVertCount = static_cast<int>(g_vertexCount);
-
-            drawFrame(t, dt);
+            // Presentation only. Shader time is derived from the tick counter so
+            // animation is frame-rate independent.
+            drawFrame(static_cast<float>(g_tick) * static_cast<float>(TICK_DT));
             ++frames;
-            ++g_framesSinceRemesh;
 
-            if (g_smoke && frames >= g_smokeFrames) {
+            if (g_smoke && g_tick >= g_smokeTicks) {
                 g_running = false;
             }
         }
@@ -3053,7 +3253,11 @@ const bool wasDirty = g_meshDirty;
         if (g_smoke) {
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
-out << "frames=" << frames << "\nvertices=" << g_vertexCount
+out << "ticks=" << g_tick << "\nframes=" << frames
+                << "\nsim_hz=" << TICK_HZ
+                << "\nvertices=" << g_liveVertexCount
+                << "\nvertex_slots=" << g_vertexCount
+                << "\nmesh_repacks=" << g_meshRepackCount
                 << "\ncam=" << g_camPos.x << "," << g_camPos.y << "," << g_camPos.z
                 << "\nplayer=" << g_player.px << "," << g_player.py << "," << g_player.pz
                 << "\non_ground=" << (g_player.onGround ? 1 : 0)
@@ -3101,7 +3305,8 @@ out << "frames=" << frames << "\nvertices=" << g_vertexCount
                         && g_frameMsMax <= 50.0
                         && g_debrisUploadUsMax <= 250.0) ? 1 : (g_stress ? 0 : 1))
                 << "\ngravity=" << kWorldGravity
-                << "\nremesh_events=" << destroysApprox
+                << "\nvoxels_destroyed=" << g_voxelsDestroyed
+                << "\nbulbs=" << g_bulbs.size()
                 << "\nwater_touch=" << g_touchingWaterUnits << "/" << g_characterUnitCount
                 << "\ncurrent=" << (g_currentTriggered ? 1 : 0)
                 << "\nsubmerged=" << (g_fullySubmerged ? 1 : 0)
@@ -3110,6 +3315,8 @@ out << "frames=" << frames << "\nvertices=" << g_vertexCount
                 << "\nrender_scale=" << RENDER_SCALE
                 << "\ndrawn_chunks=" << g_drawnChunks
                 << "\nculled_chunks=" << g_culledChunks
+                << "\nfisheye_visible_radius=" << fisheyeVisibleNdcRadius(kFisheyeStrengthWorld)
+                << "\nfisheye_visible_radius_sky=" << fisheyeVisibleNdcRadius(kFisheyeStrengthSky)
                 << "\navg_frame_ms=" << (g_frameMsCount > 15 ? (g_frameMsSum / double(g_frameMsCount - 15)) : -1.0)
                 << "\nmin_frame_ms=" << (g_frameMsMin < 1e8 ? g_frameMsMin : -1.0)
                 << "\nmax_frame_ms=" << g_frameMsMax

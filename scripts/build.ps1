@@ -15,9 +15,15 @@ $VCVARS = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Aux
 
 New-Item -ItemType Directory -Force -Path $Build, (Join-Path $Build "shaders") | Out-Null
 
-Write-Host "== export projectiles/materials (Python) ==" -ForegroundColor Cyan
+Write-Host "== check cross-language constants ==" -ForegroundColor Cyan
 $py = Get-Command python -ErrorAction SilentlyContinue
 if (-not $py) { throw "python not found on PATH" }
+# Fails the build if the C++/Python/Java material tables or the unit scale drift.
+# The Python voxel-mass scale was once 1000x off the C++ one; nothing caught it.
+& python (Join-Path $Root "scripts\check_constants.py")
+if ($LASTEXITCODE -ne 0) { throw "check_constants.py failed: $LASTEXITCODE" }
+
+Write-Host "== export projectiles/materials (Python) ==" -ForegroundColor Cyan
 & python (Join-Path $Root "python\export_projectiles.py")
 if ($LASTEXITCODE -ne 0) { throw "export_projectiles.py failed: $LASTEXITCODE" }
 
@@ -37,7 +43,10 @@ if (-not (Test-Path (Join-Path $LLVM "clang++.exe"))) { throw "clang++ missing u
 
 $bat = @"
 @echo off
-call "$VCVARS" >nul
+REM vcvars64.bat probes for vswhere.exe and prints a benign "not recognized"
+REM warning on stderr when it is absent. That must not abort the build, so
+REM both streams are discarded and the real clang exit code is what counts.
+call "$VCVARS" >nul 2>&1
 set "PATH=$LLVM;%PATH%"
 clang++.exe -std=c++17 -O2 -g -D_CRT_SECURE_NO_WARNINGS -I"$Src" -I"$VK\Include" "$Src\main.cpp" -o "$Build\voxel_engine.exe" -L"$VK\Lib" -lvulkan-1 -luser32 -lgdi32 -lshell32
 echo CLANG_EXIT=%ERRORLEVEL%
@@ -45,8 +54,17 @@ exit /b %ERRORLEVEL%
 "@
 $batPath = Join-Path $Build "_build.bat"
 Set-Content -Path $batPath -Value $bat -Encoding ASCII
-cmd /c $batPath
-if ($LASTEXITCODE -ne 0) { throw "clang++ build failed: $LASTEXITCODE" }
+# Native tools are chatty on stderr (linker notes, vcvars probes). Keep them from
+# tripping ErrorActionPreference=Stop and decide success on the exit code alone.
+$prevErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    cmd /c $batPath
+    $clangExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevErrorAction
+}
+if ($clangExit -ne 0) { throw "clang++ build failed: $clangExit" }
 if (-not (Test-Path (Join-Path $Build "voxel_engine.exe"))) { throw "voxel_engine.exe not produced" }
 
 # Ensure runtime JSON sits beside exe
