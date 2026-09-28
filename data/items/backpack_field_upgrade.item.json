@@ -1,0 +1,11 @@
+{
+  "id": "backpack_field_upgrade",
+  "name": "Field Pack (Expanded)",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "backpack",
+  "material": "carbon_fiber",
+  "color": [0.24, 0.26, 0.30],
+  "size": [3, 4, 3],
+  "pack_size": [4, 4, 5]
+}

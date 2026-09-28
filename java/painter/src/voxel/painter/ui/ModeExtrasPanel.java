@@ -10,13 +10,18 @@ import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JSpinner;
+import javax.swing.JTextField;
 import javax.swing.SpinnerNumberModel;
+import voxel.painter.grid.Items;
 import voxel.painter.grid.SkyAndCharacter;
 import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxelGrid;
 import voxel.painter.grid.WeaponParts;
 
-/** Bottom strip: sky/character extras + weapon caliber/ammo/fire when in weapon mode. */
+/**
+ * Bottom strip: sky/character extras, weapon caliber/ammo/fire in weapon mode,
+ * and item metadata in item mode.
+ */
 public final class ModeExtrasPanel extends JPanel implements PainterModel.Listener {
     private final PainterModel model;
     private final JSpinner segU;
@@ -34,10 +39,28 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
     private final JButton bakeSky;
     private final JButton bakeChar;
     private final JButton bakeWeapon;
+    // Item mode (RULES.md rule 12). The grid the artist paints IS the packing
+    // footprint, so there is no size control here - only the metadata the engine
+    // reads alongside that shape.
+    private final JPanel itemRow;
+    private final JTextField itemId;
+    private final JTextField itemName;
+    private final JComboBox<String> itemClassBox;
+    private final JComboBox<String> armorZoneBox;
+    private final JSpinner packX, packY, packZ;
+    private final JLabel itemInfo;
+    private final JButton bakeItem;
+    private final JButton exportItem;
+    private final Runnable requestItemExport;
     private boolean syncing;
 
     public ModeExtrasPanel(PainterModel model) {
+        this(model, null);
+    }
+
+    public ModeExtrasPanel(PainterModel model, Runnable requestItemExport) {
         this.model = model;
+        this.requestItemExport = requestItemExport;
         setLayout(new GridBagLayout());
         setBackground(PainterTheme.BG_PANEL);
         setBorder(PainterTheme.cardBorder("Mode extras"));
@@ -111,6 +134,34 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         weaponRow.add(weaponStats);
         c.gridy = 3;
         add(weaponRow, c);
+
+        itemRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        itemRow.setOpaque(false);
+        itemRow.add(dim("id"));
+        itemId = new JTextField(14);
+        itemRow.add(itemId);
+        itemRow.add(dim("name"));
+        itemName = new JTextField(14);
+        itemRow.add(itemName);
+        itemRow.add(dim("class"));
+        itemClassBox = new JComboBox<>(Items.CLASSES);
+        itemRow.add(itemClassBox);
+        itemRow.add(dim("zone"));
+        armorZoneBox = new JComboBox<>(armorZoneOptions());
+        itemRow.add(armorZoneBox);
+        itemRow.add(dim("pack"));
+        packX = new JSpinner(new SpinnerNumberModel(0, 0, 32, 1));
+        packY = new JSpinner(new SpinnerNumberModel(0, 0, 32, 1));
+        packZ = new JSpinner(new SpinnerNumberModel(0, 0, 32, 1));
+        itemRow.add(packX);
+        itemRow.add(packY);
+        itemRow.add(packZ);
+        itemInfo = new JLabel(" ");
+        itemInfo.setForeground(PainterTheme.modeColor(VoxDocument.Mode.ITEM));
+        itemInfo.setFont(PainterTheme.monoFont());
+        itemRow.add(itemInfo);
+        c.gridy = 4;
+        add(itemRow, c);
         c.gridwidth = 1;
 
         bakeSky = new JButton("Bake sky tiles");
@@ -132,13 +183,22 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         });
         bakeWeapon = new JButton("Bake starter rifle");
         bakeWeapon.addActionListener(e -> model.bakeStarterWeapon());
+        bakeItem = new JButton("Bake starter pouch");
+        bakeItem.addActionListener(e -> model.bakeStarterItem());
+        exportItem = new JButton("Export item.json");
+        exportItem.addActionListener(e -> {
+            push();
+            if (requestItemExport != null) requestItemExport.run();
+        });
 
         JPanel bakes = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         bakes.setOpaque(false);
         bakes.add(bakeSky);
         bakes.add(bakeChar);
         bakes.add(bakeWeapon);
-        c.gridy = 4;
+        bakes.add(bakeItem);
+        bakes.add(exportItem);
+        c.gridy = 5;
         c.gridx = 0;
         c.gridwidth = 8;
         add(bakes, c);
@@ -152,8 +212,29 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         fireBox.addActionListener(e -> {
             if (!syncing) model.setFireMode((String) fireBox.getSelectedItem());
         });
+        itemClassBox.addActionListener(e -> {
+            if (syncing) return;
+            model.setItemClass((String) itemClassBox.getSelectedItem());
+            push();
+        });
+        armorZoneBox.addActionListener(e -> {
+            if (syncing) return;
+            model.setArmorZone((String) armorZoneBox.getSelectedItem());
+            push();
+        });
+        itemId.addActionListener(e -> {
+            if (syncing) return;
+            model.setItemId(itemId.getText().trim());
+            push();
+        });
+        itemName.addActionListener(e -> {
+            if (syncing) return;
+            model.setItemName(itemName.getText().trim());
+            push();
+        });
 
-        for (JSpinner s : new JSpinner[] {segU, segV, moonX, moonY, moonZ, moonI, feetX, feetY, feetZ}) {
+        for (JSpinner s : new JSpinner[] {segU, segV, moonX, moonY, moonZ, moonI, feetX, feetY, feetZ,
+                                          packX, packY, packZ}) {
             s.addChangeListener(ev -> push());
         }
         model.addListener(this);
@@ -166,9 +247,25 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         return l;
     }
 
+    /** Zone list with a "" entry for non-armor items. */
+    private static String[] armorZoneOptions() {
+        String[] opts = new String[Items.ARMOR_ZONES.length + 1];
+        opts[0] = "";
+        System.arraycopy(Items.ARMOR_ZONES, 0, opts, 1, Items.ARMOR_ZONES.length);
+        return opts;
+    }
+
     private void push() {
         if (syncing) return;
         VoxDocument doc = model.document();
+        // Only write item fields in item mode, so switching modes can never have
+        // the sky spinners clobber an item's pack_size.
+        if (doc.mode == VoxDocument.Mode.ITEM) {
+            model.setPackSize((Integer) packX.getValue(), (Integer) packY.getValue(),
+                              (Integer) packZ.getValue());
+            model.setItemId(itemId.getText().trim());
+            model.setItemName(itemName.getText().trim());
+        }
         doc.segU = (Integer) segU.getValue();
         doc.segV = (Integer) segV.getValue();
         doc.moonDirX = ((Number) moonX.getValue()).floatValue();
@@ -188,6 +285,26 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             boolean sky = doc.mode == VoxDocument.Mode.SKY;
             boolean character = doc.mode == VoxDocument.Mode.CHARACTER;
             boolean weapon = doc.mode == VoxDocument.Mode.WEAPON;
+            boolean item = doc.mode == VoxDocument.Mode.ITEM;
+
+            if (item) {
+                // The canvas is only a work area; the engine charges for the tight
+                // bounding box of the solid cells, in whole unit cubes.
+                VoxelGrid g = doc.grid;
+                int[] fp = Items.footprintSize(g);
+                int cells = Items.solidCells(g);
+                String size = fp == null ? "empty" : fp[0] + "x" + fp[1] + "x" + fp[2];
+                String density = "";
+                if (fp != null) {
+                    int volume = fp[0] * fp[1] * fp[2];
+                    density = " (" + (volume == 0 ? 0 : cells * 100 / volume) + "% dense)";
+                }
+                itemInfo.setText(String.format(
+                        "footprint=%s  cells=%d%s  -> %s",
+                        size, cells, density, Items.fileNameFor(doc.itemId)));
+            } else {
+                itemInfo.setText(" ");
+            }
 
             String extra = "";
             if (weapon) {
@@ -205,6 +322,11 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
                 weaponStats.setText(" ");
             }
 
+            if (item) {
+                extra = String.format("  class=%s  solids=%d",
+                        doc.itemClass, doc.grid.solidCount());
+            }
+
             modeLabel.setText(
                     "Active: " + PainterTheme.modeTitle(doc.mode)
                             + "   unit=" + doc.unit
@@ -212,6 +334,16 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
                             + "   solids=" + doc.grid.solidCount()
                             + extra);
             modeLabel.setForeground(PainterTheme.modeColor(doc.mode));
+
+            if (item) {
+                if (!itemId.getText().equals(doc.itemId)) itemId.setText(doc.itemId);
+                if (!itemName.getText().equals(doc.itemName)) itemName.setText(doc.itemName);
+                itemClassBox.setSelectedItem(doc.itemClass);
+                armorZoneBox.setSelectedItem(doc.armorZone == null ? "" : doc.armorZone);
+                packX.setValue(doc.packSX);
+                packY.setValue(doc.packSY);
+                packZ.setValue(doc.packSZ);
+            }
 
             segU.setValue(doc.segU);
             segV.setValue(doc.segV);
@@ -226,10 +358,12 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             skyRow.setVisible(sky);
             charRow.setVisible(character);
             weaponRow.setVisible(weapon);
+            itemRow.setVisible(item);
             bakeSky.setEnabled(sky);
             bakeChar.setEnabled(character);
-            bakeWeapon.setEnabled(weapon || true); // always allow jump-to-weapon bake
             bakeWeapon.setVisible(true);
+            bakeItem.setVisible(item);
+            exportItem.setVisible(item);
         } finally {
             syncing = false;
         }
@@ -242,7 +376,8 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
 
     @Override
     public void toolsChanged() {
-        if (model.document().mode == VoxDocument.Mode.WEAPON) pull();
+        VoxDocument.Mode m = model.document().mode;
+        if (m == VoxDocument.Mode.WEAPON || m == VoxDocument.Mode.ITEM) pull();
     }
 
     @Override

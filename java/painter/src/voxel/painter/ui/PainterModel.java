@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import voxel.painter.grid.Items;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.SkyAndCharacter;
@@ -73,6 +74,9 @@ public void newDocument(VoxDocument.Mode mode) {
             case SKY -> new VoxDocument(VoxDocument.Mode.SKY, 28, 1, 14);
             case CHARACTER -> new VoxDocument(VoxDocument.Mode.CHARACTER, 24, 16, 12);
             case WEAPON -> new VoxDocument(VoxDocument.Mode.WEAPON, 24, 12, 12);
+            // Small by default: an item grid IS its packing footprint, so a big
+            // default would be a huge item the player could never pick up.
+            case ITEM -> new VoxDocument(VoxDocument.Mode.ITEM, 4, 3, 2);
             default -> new VoxDocument(VoxDocument.Mode.MODEL, 32, 24, 32);
         };
         if (mode == VoxDocument.Mode.SKY) {
@@ -87,6 +91,15 @@ public void newDocument(VoxDocument.Mode mode) {
             doc.fireMode = "semi";
             WeaponParts.paintStarterRifle(doc.grid);
             tools.activePart = WeaponParts.BARREL;
+        } else if (mode == VoxDocument.Mode.ITEM) {
+            doc.itemId = "item_pouch_medium";
+            doc.itemName = "Medium Ammo Pouch";
+            doc.itemClass = Items.CLASS_AMMO_POUCH;
+            doc.armorZone = "";
+            doc.packSX = 0; doc.packSY = 0; doc.packSZ = 0;
+            doc.caliber = "medium";
+            doc.ammoId = "medium_fmj";
+            Items.paintStarterPouch(doc.grid);
         } else {
             seedDemo(doc);
         }
@@ -131,6 +144,51 @@ public void newDocument(VoxDocument.Mode mode) {
         tools.activePart = WeaponParts.BARREL;
         markDirty();
         fireTools();
+    }
+
+    public void setItemId(String id) {
+        if (id == null || id.isBlank()) return;
+        document.itemId = id;
+        fireDoc();
+    }
+
+    public void setItemName(String name) {
+        if (name == null || name.isBlank()) return;
+        document.itemName = name;
+        fireDoc();
+    }
+
+    public void setItemClass(String cls) {
+        if (cls == null) return;
+        for (String c : Items.CLASSES)
+            if (c.equals(cls)) { document.itemClass = cls; break; }
+        fireDoc();
+    }
+
+    public void setArmorZone(String zone) {
+        if (zone == null) return;
+        for (String z : Items.ARMOR_ZONES)
+            if (z.equals(zone)) { document.armorZone = zone; fireDoc(); return; }
+        // Empty selection clears the zone, which is how a non-armor item is authored.
+        document.armorZone = "";
+        fireDoc();
+    }
+
+    public void setPackSize(int sx, int sy, int sz) {
+        document.packSX = Math.max(0, sx);
+        document.packSY = Math.max(0, sy);
+        document.packSZ = Math.max(0, sz);
+        fireDoc();
+    }
+
+    /** Re-bake the starter pouch template into the current item document. */
+    public void bakeStarterItem() {
+        if (document.mode != VoxDocument.Mode.ITEM) {
+            newDocument(VoxDocument.Mode.ITEM);
+            return;
+        }
+        Items.paintStarterPouch(document.grid);
+        markDirty();
     }
 
     public WeaponParts.Stats weaponStats() {
@@ -338,6 +396,17 @@ bits.add("mat=" + MaterialPalette.nameFromId(tools.activeMat()) + (tools.useB ? 
             bits.add(String.format(
                     "dmg=%.1f imp=%.1f rec=%.1f hnd=%.1f w=%.1f opt=%.1f",
                     st.damage, st.impact, st.recoil, st.handling, st.weight, st.optic));
+        }
+        if (document.mode == VoxDocument.Mode.ITEM) {
+            // The shape is the painted grid, so show the storage cost the engine
+            // will actually charge for picking this up.
+            bits.add("item=" + document.itemId);
+            bits.add("class=" + document.itemClass);
+            if (Items.needsArmorZone(document.itemClass) && !document.armorZone.isEmpty())
+                bits.add("zone=" + document.armorZone);
+            if (Items.needsPackSize(document.itemClass) && document.packSX > 0)
+                bits.add("pack=" + document.packSX + "x" + document.packSY + "x" + document.packSZ);
+            bits.add("cells=" + Items.solidCells(grid()));
         }
         bits.add("slice=" + sliceAxis + ":" + sliceIndex);
         bits.add("unit=" + grid().unitSizeX() + "=" + grid().unitSizeY() + "=" + grid().unitSizeZ());

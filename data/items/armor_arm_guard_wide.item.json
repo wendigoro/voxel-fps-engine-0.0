@@ -1,0 +1,11 @@
+{
+  "id": "armor_arm_guard_wide",
+  "name": "Arm Guard (Oversized)",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "armor",
+  "armor_zone": "arms",
+  "material": "sheet_metal",
+  "color": [0.50, 0.30, 0.24],
+  "size": [3, 3, 3]
+}

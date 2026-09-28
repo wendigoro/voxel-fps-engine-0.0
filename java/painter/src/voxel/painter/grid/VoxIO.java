@@ -38,6 +38,14 @@ if (doc.mode == VoxDocument.Mode.CHARACTER) {
             sb.append("  \"caliber\": \"").append(doc.caliber).append("\",\n");
             sb.append("  \"ammo_id\": \"").append(doc.ammoId).append("\",\n");
         }
+        if (doc.mode == VoxDocument.Mode.ITEM) {
+            sb.append("  \"item_id\": \"").append(doc.itemId).append("\",\n");
+            sb.append("  \"item_name\": \"").append(doc.itemName).append("\",\n");
+            sb.append("  \"item_class\": \"").append(doc.itemClass).append("\",\n");
+            sb.append("  \"armor_zone\": \"").append(doc.armorZone).append("\",\n");
+            sb.append("  \"pack_size\": [").append(doc.packSX).append(", ")
+                    .append(doc.packSY).append(", ").append(doc.packSZ).append("],\n");
+        }
         sb.append("  \"voxels\": [\n");
         List<String> rows = new ArrayList<>();
         VoxelGrid g = doc.grid;
@@ -79,6 +87,12 @@ if (doc.mode == VoxDocument.Mode.CHARACTER) {
 doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
         doc.caliber = findString(text, "caliber", doc.caliber);
         doc.ammoId = findString(text, "ammo_id", doc.ammoId);
+        doc.itemId = findString(text, "item_id", doc.itemId);
+        doc.itemName = findString(text, "item_name", doc.itemName);
+        doc.itemClass = findString(text, "item_class", doc.itemClass);
+        doc.armorZone = findString(text, "armor_zone", doc.armorZone);
+        int[] pack = findIntArray(text, "pack_size", new int[]{0, 0, 0});
+        doc.packSX = pack[0]; doc.packSY = pack[1]; doc.packSZ = pack[2];
 
         Matcher vm = Pattern.compile(
                 "\\{\\s*\"x\"\\s*:\\s*(\\d+)\\s*,\\s*\"y\"\\s*:\\s*(\\d+)\\s*,\\s*\"z\"\\s*:\\s*(\\d+)\\s*,\\s*\"mat\"\\s*:\\s*\"([^\"]+)\"\\s*,\\s*\"rgb\"\\s*:\\s*(\\d+)(?:\\s*,\\s*\"part\"\\s*:\\s*\"([^\"]+)\")?\\s*\\}")

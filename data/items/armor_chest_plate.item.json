@@ -1,0 +1,11 @@
+{
+  "id": "armor_chest_plate",
+  "name": "Chest Plate",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "armor",
+  "armor_zone": "chest",
+  "material": "sheet_metal",
+  "color": [0.32, 0.34, 0.32],
+  "size": [3, 3, 3]
+}

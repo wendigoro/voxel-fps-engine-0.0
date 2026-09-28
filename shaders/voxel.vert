@@ -45,6 +45,14 @@ void main() {
     vec2 ndc = clip.xy / wclip;
 
     // Strong true-sky style fisheye (barrel + higher-order terms)
+    // Skipped for mat 7 ONLY (inventory lattice, RULES.md rule 12): the lattice
+    // is parented to the camera and must read as a clean 3D projection rather
+    // than being bent by a screen-space barrel distortion. The gate is an exact
+    // mat-7 test, not `inMat < 6.5`, so mat 8 (world pickups) keeps the
+    // fisheye like every other world object. This is also what makes the CPU
+    // screen-space cell picking in main.cpp exact: mat 7 is the only geometry
+    // whose GPU rasterisation matches its unprojected CPU transform.
+    if (inMat < 6.5 || inMat > 7.5) {
     float r = length(ndc);
 float strength = (inMat > 2.5 && inMat < 4.5) ? 1.35 : 1.0;
     float k1 = 0.55 * strength;
@@ -55,6 +63,7 @@ float strength = (inMat > 2.5 && inMat < 4.5) ? 1.35 : 1.0;
     float edgeSoft = smoothstep(1.85, 1.15, r * fisheye);
     ndc *= mix(1.0, fisheye, 0.92 + 0.08 * edgeSoft);
     ndc.y *= 1.04;
+    }
 
     fragNdc = ndc;
     fragViewZ = clip.w;
@@ -64,8 +73,10 @@ float strength = (inMat > 2.5 && inMat < 4.5) ? 1.35 : 1.0;
     if (inMat > 2.5 && inMat < 4.5) {
         clip.z = clip.w * 0.999;
     }
-    // Muzzle flash cubes: slight depth bias toward camera so they don't z-fight
-    if (inMat > 5.5) {
+    // Muzzle flash cubes: slight depth bias toward camera so they don't z-fight.
+    // mat 7 is excluded: it draws in the overlay pass with a cleared depth
+    // buffer, so no bias is needed (and none would be strong enough anyway).
+    if (inMat > 5.5 && inMat < 6.5) {
         clip.z = clip.z * 0.98;
     }
 

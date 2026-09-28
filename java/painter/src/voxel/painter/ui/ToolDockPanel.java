@@ -27,9 +27,11 @@ import javax.swing.ListSelectionModel;
 import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingConstants;
 import javax.swing.border.EmptyBorder;
+import voxel.painter.grid.Items;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.VoxDocument;
+import voxel.painter.grid.VoxelGrid;
 import voxel.painter.grid.WeaponParts;
 
 /** Left tool dock — mode-aware; weapon assembly card only in weapon mode. */
@@ -365,7 +367,40 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
     }
 
     private void refreshWeaponStats() {
-        if (model.document().mode != VoxDocument.Mode.WEAPON) {
+        VoxDocument.Mode m = model.document().mode;
+        if (m == VoxDocument.Mode.ITEM) {
+            // The canvas is a work area; what the packer charges for is the tight
+            // bounding box of solid cells, in whole unit cubes.
+            VoxDocument doc = model.document();
+            VoxelGrid g = doc.grid;
+            int[] fp = Items.footprintSize(g);
+            int cells = Items.solidCells(g);
+            StringBuilder sb = new StringBuilder();
+            sb.append("canvas   ");
+            sb.append(String.format("%dx%dx%d%n", g.sizeX(), g.sizeY(), g.sizeZ()));
+            if (fp == null) {
+                sb.append("footprint empty\n");
+                sb.append("solid    0\n");
+            } else {
+                int volume = fp[0] * fp[1] * fp[2];
+                sb.append(String.format("footprint %dx%dx%d%n", fp[0], fp[1], fp[2]));
+                sb.append(String.format("volume   %7d%n", volume));
+                sb.append(String.format("solid    %7d%n", cells));
+                sb.append(String.format("wasted   %7d%n", volume - cells));
+                sb.append(String.format("density  %6d%%n", cells * 100 / volume));
+            }
+            sb.append('\n');
+            sb.append("class    ").append(doc.itemClass).append('\n');
+            if (Items.needsArmorZone(doc.itemClass))
+                sb.append("zone     ").append(doc.armorZone.isEmpty() ? "(none)" : doc.armorZone).append('\n');
+            if (Items.needsPackSize(doc.itemClass))
+                sb.append(String.format("pack     %dx%dx%d%n", doc.packSX, doc.packSY, doc.packSZ));
+            sb.append('\n');
+            sb.append("file     ").append(Items.fileNameFor(doc.itemId));
+            statsArea.setText(sb.toString());
+            return;
+        }
+        if (m != VoxDocument.Mode.WEAPON) {
             statsArea.setText("");
             return;
         }

@@ -109,6 +109,37 @@ void main() {
     vec3 base = fragColor;
     float matId = fragMat;
 
+    // mat 8: world item pickups. These are real world objects, not overlay UI, so
+    // they take the mat-0 lighting path (shadow rays, height AO, vignette) and sit
+    // in the scene instead of floating on top of it. Remapping the id to 0 lets
+    // them fall through every branch below into that shared world path; testing
+    // it here is required because the chain is a descending `matId > N.5` and an
+    // untested mat 8 would be swallowed by the mat-7 lattice branch.
+    if (matId > 7.5) matId = 0.0;
+
+    // mat 7: inventory lattice unit cubes (RULES.md rule 12).
+    // Must be tested FIRST of the remaining ids: the chain below is a descending
+    // `matId > N.5` and an
+    // untested mat 7 would fall into the muzzle-flash branch. Deliberately skips
+    // the mat-0 path's world-space shadow rays, world-Y height AO and vignette —
+    // none of which mean anything on a lattice parented to the camera. The
+    // vertex stage also skips the fisheye for mat 7, so this is a clean 3D
+    // projection. Flat face shading plus a light bitcrush to match the look.
+    if (matId > 6.5) {
+        vec3 key = normalize(vec3(0.42, 0.78, 0.30));
+        float ndl = max(dot(n, key), 0.0);
+        float fill = 0.42 + 0.58 * max(n.y, 0.0);
+        vec3 lit = base * (0.34 + 0.52 * ndl) * fill;
+        // Emphasise the cube silhouette so single cells stay legible.
+        float face = pow(max(abs(n.x), max(abs(n.y), abs(n.z))), 8.0);
+        lit += base * face * 0.14;
+        float levels = 20.0;
+        lit = floor(lit * levels + 0.5) / levels;
+        applyFireOverlay(lit);
+        outColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
+        return;
+    }
+
     // mat 6: muzzle flash cubes (emissive, no lighting)
     if (matId > 5.5) {
         vec3 glow = base * (1.4 + 0.6 * ubo.muzzleFlash);

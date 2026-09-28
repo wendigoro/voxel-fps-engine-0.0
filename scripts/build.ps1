@@ -45,8 +45,16 @@ exit /b %ERRORLEVEL%
 "@
 $batPath = Join-Path $Build "_build.bat"
 Set-Content -Path $batPath -Value $bat -Encoding ASCII
-cmd /c $batPath
-if ($LASTEXITCODE -ne 0) { throw "clang++ build failed: $LASTEXITCODE" }
+# The linker emits a benign "found main and WinMain" warning on stderr, which
+# ErrorActionPreference=Stop would otherwise promote to a fatal error and skip
+# the asset-copy steps below. Capture output, then judge success by exit code.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$batOut = cmd /c $batPath 2>&1
+$clangExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+$batOut | ForEach-Object { Write-Host $_ }
+if ($clangExit -ne 0) { throw "clang++ build failed: $clangExit" }
 if (-not (Test-Path (Join-Path $Build "voxel_engine.exe"))) { throw "voxel_engine.exe not produced" }
 
 # Ensure runtime JSON sits beside exe
@@ -56,6 +64,13 @@ $weaponsDst = Join-Path $Build "weapons"
 if (Test-Path $weaponsSrc) {
   New-Item -ItemType Directory -Force -Path $weaponsDst | Out-Null
   Copy-Item (Join-Path $weaponsSrc "*") $weaponsDst -Force -Recurse
+}
+# Inventory item defs (RULES.md rule 12: unit=1, voxel_size=0.001)
+$itemsSrc = Join-Path $Root "data\items"
+$itemsDst = Join-Path $Build "items"
+if (Test-Path $itemsSrc) {
+  New-Item -ItemType Directory -Force -Path $itemsDst | Out-Null
+  Copy-Item (Join-Path $itemsSrc "*") $itemsDst -Force -Recurse
 }
 
 $exe = Get-Item (Join-Path $Build "voxel_engine.exe")

@@ -32,6 +32,7 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.border.MatteBorder;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import voxel.painter.filter.BitcrushUpscale;
+import voxel.painter.grid.Items;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxIO;
@@ -51,6 +52,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
     private final JTextArea logArea = new JTextArea(5, 40);
     private final JTabbedPane modeTabs = new JTabbedPane();
     private final ScriptRunner scripts;
+    private final ModeExtrasPanel modeExtras;
     private Path lastDir;
     private boolean syncingTabs;
 
@@ -105,6 +107,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         modeTabs.addTab("Sky", modeCard(VoxDocument.Mode.SKY));
         modeTabs.addTab("Character", modeCard(VoxDocument.Mode.CHARACTER));
         modeTabs.addTab("Weapon", modeCard(VoxDocument.Mode.WEAPON));
+        modeTabs.addTab("Item", modeCard(VoxDocument.Mode.ITEM));
         modeTabs.addChangeListener(e -> {
             if (syncingTabs) return;
             int i = modeTabs.getSelectedIndex();
@@ -112,6 +115,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
                 case 1 -> VoxDocument.Mode.SKY;
                 case 2 -> VoxDocument.Mode.CHARACTER;
                 case 3 -> VoxDocument.Mode.WEAPON;
+                case 4 -> VoxDocument.Mode.ITEM;
                 default -> VoxDocument.Mode.MODEL;
             };
             if (model.document().mode != mode) {
@@ -146,7 +150,10 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         main.setBorder(new EmptyBorder(4, 4, 4, 4));
         main.add(modeTabs, BorderLayout.NORTH);
         main.add(views, BorderLayout.CENTER);
-        main.add(new ModeExtrasPanel(model), BorderLayout.SOUTH);
+        // The extras panel is mode-aware, so a single instance is kept and
+        // queried; the item editor lives in the same slot as weapon controls.
+        modeExtras = new ModeExtrasPanel(model, this::onExportItem);
+        main.add(modeExtras, BorderLayout.SOUTH);
 
         ToolDockPanel tools = new ToolDockPanel(model);
         JScrollPane toolScroll = new JScrollPane(tools);
@@ -235,6 +242,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         file.addSeparator();
         file.add(item("Export 32× bitcrush preview…", null, this::onExportPreview));
         file.add(item("Export weapon.json…", null, this::onExportWeapon));
+        file.add(item("Export item.json…", null, this::onExportItem));
         file.addSeparator();
         file.add(item("Exit", null, () -> System.exit(0)));
         bar.add(file);
@@ -307,7 +315,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
     }
 
     private void onNew() {
-        Object[] opts = {"model", "sky", "character", "weapon"};
+        Object[] opts = {"model", "sky", "character", "weapon", "item"};
         Object pick = JOptionPane.showInputDialog(
                 this, "New document mode", "New", JOptionPane.QUESTION_MESSAGE,
                 null, opts, model.document().modeName());
@@ -390,6 +398,34 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         }
     }
 
+    private void onExportItem() {
+        try {
+            if (model.document().mode != VoxDocument.Mode.ITEM) {
+                int c = JOptionPane.showConfirmDialog(this,
+                        "Not in item mode. Switch and bake the starter pouch template?",
+                        "Item export", JOptionPane.YES_NO_OPTION);
+                if (c != JOptionPane.YES_OPTION) return;
+                model.bakeStarterItem();
+            }
+            VoxDocument doc = model.document();
+            JFileChooser fc = new JFileChooser(lastDir == null ? null : lastDir.toFile());
+            fc.setSelectedFile(new java.io.File(Items.fileNameFor(doc.itemId)));
+            if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+            Path path = fc.getSelectedFile().toPath();
+            if (!path.getFileName().toString().endsWith(".item.json"))
+                path = path.resolveSibling(path.getFileName() + ".item.json");
+            Items.exportItemJson(path, doc);
+            int cells = Items.solidCells(doc.grid);
+            appendLog("Item export " + path + " class=" + doc.itemClass
+                    + " size=" + doc.grid.sizeX() + "x" + doc.grid.sizeY() + "x" + doc.grid.sizeZ()
+                    + " cells=" + cells);
+            lastDir = path.getParent();
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(),
+                    "Item export failed", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
     private void onExportPreview() {
         JFileChooser fc = new JFileChooser(lastDir == null ? null : lastDir.toFile());
         fc.setFileFilter(new FileNameExtensionFilter("PNG preview", "png"));
@@ -440,6 +476,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
             case SKY -> 1;
             case CHARACTER -> 2;
             case WEAPON -> 3;
+            case ITEM -> 4;
             default -> 0;
         };
         if (modeTabs.getSelectedIndex() != idx) {

@@ -1,0 +1,13 @@
+{
+  "id": "ammo_pouch_medium",
+  "name": "Medium Ammo Pouch",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "ammo_pouch",
+  "material": "sheet_metal",
+  "color": [0.52, 0.47, 0.33],
+  "size": [2, 2, 2],
+  "caliber": "medium",
+  "ammo_id": "medium_fmj",
+  "rounds": 60
+}

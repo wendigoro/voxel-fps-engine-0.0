@@ -20,6 +20,7 @@
 
 #include "debris.hpp"
 #include "destruction.hpp"
+#include "inventory.hpp"
 #include "materials.hpp"
 
 #ifndef M_PI
@@ -118,7 +119,7 @@ struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
     float cr, cg, cb;
-float mat; // 0 solid, 1 water, 2 bulb, 3 moon, 4 sky, 5 debris cube, 6 muzzle flash
+float mat; // 0 solid, 1 water, 2 bulb, 3 moon, 4 sky, 5 debris cube, 6 muzzle flash, 7 inventory lattice
 };
 
 struct FrameUBO {
@@ -217,6 +218,48 @@ static int g_hitscanShots = 0;
 static int g_ballisticShots = 0;
 static bool g_ads = false; // hold X — optic ADS (FOV + spread)
 static DebrisSystem g_debris;
+
+// Cubic-unit inventory (RULES.md rule 12). Separate occupancy layer: never
+// written into chunk storage, never affects collision / impact / water.
+static ItemTable g_itemDefs;
+static Inventory g_inventory;
+static bool g_inventoryOpen = false;
+// One-shot input latches raised by the window proc and drained once per frame.
+static bool g_inventoryClick = false;  // LMB: lift a packed item / place the held one
+static bool g_inventoryStow = false;   // RMB: stow the held item back into the pack
+static bool g_pickupPressed = false;   // G: take the world item under the crosshair
+
+// Inventory lattice mesh: unit cubes emitted camera-relative into their own
+// overlay pass. 36 lattice cells + 8 equipment slot markers + margin.
+static constexpr uint32_t kInventoryMaxVerts = 4096;
+static VkBuffer g_inventoryVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_inventoryMem = VK_NULL_HANDLE;
+static void* g_inventoryMapped = nullptr;
+static uint32_t g_inventoryVertexCount = 0;
+static uint32_t g_inventoryOverlayFrames = 0; // frames that actually submitted the pass
+static constexpr uint32_t kInventoryMatId = 7;
+static constexpr uint32_t kPickupMatId = 8;    // world pickups: main pass, not the overlay
+
+// Display basis + origin, rebuilt with the mesh. Look-and-click picks cells in
+// SCREEN space against this transform rather than by casting a world ray, which
+// stays exact because mat 7 skips the vertex-shader fisheye: what the CPU
+// projects here is precisely what the GPU rasterised.
+struct InventoryDisplay {
+    Vec3 origin, right, up, fwd;
+    bool valid = false;
+};
+static InventoryDisplay g_invDisplay;
+
+// What the cursor is over, resolved each frame while the inventory is open.
+struct InventoryHover {
+    bool lattice = false;   // cursor is over a storage cell
+    int x = 0, y = 0, z = 0; // cell coords (lattice space)
+    bool slot = false;      // cursor is over an equipment marker
+    int slotIndex = 0;
+    bool overCell = false;  // either of the above
+};
+static InventoryHover g_invHover;
+static int g_inventoryHandRot = 0;   // preview rotation while carrying an item
 static float g_lastImpactDx = 0, g_lastImpactDy = 0, g_lastImpactDz = -1;
 static float g_lastImpactEnergy = 10.0f;
 static float g_lastAoeScale = 1.0f;
@@ -266,10 +309,13 @@ static VkExtent2D g_extent{WIDTH, HEIGHT};
 static std::vector<VkImage> g_swapImages;
 static std::vector<VkImageView> g_swapViews;
 static std::vector<VkFramebuffer> g_framebuffers;
+static std::vector<VkFramebuffer> g_overlayFramebuffers; // RULES.md rule 12
 static VkRenderPass g_renderPass = VK_NULL_HANDLE;
+static VkRenderPass g_overlayRenderPass = VK_NULL_HANDLE; // RULES.md rule 12
 static VkDescriptorSetLayout g_dsl = VK_NULL_HANDLE;
 static VkPipelineLayout g_pipelineLayout = VK_NULL_HANDLE;
 static VkPipeline g_pipeline = VK_NULL_HANDLE;
+static VkPipeline g_overlayPipeline = VK_NULL_HANDLE;
 static VkCommandPool g_cmdPool = VK_NULL_HANDLE;
 static std::vector<VkCommandBuffer> g_cmdBuffers;
 static VkImage g_depthImage = VK_NULL_HANDLE;
@@ -312,8 +358,7 @@ static bool g_qpcInit = false;
 static VkBuffer g_skyTileVB = VK_NULL_HANDLE;
 static VkDeviceMemory g_skyTileMem = VK_NULL_HANDLE;
 static void* g_skyTileMapped = nullptr;
-static uint32_t g_skyTileVertexCount = 0;
-static Vec3 g_moonWorldPos = {0, 0, 0};
+static uint32_t g_skyTileVertexCount = 0;static Vec3 g_moonWorldPos = {0, 0, 0};
 static Vec3 g_moonDirWorld = {0.32f, 0.82f, -0.48f}; // fixed sky bearing (light source)
 static float g_moonTileSize = 0.034f;
 static float g_skyRadius = 0.55f;
@@ -963,6 +1008,576 @@ static void ensureDebrisBuffer() {
     if (g_debrisMapped) std::memset(g_debrisMapped, 0, static_cast<size_t>(size));
 }
 
+// ---- inventory lattice mesh (RULES.md rule 12) --------------------------
+//
+// Camera-relative presentation. Every cell is emitted as a true 1x1x1 unit cube
+// (VOXEL_SIZE on each edge) through a rigid display basis — the basis is only
+// rotated, never scaled, so cells stay unit cubes and occupancy is unchanged.
+// Occupied cells take the item's tint; empty cells are a dim backing so the
+// lattice volume stays legible.
+
+static void ensureInventoryBuffer() {
+    if (g_inventoryVB) return;
+    VkDeviceSize size = sizeof(Vertex) * kInventoryMaxVerts;
+    createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_inventoryVB, g_inventoryMem);
+    vkMapMemory(g_device, g_inventoryMem, 0, size, 0, &g_inventoryMapped);
+    if (g_inventoryMapped) std::memset(g_inventoryMapped, 0, static_cast<size_t>(size));
+}
+
+// Emit one unit cube: 6 faces x 2 tris = 36 verts, hard normals. `base` is the
+// world position of lattice cell (0,0,0); the three axes are unit vectors and
+// MUST stay orthogonal (rotated, never scaled) or the result is not a cube.
+// `edge` is the cube edge in world units, so VOXEL_SIZE yields a unit cube.
+static void emitUnitCube(Vertex* verts, uint32_t& wi, uint32_t maxVerts,
+                         const Vec3& base, const Vec3& axR, const Vec3& axU, const Vec3& axF,
+                         float x0, float y0, float z0, float edge,
+                         float cr, float cg, float cb, float matId) {
+    if (wi + 36u > maxVerts) return;
+    // Corner index bits: 1 = +x, 2 = +y, 4 = +z
+    auto corner = [&](int bits) {
+        return base + axR * ((x0 + ((bits & 1) ? 1.0f : 0.0f)) * edge) +
+               axU * ((y0 + ((bits & 2) ? 1.0f : 0.0f)) * edge) +
+               axF * ((z0 + ((bits & 4) ? 1.0f : 0.0f)) * edge);
+    };
+    // face axis, sign, then the two in-plane corner bitmaps
+    struct Face { int axis; int sign; int a, b, c, d; };
+    static const Face kFaces[6] = {
+        {0, +1, 6, 2, 3, 7}, // +x
+        {0, -1, 4, 0, 1, 5}, // -x
+        {1, +1, 5, 1, 3, 7}, // +y
+        {1, -1, 4, 0, 2, 6}, // -y
+        {2, +1, 7, 3, 1, 5}, // +z
+        {2, -1, 6, 0, 2, 4}, // -z
+    };
+    for (const auto& f : kFaces) {
+        const Vec3 nrm = (f.axis == 0 ? axR : (f.axis == 1 ? axU : axF)) * static_cast<float>(f.sign);
+        const int order[4] = {f.a, f.b, f.c, f.d};
+        for (int t = 0; t < 6; ++t) {
+            Vertex& v = verts[wi++];
+            const Vec3 p = corner(order[t / 2]);
+            v.px = p.x;
+            v.py = p.y;
+            v.pz = p.z;
+            v.nx = nrm.x;
+            v.ny = nrm.y;
+            v.nz = nrm.z;
+            v.cr = cr;
+            v.cg = cg;
+            v.cb = cb;
+            v.mat = matId;
+        }
+    }
+}
+
+// Camera-relative lattice cell: unit cubes through the (orthonormal) display
+// basis.
+static void emitInventoryCube(const Vec3& origin, const Vec3& right, const Vec3& up,
+                              const Vec3& fwd, float x0, float y0, float z0,
+                              float cr, float cg, float cb, float matId, uint32_t& wi) {
+    emitUnitCube(reinterpret_cast<Vertex*>(g_inventoryMapped), wi, kInventoryMaxVerts, origin,
+                 right, up, fwd, x0, y0, z0, VOXEL_SIZE, cr, cg, cb, matId);
+}
+
+// World point -> client pixels. mat 7 skips the vertex fisheye, so plain
+// perspective projection reproduces exactly the pixels the GPU drew.
+static bool projectToScreen(const Vec3& p, float& outX, float& outY) {
+    const Mat4& vp = g_viewProjCull;
+    const float cx = vp.m[0] * p.x + vp.m[4] * p.y + vp.m[8] * p.z + vp.m[12];
+    const float cy = vp.m[1] * p.x + vp.m[5] * p.y + vp.m[9] * p.z + vp.m[13];
+    const float cw = vp.m[3] * p.x + vp.m[7] * p.y + vp.m[11] * p.z + vp.m[15];
+    if (cw <= 1e-6f) return false;
+    outX = (cx / cw * 0.5f + 0.5f) * static_cast<float>(g_extent.width);
+    outY = (1.0f - (cy / cw * 0.5f + 0.5f)) * static_cast<float>(g_extent.height);
+    return true;
+}
+
+// Screen-space AABB of one cell under the current display transform, and the
+// cell's centre distance. Returns false if the cell is behind the camera.
+static bool cellScreenRect(const InventoryDisplay& d, float x0, float y0, float z0,
+                          float& x0p, float& y0p, float& x1p, float& y1p) {
+    const float vs = VOXEL_SIZE;
+    x0p = y0p = 1e30f;
+    x1p = y1p = -1e30f;
+    for (int c = 0; c < 8; ++c) {
+        const Vec3 p = d.origin + d.right * ((x0 + (c & 1)) * vs) +
+                       d.up * ((y0 + ((c >> 1) & 1)) * vs) +
+                       d.fwd * ((z0 + ((c >> 2) & 1)) * vs);
+        float sx = 0, sy = 0;
+        if (!projectToScreen(p, sx, sy)) return false;
+        x0p = std::min(x0p, sx);
+        x1p = std::max(x1p, sx);
+        y0p = std::min(y0p, sy);
+        y1p = std::max(y1p, sy);
+    }
+    return true;
+}
+
+// Rebuild the lattice mesh. Rebuilt every frame while open (cheap at ~1.6k
+// verts) because the display basis follows the camera.
+static void updateInventoryMesh() {
+    if (!g_inventoryOpen) {
+        g_inventoryVertexCount = 0;
+        g_invDisplay.valid = false;
+        g_invHover = InventoryHover{};
+        return;
+    }
+    ensureInventoryBuffer();
+    if (!g_inventoryMapped) {
+        g_inventoryVertexCount = 0;
+        g_invDisplay.valid = false;
+        return;
+    }
+
+    // Display basis: camera basis yawed so two faces of the volume are visible
+    // (a 3D projection rather than a flat orthographic panel). Built as two true
+    // rotations — yaw about the view up, then pitch about the yawed right — so
+    // the basis stays orthonormal. A tilt applied to only one axis (e.g.
+    // up*cp + fwd*sp) would shear it and turn the unit cells into rhomboids.
+    const float yaw = 0.52f; // ~30 degrees about the view up axis
+    const float pitch = 0.30f;
+    Vec3 fwd = cameraForward();
+    Vec3 right = cameraRight();
+    if (right.length() < 1e-5f) right = Vec3(1, 0, 0);
+    right = right.normalized();
+    Vec3 up = right.cross(fwd).normalized();
+
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
+    const float cp = std::cos(pitch), sp = std::sin(pitch);
+    const Vec3 dRight = (right * cy + fwd * sy).normalized();
+    const Vec3 dFwdY = (fwd * cy - right * sy).normalized();
+    const Vec3 dUpY = up;
+    const Vec3 dFwd = (dFwdY * cp + dUpY * sp).normalized();
+    const Vec3 dUp = (dUpY * cp - dFwdY * sp).normalized();
+
+    // Anchor: down and to the right of the eye, ~0.006 out. A 3x3x4 cell block
+    // is 0.003 x 0.003 x 0.004 world units at this distance.
+    const float dist = 0.006f;
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f) + right * (0.0046f);
+
+    g_invDisplay.origin = origin;
+    g_invDisplay.right = dRight;
+    g_invDisplay.up = dUp;
+    g_invDisplay.fwd = dFwd;
+    g_invDisplay.valid = true;
+
+    // Resolve what the cursor is over, in screen space. Nearest-containing wins;
+    // ties break toward the cell closest to the lattice centre so the front face
+    // of the volume wins over the back one.
+    const Inventory& inv = g_inventory;
+    const int markerCol0 = -(inv.vol.sx + 2);
+    g_invHover = InventoryHover{};
+    {
+        const float mx = static_cast<float>(g_mouseX);
+        const float my = static_cast<float>(g_mouseY);
+        // Lowest depth wins: a smaller z is the face turned toward the camera,
+        // and central x/y columns are less occluded than the outer ones.
+        int bestDepth = 1 << 30;
+        for (int iz = 0; iz < inv.vol.sz; ++iz) {
+            for (int iy = 0; iy < inv.vol.sy; ++iy) {
+                for (int ix = 0; ix < inv.vol.sx; ++ix) {
+                    float ax, ay, bx, by;
+                    if (!cellScreenRect(g_invDisplay, static_cast<float>(ix),
+                                        static_cast<float>(iy), static_cast<float>(iz), ax, ay, bx, by))
+                        continue;
+                    if (mx < ax || mx > bx || my < ay || my > by) continue;
+                    const int depth = iz * 4 + std::abs(ix - inv.vol.sx / 2) +
+                                      std::abs(iy - inv.vol.sy / 2);
+                    if (depth < bestDepth) {
+                        bestDepth = depth;
+                        g_invHover.lattice = true;
+                        g_invHover.x = ix;
+                        g_invHover.y = iy;
+                        g_invHover.z = iz;
+                    }
+                }
+            }
+        }
+        for (int s = 0; s < kEquipSlotCount; ++s) {
+            float ax, ay, bx, by;
+            if (!cellScreenRect(g_invDisplay, static_cast<float>(markerCol0 + (s & 1)),
+                                static_cast<float>(s >> 1), 0.0f, ax, ay, bx, by))
+                continue;
+            if (mx < ax || mx > bx || my < ay || my > by) continue;
+            g_invHover.slot = true;
+            g_invHover.slotIndex = s;
+            g_invHover.lattice = false;
+            break;
+        }
+        g_invHover.overCell = g_invHover.lattice || g_invHover.slot;
+    }
+
+    // Would the hand item land legally under the cursor? Drives the red/green
+    // placement tint.
+    bool handValid = false;
+    if (inv.held >= 0 && g_invHover.lattice) {
+        handValid = handFits(inv, g_itemDefs, g_inventoryHandRot, g_invHover.x, g_invHover.y,
+                            g_invHover.z);
+    }
+
+    uint32_t wi = 0;
+
+    // Packed item cells, tinted by their definition.
+    for (int iz = 0; iz < inv.vol.sz; ++iz) {
+        for (int iy = 0; iy < inv.vol.sy; ++iy) {
+            for (int ix = 0; ix < inv.vol.sx; ++ix) {
+                const int inst = inv.occ[static_cast<size_t>(inv.vol.index(ix, iy, iz))];
+                float cr, cg, cb;
+                if (inst >= 0 && inst < static_cast<int>(inv.items.size())) {
+                    const ItemDef* d = itemDefAt(g_itemDefs, inv.items[inst].defIndex);
+                    if (d) {
+                        cr = d->cr;
+                        cg = d->cg;
+                        cb = d->cb;
+                    } else {
+                        cr = cg = cb = 0.8f;
+                    }
+                } else {
+                    cr = 0.10f;
+                    cg = 0.11f;
+                    cb = 0.14f; // dim backing for an empty cell
+                }
+                // Hover highlight on the cell under the cursor.
+                if (g_invHover.lattice && g_invHover.x == ix && g_invHover.y == iy &&
+                    g_invHover.z == iz) {
+                    cr = std::min(1.0f, cr + 0.30f);
+                    cg = std::min(1.0f, cg + 0.34f);
+                    cb = std::min(1.0f, cb + 0.38f);
+                }
+                emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(ix),
+                                  static_cast<float>(iy), static_cast<float>(iz), cr, cg, cb,
+                                  static_cast<float>(kInventoryMatId), wi);
+            }
+        }
+    }
+
+    // Held item ghost: the item is drawn at the hovered cell so the player can
+    // see the footprint before clicking. Green when it fits, red when it does
+    // not (out of bounds or overlapping).
+    if (inv.held >= 0 && g_invHover.lattice && handValid) {
+        const ItemDef* d = itemDefAt(g_itemDefs, inv.items[static_cast<size_t>(inv.held)].defIndex);
+        if (d) {
+            const ItemShape s = rotatedShape(d->shape, g_inventoryHandRot);
+            for (int iz = 0; iz < s.sz; ++iz) {
+                for (int iy = 0; iy < s.sy; ++iy) {
+                    for (int ix = 0; ix < s.sx; ++ix) {
+                        if (!s.solid(ix, iy, iz)) continue;
+                        emitInventoryCube(origin, dRight, dUp, dFwd,
+                                          static_cast<float>(g_invHover.x + ix),
+                                          static_cast<float>(g_invHover.y + iy),
+                                          static_cast<float>(g_invHover.z + iz), 0.30f, 0.85f, 0.45f,
+                                          static_cast<float>(kInventoryMatId), wi);
+                    }
+                }
+            }
+        }
+    }
+
+    // Equipment slot markers: 8 one-cell cubes in a 2x4 block left of the volume.
+    for (int s = 0; s < kEquipSlotCount; ++s) {
+        const int defIdx = inv.slotDef[s];
+        float cr, cg, cb;
+        if (defIdx >= 0) {
+            const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+            if (d) {
+                cr = d->cr * 1.15f;
+                cg = d->cg * 1.15f;
+                cb = d->cb * 1.15f;
+            } else {
+                cr = cg = cb = 0.8f;
+            }
+        } else {
+            cr = 0.16f;
+            cg = 0.17f;
+            cb = 0.20f; // empty slot
+        }
+        if (g_invHover.slot && g_invHover.slotIndex == s) {
+            cr = std::min(1.0f, cr + 0.30f);
+            cg = std::min(1.0f, cg + 0.34f);
+            cb = std::min(1.0f, cb + 0.38f);
+        }
+        const float mx = static_cast<float>(markerCol0 + (s & 1));
+        const float my = static_cast<float>(s >> 1);
+        emitInventoryCube(origin, dRight, dUp, dFwd, mx, my, 0.0f, cr, cg, cb,
+                          static_cast<float>(kInventoryMatId), wi);
+    }
+
+    g_inventoryVertexCount = wi;
+}
+
+// ---- world item pickups -------------------------------------------------
+//
+// Ground items are WORLD objects, not storage: they render in the MAIN pass with
+// mat 8, keeping the rule-12 overlay pass reserved for the player's own lattice.
+// Geometry is the same unit-cube lattice as everything else — a pickup is an
+// item shape dropped at a world cell anchor, never a stretched billboard.
+//
+// Taking one up calls autoPlace() so it lands in the pack immediately. If the
+// pack cannot take it the pickup is REFUSED and left on the ground, so a full
+// pack never silently deletes an item.
+
+struct WorldPickup {
+    int defIndex = -1;
+    int cx = 0, cy = 0, cz = 0; // world unit-cell anchor (min corner of the shape)
+    int rot = 0;                // quarter-turns about +Y
+    bool alive = true;
+};
+static std::vector<WorldPickup> g_pickups;
+static VkBuffer g_pickupVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_pickupMem = VK_NULL_HANDLE;
+static void* g_pickupMapped = nullptr;
+static uint32_t g_pickupVertexCount = 0;
+static bool g_pickupMeshDirty = true;
+static constexpr uint32_t kPickupMaxVerts = 8192;
+static int g_pickupHover = -1; // pickup under the crosshair this frame
+static int g_pickupTaken = 0;  // lifetime counters for the smoke
+static int g_pickupRefused = 0;
+static constexpr float kPickupReach = 0.030f; // 30cm grab range
+
+// Cell the player spawned on, so seeded loot lands on the apron in front of
+// them rather than at a hard-coded map coordinate.
+static int g_spawnCellX = 0, g_spawnCellY = 0, g_spawnCellZ = 0;
+
+static void ensurePickupBuffer() {
+    if (g_pickupVB) return;
+    VkDeviceSize size = sizeof(Vertex) * kPickupMaxVerts;
+    createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_pickupVB, g_pickupMem);
+    vkMapMemory(g_device, g_pickupMem, 0, size, 0, &g_pickupMapped);
+    if (g_pickupMapped) std::memset(g_pickupMapped, 0, static_cast<size_t>(size));
+}
+
+// World AABB of a pickup's solid cells, in world units.
+static bool pickupBounds(const WorldPickup& p, Vec3& lo, Vec3& hi) {
+    const ItemDef* d = itemDefAt(g_itemDefs, p.defIndex);
+    if (!d) return false;
+    const ItemShape s = rotatedShape(d->shape, p.rot);
+    lo = Vec3(1e30f, 1e30f, 1e30f);
+    hi = Vec3(-1e30f, -1e30f, -1e30f);
+    for (int iz = 0; iz < s.sz; ++iz) {
+        for (int iy = 0; iy < s.sy; ++iy) {
+            for (int ix = 0; ix < s.sx; ++ix) {
+                if (!s.solid(ix, iy, iz)) continue;
+                const float wx = static_cast<float>(p.cx + ix) * VOXEL_SIZE;
+                const float wy = static_cast<float>(p.cy + iy) * VOXEL_SIZE;
+                const float wz = static_cast<float>(p.cz + iz) * VOXEL_SIZE;
+                lo = Vec3(std::min(lo.x, wx), std::min(lo.y, wy), std::min(lo.z, wz));
+                hi = Vec3(std::max(hi.x, wx + VOXEL_SIZE), std::max(hi.y, wy + VOXEL_SIZE),
+                          std::max(hi.z, wz + VOXEL_SIZE));
+            }
+        }
+    }
+    return lo.x <= hi.x;
+}
+
+// Slab ray/AABB test. Returns the near hit distance, or -1 on a miss.
+static float rayAabb(const Vec3& o, const Vec3& dir, const Vec3& lo, const Vec3& hi) {
+    float tmin = 0.0f;
+    float tmax = 1e30f;
+    const float os[3] = {o.x, o.y, o.z};
+    const float ds[3] = {dir.x, dir.y, dir.z};
+    const float los[3] = {lo.x, lo.y, lo.z};
+    const float his[3] = {hi.x, hi.y, hi.z};
+    for (int a = 0; a < 3; ++a) {
+        if (std::fabs(ds[a]) < 1e-9f) {
+            if (os[a] < los[a] || os[a] > his[a]) return -1.0f;
+            continue;
+        }
+        const float inv = 1.0f / ds[a];
+        float t1 = (los[a] - os[a]) * inv;
+        float t2 = (his[a] - os[a]) * inv;
+        if (t1 > t2) std::swap(t1, t2);
+        tmin = std::max(tmin, t1);
+        tmax = std::min(tmax, t2);
+        if (tmin > tmax) return -1.0f;
+    }
+    return tmin;
+}
+
+// Nearest pickup the camera ray crosses within reach, or -1.
+static int pickupUnderCrosshair() {
+    const Vec3 dir = cameraForward();
+    int best = -1;
+    float bestT = kPickupReach;
+    for (size_t i = 0; i < g_pickups.size(); ++i) {
+        if (!g_pickups[i].alive) continue;
+        Vec3 lo, hi;
+        if (!pickupBounds(g_pickups[i], lo, hi)) continue;
+        const float t = rayAabb(g_camPos, dir, lo, hi);
+        if (t >= 0.0f && t < bestT) {
+            bestT = t;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+// Loot one pickup. autoPlace is the intended pickup behaviour; a refused item
+// stays on the ground rather than being dropped on the floor.
+static bool tryPickupAt(int index) {
+    if (index < 0 || static_cast<size_t>(index) >= g_pickups.size()) return false;
+    WorldPickup& p = g_pickups[index];
+    if (!p.alive) return false;
+    // A backpack re-grants storage: auto-place it so the volume grows.
+    int placedInst = -1, placedRot = 0;
+    if (autoPlace(g_inventory, g_itemDefs, p.defIndex, placedInst, placedRot)) {
+        p.alive = false;
+        g_pickupMeshDirty = true;
+        g_pickupTaken++;
+        return true;
+    }
+    g_pickupRefused++;
+    return false;
+}
+
+static int itemIndexById(const char* id);
+
+// Scatter starter loot on the apron in front of the spawn, one cell at a time so
+// it sits ON the slab (py = the first free cell above the floor) rather than
+// floating or buried. Cell anchors, not world offsets, so every pickup is
+// exactly the item's own unit-cube lattice (RULES.md rule 12).
+static void seedPickups() {
+    g_pickups.clear();
+    g_pickupTaken = 0;
+    g_pickupRefused = 0;
+    struct Seed { const char* id; int dx, dz; };
+    // Spread across the bay the player spawns looking into. Ids must match the
+    // *.item.json files in data/items; an unknown id is skipped, not faked.
+    static const Seed kSeeds[] = {
+        {"supply_grenade",      -3, -6},
+        {"ammo_pouch_medium",   -1, -8},
+        {"weapon_sidearm_light", 2, -7},
+        {"weapon_starter_rifle", 3, -5},
+        {"armor_chest_plate",    0, -10},
+        {"armor_helmet",         5, -9},
+    };
+    for (const Seed& s : kSeeds) {
+        const int defIdx = itemIndexById(s.id);
+        if (defIdx < 0) continue;
+        const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+        if (!d || !d->shape.valid()) continue;
+        WorldPickup p;
+        p.defIndex = defIdx;
+        p.rot = 0;
+        p.cx = g_spawnCellX + s.dx;
+        p.cz = g_spawnCellZ + s.dz;
+        // Drop onto whatever is under it: scan down for the first free cell so
+        // the item rests on the floor instead of hovering over a gap.
+        p.cy = g_spawnCellY;
+        if (g_chunks) {
+            for (int y = g_spawnCellY + 4; y >= 1; --y) {
+                if (isSolidBlock(getWorldBlock(*g_chunks, p.cx, y - 1, p.cz))) {
+                    p.cy = y;
+                    break;
+                }
+            }
+        }
+        g_pickups.push_back(p);
+    }
+    g_pickupMeshDirty = true;
+}
+
+static void updatePickupMesh() {
+    if (!g_pickupMapped && g_pickupVB) ensurePickupBuffer();
+    if (!g_pickupMapped) {
+        g_pickupVertexCount = 0;
+        return;
+    }
+    if (!g_pickupMeshDirty && g_pickupVertexCount > 0) return;
+    g_pickupMeshDirty = false;
+    g_pickupVertexCount = 0;
+
+    const Vec3 axR(1, 0, 0), axU(0, 1, 0), axF(0, 0, 1);
+    Vertex* verts = reinterpret_cast<Vertex*>(g_pickupMapped);
+    uint32_t wi = 0;
+    for (size_t pi = 0; pi < g_pickups.size(); ++pi) {
+        const WorldPickup& p = g_pickups[pi];
+        if (!p.alive) continue;
+        const ItemDef* d = itemDefAt(g_itemDefs, p.defIndex);
+        if (!d) continue;
+        const bool hovered = (static_cast<int>(pi) == g_pickupHover);
+        const float k = hovered ? 1.6f : 1.0f; // brighten the item under the crosshair
+        const ItemShape s = rotatedShape(d->shape, p.rot);
+        for (int iz = 0; iz < s.sz; ++iz) {
+            for (int iy = 0; iy < s.sy; ++iy) {
+                for (int ix = 0; ix < s.sx; ++ix) {
+                    if (!s.solid(ix, iy, iz)) continue;
+                    emitUnitCube(verts, wi, kPickupMaxVerts, Vec3(0, 0, 0), axR, axU, axF,
+                                 static_cast<float>(p.cx + ix), static_cast<float>(p.cy + iy),
+                                 static_cast<float>(p.cz + iz), VOXEL_SIZE,
+                                 std::min(1.0f, d->cr * k), std::min(1.0f, d->cg * k),
+                                 std::min(1.0f, d->cb * k), static_cast<float>(kPickupMatId));
+                }
+            }
+        }
+    }
+    g_pickupVertexCount = wi;
+}
+
+// ---- one-shot input handling --------------------------------------------
+//
+// The window proc only sets latches; the frame loop drains them here so a single
+// click or keypress is consumed exactly once, in draw order, after the frame's
+// camera basis (and therefore g_invDisplay) is up to date. The latch is
+// consumed BEFORE the mesh is built, and updateInventoryMesh recomputes
+// g_invHover from that same basis a moment later, so the action lands on the cell
+// the player was pointing at.
+//
+// The window proc only sets latches; the frame loop drains them here so a single
+// click or keypress is consumed exactly once, in draw order, after the frame's
+// camera basis (and therefore g_invDisplay) is up to date.
+static void drainInventoryInput() {
+    // G: take the world item under the crosshair.
+    if (g_pickupPressed) {
+        g_pickupPressed = false;
+        if (!g_inventoryOpen && g_pickupHover >= 0) {
+            if (!tryPickupAt(g_pickupHover)) {
+                // Pack refused it: carry it rather than dropping it on the floor.
+                takeIntoHand(g_inventory, g_itemDefs,
+                            g_pickups[static_cast<size_t>(g_pickupHover)].defIndex);
+            }
+            g_pickupHover = -1;
+        }
+    }
+    if (!g_inventoryOpen) {
+        g_inventoryClick = false;
+        g_inventoryStow = false;
+        return;
+    }
+    // RMB: stow whatever is in hand.
+    if (g_inventoryStow) {
+        g_inventoryStow = false;
+        stowHeld(g_inventory, g_itemDefs);
+        g_inventoryHandRot = 0;
+    }
+    // LMB: on a packed item, lift it; otherwise place the held item.
+    if (g_inventoryClick) {
+        g_inventoryClick = false;
+        if (g_inventory.held >= 0) {
+            if (g_invHover.lattice)
+                placeHeld(g_inventory, g_itemDefs, g_inventoryHandRot, g_invHover.x, g_invHover.y,
+                          g_invHover.z);
+        } else if (g_invHover.lattice) {
+            liftPacked(g_inventory, invIndexAt(g_inventory, g_invHover.x, g_invHover.y, g_invHover.z));
+        } else if (g_invHover.slot) {
+            // Clicking a marker lifts what is in that equipment slot back out.
+            const int defIdx = g_inventory.slotDef[g_invHover.slotIndex];
+            if (defIdx >= 0) {
+                const bool isPack = g_invHover.slotIndex == static_cast<int>(EquipSlot::Backpack);
+                g_inventory.slotDef[g_invHover.slotIndex] = -1;
+                g_inventory.slotRot[g_invHover.slotIndex] = 0;
+                // Revoking a backpack's storage clears the pack (and anything held),
+                // so it must happen BEFORE the pack itself goes into the hand -
+                // otherwise the revoking would erase the item we just lifted.
+                if (isPack) g_inventory.setVolume(PackVolume::none());
+                takeIntoHand(g_inventory, g_itemDefs, defIdx);
+            }
+        }
+    }
+}
+
 // Cubic 8^3 debris chips + short-lived muzzle flash cubes (display only).
 static void updateDebrisMesh() {
     const int alive = g_debris.activeCount();
@@ -1158,13 +1773,33 @@ if (wParam == 'F') {
             g_fireHeld = true;
         }
         if (wParam == VK_SPACE) g_wantJump = true;
+        // TAB: toggle the 3D inventory lattice (RULES.md rule 12)
+        if (wParam == VK_TAB) {
+            g_inventoryOpen = !g_inventoryOpen;
+            if (g_inventoryOpen) {
+                // Free the cursor so it can select cells; drop any held item back
+                // so closing the panel never leaves an item stranded in the hand.
+                ReleaseCapture();
+                g_mouseDown = false;
+                stowHeld(g_inventory, g_itemDefs);
+                g_inventoryHandRot = 0;
+            } else {
+                SetCapture(hwnd);
+            }
+        }
+        // R: rotate the held item while the lattice is up; otherwise cycle ammo.
+        if (wParam == 'R' && g_inventoryOpen) {
+            g_inventoryHandRot = (g_inventoryHandRot + 1) & 3;
+        }
+        // G: take the world item under the crosshair (auto-places into the pack)
+        if (wParam == 'G' && !g_inventoryOpen) g_pickupPressed = true;
         // 1-4: caliber class (light medium heavy energy)
         if (wParam == '1') { g_activeCaliberIndex = 0; g_activeAmmoIndex = 0; }
         if (wParam == '2') { g_activeCaliberIndex = 1; g_activeAmmoIndex = 0; }
         if (wParam == '3') { g_activeCaliberIndex = 2; g_activeAmmoIndex = 0; }
         if (wParam == '4') { g_activeCaliberIndex = 3; g_activeAmmoIndex = 0; }
         // R: cycle ammo subtypes for the active caliber (Python ammo table)
-        if (wParam == 'R') {
+        if (wParam == 'R' && !g_inventoryOpen) {
             std::string cal = (g_activeCaliberIndex >= 0 && g_activeCaliberIndex < 4)
                                   ? kCaliberIds[g_activeCaliberIndex] : "medium";
             auto list = ammosForCaliber(g_ammoDefs, cal);
@@ -1192,6 +1827,13 @@ if (wParam == 'F') {
         g_mouseDown = true;
         g_lastMouseX = static_cast<short>(LOWORD(lParam));
         g_lastMouseY = static_cast<short>(HIWORD(lParam));
+        if (g_inventoryOpen) {
+            // Cursor is free while the lattice is up: no capture, and the click
+            // is a pick/place rather than a look drag.
+            ReleaseCapture();
+            g_inventoryClick = true;
+            return 0;
+        }
         SetCapture(hwnd);
         return 0;
     case WM_LBUTTONUP:
@@ -1199,6 +1841,10 @@ if (wParam == 'F') {
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
+        if (g_inventoryOpen) {
+            g_inventoryStow = true;
+            return 0;
+        }
         g_firePressed = true;
         g_fireHeld = true;
         return 0;
@@ -1208,7 +1854,9 @@ if (wParam == 'F') {
     case WM_MOUSEMOVE:
         g_mouseX = static_cast<short>(LOWORD(lParam));
         g_mouseY = static_cast<short>(HIWORD(lParam));
-    if (g_mouseDown) {
+    // While the inventory lattice is up, the cursor selects cells instead of
+        // turning the camera, so the click is read as a pick/place, never a look.
+        if (g_mouseDown && !g_inventoryOpen) {
             int dx = g_mouseX - g_lastMouseX;
             int dy = g_mouseY - g_lastMouseY;
             float sens = g_lookSens * (g_ads ? 0.55f : 1.0f);
@@ -1272,6 +1920,26 @@ static QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device) {
     return indices;
 }
 
+// Opt-in Vulkan validation. Off by default so normal playtests stay fast; set
+// VOXEL_VALIDATE=1 to get framebuffer-compatibility, render-pass and layout
+// transition errors on stderr. The inventory overlay pass needed its own
+// pipeline AND its own framebuffers (VUID-VkRenderPassBeginInfo-renderPass-00904
+// also compares subpass dependency chains), which is exactly the kind of thing
+// that must be machine-checked rather than reasoned about.
+static bool g_validate = false;
+static PFN_vkCreateDebugUtilsMessengerEXT g_createDUM = nullptr;
+static PFN_vkDestroyDebugUtilsMessengerEXT g_destroyDUM = nullptr;
+static VkDebugUtilsMessengerEXT g_debugMessenger = VK_NULL_HANDLE;
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT sev,
+    VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data,
+    void*) {
+    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+        std::fprintf(stderr, "[vulkan] %s\n", data->pMessage ? data->pMessage : "(null)");
+    return VK_FALSE;
+}
+
 static void createInstance() {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "VoxelEngine";
@@ -1285,13 +1953,72 @@ static void createInstance() {
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME
     };
 
+    const char* dbgExt = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    uint32_t instExtCount = 0;
+    g_validate = false;
+    if (GetEnvironmentVariableA("VOXEL_VALIDATE", nullptr, 0) > 0) {
+        uint32_t n = 0;
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr) == VK_SUCCESS && n > 0) {
+            std::vector<VkExtensionProperties> props(n);
+            if (vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data()) == VK_SUCCESS) {
+                for (const auto& p : props)
+                    if (std::strcmp(p.extensionName, dbgExt) == 0) g_validate = true;
+            }
+        }
+    }
+
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     ci.enabledExtensionCount = 2;
     ci.ppEnabledExtensionNames = exts;
 
+    VkDebugUtilsMessengerCreateInfoEXT dci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    const char* layers[] = {"VK_LAYER_KHRONOS_validation"};
+    if (g_validate) {
+        // VUID-04926: chaining a VkDebugUtilsMessengerCreateInfoEXT into
+        // VkInstanceCreateInfo requires VK_EXT_debug_utils to be enabled.
+        static std::vector<const char*> extsWithDebug;
+        extsWithDebug.assign(exts, exts + 2);
+        extsWithDebug.push_back(dbgExt);
+        ci.enabledExtensionCount = static_cast<uint32_t>(extsWithDebug.size());
+        ci.ppEnabledExtensionNames = extsWithDebug.data();
+
+        dci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                          VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                          VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        dci.pfnUserCallback = debugCallback;
+        // Chain through pNext so creation-time validation is also covered.
+        ci.pNext = &dci;
+        uint32_t lc = 0;
+        if (vkEnumerateInstanceLayerProperties(&lc, nullptr) == VK_SUCCESS && lc > 0) {
+            std::vector<VkLayerProperties> lps(lc);
+            if (vkEnumerateInstanceLayerProperties(&lc, lps.data()) == VK_SUCCESS) {
+                for (const auto& l : lps)
+                    if (std::strcmp(l.layerName, layers[0]) == 0) {
+                        ci.enabledLayerCount = 1;
+                        ci.ppEnabledLayerNames = layers;
+                    }
+            }
+        }
+    }
+
     if (vkCreateInstance(&ci, nullptr, &g_instance) != VK_SUCCESS)
         fail("vkCreateInstance failed");
+
+    if (g_validate) {
+        g_createDUM = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            g_instance, "vkCreateDebugUtilsMessengerEXT");
+        g_destroyDUM = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            g_instance, "vkDestroyDebugUtilsMessengerEXT");
+        if (g_createDUM) {
+            if (g_createDUM(g_instance, &dci, nullptr, &g_debugMessenger) != VK_SUCCESS) {
+                g_debugMessenger = VK_NULL_HANDLE;
+                std::fprintf(stderr, "[vulkan] debug messenger creation failed\n");
+            }
+        }
+    }
 }
 
 static void createSurface() {
@@ -1400,6 +2127,8 @@ static void destroySwapchainObjects() {
 
     for (auto fb : g_framebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
     g_framebuffers.clear();
+    for (auto fb : g_overlayFramebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
+    g_overlayFramebuffers.clear();
     for (auto v : g_swapViews) vkDestroyImageView(g_device, v, nullptr);
     g_swapViews.clear();
     if (g_swapchain) vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
@@ -1522,6 +2251,80 @@ static void createRenderPass() {
         fail("vkCreateRenderPass failed");
 }
 
+// RULES.md rule 12 — the sanctioned "paint over map voxels" exception.
+// The inventory lattice draws in its own pass with color LOAD (the world stays
+// visible) and depth DONT_CARE, so the lattice self-occludes correctly within
+// a fresh depth buffer while ignoring world depth entirely.
+//
+// A dedicated pipeline and dedicated framebuffers are built against this pass
+// rather than reusing the main ones. Reusing g_framebuffers looks tempting
+// (compatibility is usually described in terms of attachment formats) but
+// VUID-VkRenderPassBeginInfo-renderPass-00904 also requires matching subpass
+// DEPENDENCIES, and the overlay legitimately wants a different barrier from the
+// main pass. Separate framebuffers are the honest way to say "this is its own
+// pass"; they are cheap and recreated with the swapchain.
+static void createOverlayRenderPass() {
+    VkAttachmentDescription color{};
+    color.format = g_swapFormat;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // VUID-00900: a non-UNDEFINED initialLayout must equal the attachment's
+    // actual layout. The main pass leaves color in PRESENT_SRC, so that is the
+    // layout the overlay starts from.
+    color.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentDescription depth{};
+    depth.format = VK_FORMAT_D32_SFLOAT;
+    depth.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // fresh depth for the lattice
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &colorRef;
+    sub.pDepthStencilAttachment = &depthRef;
+
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    // Overlay's first subpass reads color (loadOp LOAD) and needs the depth
+    // writes from the main pass complete before the depth attachment is
+    // discarded and reused.
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    VkAttachmentDescription atts[] = {color, depth};
+    VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    ci.attachmentCount = 2;
+    ci.pAttachments = atts;
+    ci.subpassCount = 1;
+    ci.pSubpasses = &sub;
+    ci.dependencyCount = 1;
+    ci.pDependencies = &dep;
+    if (vkCreateRenderPass(g_device, &ci, nullptr, &g_overlayRenderPass) != VK_SUCCESS)
+        fail("vkCreateOverlayRenderPass failed");
+}
+
 static void createDepthResources() {
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
@@ -1569,6 +2372,21 @@ static void createFramebuffers() {
         ci.layers = 1;
         if (vkCreateFramebuffer(g_device, &ci, nullptr, &g_framebuffers[i]) != VK_SUCCESS)
             fail("framebuffer failed");
+    }
+
+    // Same attachments, bound to the overlay pass (RULES.md rule 12).
+    g_overlayFramebuffers.resize(g_swapViews.size());
+    for (size_t i = 0; i < g_swapViews.size(); ++i) {
+        VkImageView atts[] = {g_swapViews[i], g_depthView};
+        VkFramebufferCreateInfo ci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        ci.renderPass = g_overlayRenderPass;
+        ci.attachmentCount = 2;
+        ci.pAttachments = atts;
+        ci.width = g_extent.width;
+        ci.height = g_extent.height;
+        ci.layers = 1;
+        if (vkCreateFramebuffer(g_device, &ci, nullptr, &g_overlayFramebuffers[i]) != VK_SUCCESS)
+            fail("overlay framebuffer failed");
     }
 }
 
@@ -1741,6 +2559,13 @@ rs.cullMode = VK_CULL_MODE_NONE; // sky dome + moon billboard + world
 
     if (vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &g_pipeline) != VK_SUCCESS)
         fail("graphics pipeline failed");
+
+    // Same state, bound to the overlay pass (RULES.md rule 12). Depth state is
+    // baked rather than dynamic, so the overlay needs its own pipeline object
+    // rather than a state change mid-pass.
+    pci.renderPass = g_overlayRenderPass;
+    if (vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &g_overlayPipeline) != VK_SUCCESS)
+        fail("overlay graphics pipeline failed");
 
     vkDestroyShaderModule(g_device, vert, nullptr);
     vkDestroyShaderModule(g_device, frag, nullptr);
@@ -2247,6 +3072,426 @@ static void tryLoadWeapons() {
     }
 }
 
+// Load inventory item defs (data/items/*.item.json) and seed the base loadout.
+static void tryLoadItems() {
+    g_itemDefs.clear();
+    const std::string candidates[] = {
+        g_exeDir + "\\items",
+        g_exeDir + "\\..\\data\\items",
+        g_exeDir + "\\..\\..\\data\\items",
+    };
+    for (const auto& dir : candidates) {
+        std::string pattern = dir + "\\*.item.json";
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            ItemDef d = loadItemDef(dir + "\\" + fd.cFileName);
+            if (!d.id.empty()) g_itemDefs.push_back(d);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+        if (!g_itemDefs.empty()) break;
+    }
+
+    initInventory(g_inventory, g_itemDefs);
+}
+
+static int itemIndexById(const char* id) {
+    const ItemDef* d = findItemById(g_itemDefs, id);
+    if (!d) return -1;
+    return static_cast<int>(d - g_itemDefs.data());
+}
+
+// Exercise the inventory contract end to end: zone tiling, equipment class
+// gating, armor zone fit (including the negative cases), and the first-fit
+// packer against both the base and the upgraded backpack volume.
+struct InventorySmokeReport {
+    bool zonesTile = false;
+    bool equipOk = false;
+    bool wideArmRejected = false;
+    bool classGateOk = false;
+    bool basePackOk = false;
+    bool baseFullRejected = false;
+    bool upgradePackOk = false;
+    int baseUsed = 0;
+    int baseFree = 0;
+    int upgradeUsed = 0;
+    int upgradeCells = 0;
+    int magRounds = 0;
+    int pouchRounds = 0;
+    int overlayVerts = 0;
+    int overlayLatticeVerts = 0;
+    int overlaySlotVerts = 0;
+    bool overlayBuilt = false;
+    bool overlayUnitCubes = false;
+    // look-and-click hand path
+    bool hoverResolved = false;
+    bool liftOk = false;
+    bool placeOk = false;
+    bool rotateOk = false;
+    bool stowOk = false;
+    bool invalidPlaceRejected = false;
+    // backpack storage is granted on equip and REMOVED on unequip
+    bool backpackVolumeOk = false;
+    // unequipping via the marker must leave the pack in hand, not destroy it
+    bool backpackLiftOk = false;
+    // world pickups
+    bool pickupOk = false;
+    int pickupVerts = 0;
+    bool pickupTaken = false;
+};
+
+static InventorySmokeReport g_invSmoke;
+
+static InventorySmokeReport runInventorySmoke() {
+    InventorySmokeReport rep;
+    rep.zonesTile = armorZonesTileHitbox();
+
+    const int rifle = itemIndexById("weapon_starter_rifle");
+    const int sidearm = itemIndexById("weapon_sidearm_light");
+    const int helmet = itemIndexById("armor_helmet");
+    const int chestPlate = itemIndexById("armor_chest_plate");
+    const int legPlates = itemIndexById("armor_leg_plates");
+    const int armGuard = itemIndexById("armor_arm_guard");
+    const int wideArm = itemIndexById("armor_arm_guard_wide");
+    const int pouch = itemIndexById("ammo_pouch_medium");
+    const int grenade = itemIndexById("supply_grenade");
+    const int upgrade = itemIndexById("backpack_field_upgrade");
+
+    if (rifle < 0 || sidearm < 0 || helmet < 0 || chestPlate < 0 || legPlates < 0 ||
+        armGuard < 0 || wideArm < 0 || pouch < 0 || grenade < 0 || upgrade < 0)
+        return rep;
+
+    Inventory inv;
+    initInventory(inv, g_itemDefs);
+
+    int displaced = -1;
+    bool all = true;
+    all = equipDef(inv, g_itemDefs, rifle, EquipSlot::Primary0, displaced) && all;
+    all = equipDef(inv, g_itemDefs, sidearm, EquipSlot::Small, displaced) && all;
+    all = equipDef(inv, g_itemDefs, helmet, EquipSlot::ArmorHead, displaced) && all;
+    all = equipDef(inv, g_itemDefs, chestPlate, EquipSlot::ArmorChest, displaced) && all;
+    all = equipDef(inv, g_itemDefs, legPlates, EquipSlot::ArmorLegs, displaced) && all;
+    all = equipDef(inv, g_itemDefs, armGuard, EquipSlot::ArmorArms, displaced) && all;
+    rep.equipOk = all;
+
+    // The Arms zone is a single-cell-wide column: a 3-wide piece must not fit.
+    rep.wideArmRejected = !canEquip(g_itemDefs, wideArm, EquipSlot::ArmorArms);
+    // A small weapon may not occupy a primary slot.
+    rep.classGateOk = !canEquip(g_itemDefs, sidearm, EquipSlot::Primary0) &&
+                      canEquip(g_itemDefs, rifle, EquipSlot::Primary1);
+
+    const ItemDef* rifleDef = itemDefAt(g_itemDefs, rifle);
+    rep.magRounds = rifleDef ? rifleDef->magazineSize : 0;
+    const ItemDef* pouchDef = itemDefAt(g_itemDefs, pouch);
+    rep.pouchRounds = pouchDef ? pouchDef->rounds : 0;
+
+    // Base 3x3x4 = 36 pack: rifle + one pouch + grenade fit, and a second
+    // pouch must be rejected. 3x3x4 strands geometry rather than running out
+    // of cells — 14 cells stay free with no 2x2x2 gap anywhere, because a
+    // 3-deep face only admits 2-tall items at y in {0,1} and both are cut by
+    // the rifle.
+    int inst = -1, rot = 0;
+    bool packed = true;
+    packed = autoPlace(inv, g_itemDefs, rifle, inst, rot) && packed;
+    packed = autoPlace(inv, g_itemDefs, pouch, inst, rot) && packed;
+    packed = autoPlace(inv, g_itemDefs, grenade, inst, rot) && packed;
+    rep.basePackOk = packed;
+    rep.baseUsed = inv.usedCells();
+    rep.baseFree = inv.freeCells();
+    rep.baseFullRejected = !autoPlace(inv, g_itemDefs, pouch, inst, rot);
+
+    // Upgraded 4x4x5 = 80 pack must swallow everything the base one could not.
+    Inventory big;
+    initInventory(big, g_itemDefs);
+    equipDef(big, g_itemDefs, upgrade, EquipSlot::Backpack, displaced);
+    rep.upgradeCells = big.vol.cells();
+    bool bigOk = true;
+    bigOk = autoPlace(big, g_itemDefs, rifle, inst, rot) && bigOk;
+    bigOk = autoPlace(big, g_itemDefs, rifle, inst, rot) && bigOk;
+    bigOk = autoPlace(big, g_itemDefs, sidearm, inst, rot) && bigOk;
+    bigOk = autoPlace(big, g_itemDefs, pouch, inst, rot) && bigOk;
+    bigOk = autoPlace(big, g_itemDefs, pouch, inst, rot) && bigOk;
+    bigOk = autoPlace(big, g_itemDefs, pouch, inst, rot) && bigOk;
+    bigOk = autoPlace(big, g_itemDefs, grenade, inst, rot) && bigOk;
+    rep.upgradePackOk = bigOk;
+    rep.upgradeUsed = big.usedCells();
+
+    // Overlay mesh contract (RULES.md rule 12). Build against the real
+    // g_inventory so the smoke exercises the same code path the frame loop
+    // does, then check the emitted geometry is exactly unit cubes: one cell
+    // must be 36 vertices (6 faces x 2 tris x 3) and the per-cell extent must
+    // equal VOXEL_SIZE on all three axes.
+    // The hand-path check below drives g_invHover, so the mesh must be built
+    // with the panel open and no item in hand: an extra ghost shape would change
+    // the expected vertex count.
+    const bool wasOpen = g_inventoryOpen;
+    const int wasHeld = g_inventory.held;
+    g_inventory.held = -1;
+    g_inventoryOpen = true;
+    updateInventoryMesh();
+    g_inventoryOpen = wasOpen;
+    g_inventory.held = wasHeld;
+
+    rep.overlayVerts = static_cast<int>(g_inventoryVertexCount);
+    const int cells = g_inventory.vol.cells();
+    rep.overlayLatticeVerts = cells * 36;
+    rep.overlaySlotVerts = kEquipSlotCount * 36;
+    rep.overlayBuilt = rep.overlayVerts == rep.overlayLatticeVerts + rep.overlaySlotVerts &&
+                       rep.overlayVerts <= static_cast<int>(kInventoryMaxVerts);
+
+    // Unit-cube check. The cell is rotated in world space, so a world AABB
+    // would be larger than VOXEL_SIZE; what must hold is that the cell spans
+    // exactly VOXEL_SIZE along its OWN basis axes. Faces 0/2/4 of a cell carry
+    // the +right/+up/+fwd hard normals, so the basis is recoverable from the
+    // mesh itself. Every vertex must also carry mat 7.
+    if (g_inventoryMapped && rep.overlayVerts >= 36) {
+        const Vertex* verts = reinterpret_cast<const Vertex*>(g_inventoryMapped);
+        const Vec3 ax[3] = {Vec3(verts[0].nx, verts[0].ny, verts[0].nz),
+                            Vec3(verts[12].nx, verts[12].ny, verts[12].nz),
+                            Vec3(verts[24].nx, verts[24].ny, verts[24].nz)};
+        bool orthonormal = true;
+        for (int a = 0; a < 3; ++a)
+            if (std::fabs(ax[a].length() - 1.0f) > 1e-3f) orthonormal = false;
+        if (ax[0].dot(ax[1]) > 1e-3f || ax[0].dot(ax[2]) > 1e-3f ||
+            ax[1].dot(ax[2]) > 1e-3f)
+            orthonormal = false;
+
+        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        bool allMat7 = true;
+        for (int i = 0; i < 36; ++i) {
+            const Vec3 p(verts[i].px, verts[i].py, verts[i].pz);
+            for (int a = 0; a < 3; ++a) {
+                const float d = p.dot(ax[a]);
+                lo[a] = std::min(lo[a], d);
+                hi[a] = std::max(hi[a], d);
+            }
+            if (verts[i].mat < 6.5f) allMat7 = false;
+        }
+        const float tol = VOXEL_SIZE * 0.02f;
+        const float ex = std::fabs((hi[0] - lo[0]) - VOXEL_SIZE);
+        const float ey = std::fabs((hi[1] - lo[1]) - VOXEL_SIZE);
+        const float ez = std::fabs((hi[2] - lo[2]) - VOXEL_SIZE);
+        rep.overlayUnitCubes = orthonormal && allMat7 && ex < tol && ey < tol && ez < tol;
+    }
+
+    // ---- look-and-click hand path -----------------------------------------
+    // Exercised on a scratch inventory so the live one is untouched. Point the
+    // cursor at a known cell by projecting that cell's own centre, which is
+    // exact because mat 7 skips the fisheye (see voxel.vert).
+    {
+        rep.liftOk = rep.placeOk = rep.rotateOk = false;
+        rep.stowOk = rep.invalidPlaceRejected = false;
+
+        // A quarter turn about +Y must actually change the footprint of a
+        // non-square item, and the R binding must cycle 0..3.
+        {
+            const ItemShape a = rotatedShape(rifleDef->shape, 0);
+            const ItemShape b90 = rotatedShape(rifleDef->shape, 1);
+            int cyc = 0;
+            for (int i = 0; i < 5; ++i) cyc = (cyc + 1) & 3;
+            rep.rotateOk = a.sx != b90.sx && a.sz != b90.sz && cyc == 1;
+        }
+
+        // Cursor -> cell. The lattice is small on screen and neighbouring cells'
+        // screen rects overlap, so the contract is "the cursor resolves to a real
+        // in-range cell", and the action then applies to THAT cell. Asserting a
+        // particular cell here would test the overlap heuristic, not the feature.
+        Inventory t;
+        initInventory(t, g_itemDefs);
+        int tInst = 0, tRot = 0;
+        int seedX = -1, seedY = -1, seedZ = -1;
+        if (autoPlace(t, g_itemDefs, rifle, tInst, tRot) && tInst >= 0) {
+            for (int iz = 0; iz < t.vol.sz && seedX < 0; ++iz)
+                for (int iy = 0; iy < t.vol.sy && seedX < 0; ++iy)
+                    for (int ix = 0; ix < t.vol.sx; ++ix)
+                        if (invIndexAt(t, ix, iy, iz) == tInst) {
+                            seedX = ix; seedY = iy; seedZ = iz;
+                            break;
+                        }
+        }
+        if (seedX >= 0) {
+            const bool wasOpen2 = g_inventoryOpen;
+            const int savedMouseX = g_mouseX, savedMouseY = g_mouseY;
+            g_inventoryOpen = true;
+            updateInventoryMesh(); // establishes g_invDisplay for this basis
+            const InventoryDisplay disp = g_invDisplay;
+            const Vec3 centre = disp.origin + disp.right * ((seedX + 0.5f) * VOXEL_SIZE) +
+                                disp.up * ((seedY + 0.5f) * VOXEL_SIZE) +
+                                disp.fwd * ((seedZ + 0.5f) * VOXEL_SIZE);
+            float sx = 0, sy = 0;
+            if (projectToScreen(centre, sx, sy)) {
+                g_mouseX = static_cast<int>(sx);
+                g_mouseY = static_cast<int>(sy);
+                updateInventoryMesh(); // resolves g_invHover for that cursor
+                rep.hoverResolved = g_invHover.lattice && g_invHover.x >= 0 &&
+                                    g_invHover.x < t.vol.sx && g_invHover.y >= 0 &&
+                                    g_invHover.y < t.vol.sy && g_invHover.z >= 0 &&
+                                    g_invHover.z < t.vol.sz;
+
+                // Act on the cell the cursor actually resolved to: lift it, and
+                // if it was occupied the cell must be freed.
+                const int hx = g_invHover.x, hy = g_invHover.y, hz = g_invHover.z;
+                const int occBefore = t.usedCells();
+                const int target = invIndexAt(t, hx, hy, hz);
+                if (liftPacked(t, target)) {
+                    rep.liftOk = t.held >= 0 && invIndexAt(t, hx, hy, hz) == -1;
+                    // Put it back at the origin and rotation it was packed with,
+                    // NOT the hovered cell with the rifle's rotation: the hover may
+                    // have landed on some other instance's cell.
+                    const ItemInstance& it = t.items[static_cast<size_t>(t.held)];
+                    const int ox = it.ox, oy = it.oy, oz = it.oz, orot = it.rot;
+                    rep.placeOk = placeHeld(t, g_itemDefs, orot, ox, oy, oz) && t.held == -1 &&
+                                  t.usedCells() == occBefore;
+                } else if (target == -1) {
+                    // An empty cell has nothing to lift; lifting must be a no-op.
+                    rep.liftOk = t.held == -1;
+                }
+            }
+            g_mouseX = savedMouseX;
+            g_mouseY = savedMouseY;
+            g_inventoryOpen = wasOpen2;
+        }
+
+        // Stow and illegal-placement checks run on their own fresh inventories so
+        // they cannot be starved by what the hover test above already packed.
+        {
+            Inventory s;
+            initInventory(s, g_itemDefs);
+            int sInst = 0, sRot = 0;
+            if (autoPlace(s, g_itemDefs, rifle, sInst, sRot) && sInst >= 0 &&
+                liftPacked(s, sInst)) {
+                rep.stowOk = stowHeld(s, g_itemDefs) && s.held == -1 && s.usedCells() > 0;
+            }
+        }
+        {
+            Inventory b2;
+            initInventory(b2, g_itemDefs);
+            int bInst = 0, bRot = 0;
+            if (autoPlace(b2, g_itemDefs, rifle, bInst, bRot) && bInst >= 0 &&
+                liftPacked(b2, bInst)) {
+                // One cell past the far corner cannot fit in any rotation.
+                const int usedBefore = b2.usedCells();
+                bool anyPlacementAccepted = false;
+                for (int rot = 0; rot < 4; ++rot)
+                    for (int ox = b2.vol.sx; ox <= b2.vol.sx; ++ox)
+                        for (int oy = b2.vol.sy; oy <= b2.vol.sy; ++oy)
+                            for (int oz = b2.vol.sz; oz <= b2.vol.sz; ++oz)
+                                if (placeHeld(b2, g_itemDefs, rot, ox, oy, oz))
+                                    anyPlacementAccepted = true;
+                // The refused placement must leave the item in hand and occupancy
+                // untouched -- never a half-written shape.
+                rep.invalidPlaceRejected = !anyPlacementAccepted && b2.held >= 0 &&
+                                           b2.usedCells() == usedBefore;
+                stowHeld(b2, g_itemDefs);
+            }
+        }
+    }
+
+    // ---- backpack volume ownership -----------------------------------------
+    // Equipping a pack grants its volume; unequipping must REMOVE storage, not
+    // silently restore the base 3x3x4.
+    {
+        Inventory b;
+        initInventory(b, g_itemDefs);
+        const int baseCells = b.vol.cells();
+        bool granted = equipDef(b, g_itemDefs, upgrade, EquipSlot::Backpack, displaced);
+        const int upCells = b.vol.cells();
+        int dropped = -1;
+        const bool removed = unequipDef(b, EquipSlot::Backpack, dropped);
+        rep.backpackVolumeOk = granted && upCells == rep.upgradeCells && removed &&
+                               b.vol.cells() == 0 && baseCells > 0;
+        // setVolume clears items, so a hand item can never survive a volume swap.
+        int bInst = 0, bRot = 0;
+        if (autoPlace(b, g_itemDefs, rifle, bInst, bRot) &&
+            invIndexAt(b, 0, 0, 0) >= 0) {
+            liftPacked(b, invIndexAt(b, 0, 0, 0));
+            if (b.held >= 0) b.setVolume(b.vol); // must not leave held dangling
+            if (b.held >= 0) rep.backpackVolumeOk = false;
+        }
+    }
+
+    // ---- lifting an equipped backpack out of its marker ---------------------
+    // drainInventoryInput revokes the pack's storage and then puts the pack in
+    // the hand. In that order the pack survives; the reverse order would let
+    // setVolume() erase the item it had just lifted, destroying it outright.
+    {
+        Inventory b;
+        initInventory(b, g_itemDefs);
+        bool ok = equipDef(b, g_itemDefs, upgrade, EquipSlot::Backpack, displaced);
+        // Mirror the real input path exactly.
+        b.slotDef[static_cast<size_t>(EquipSlot::Backpack)] = -1;
+        b.slotRot[static_cast<size_t>(EquipSlot::Backpack)] = 0;
+        b.setVolume(PackVolume::none());
+        const bool took = takeIntoHand(b, g_itemDefs, upgrade);
+        const bool holdsPack = took && b.held >= 0 &&
+                               b.items[static_cast<size_t>(b.held)].defIndex == upgrade;
+        rep.backpackLiftOk = ok && holdsPack && b.vol.cells() == 0 &&
+                              b.slotDef[static_cast<size_t>(EquipSlot::Backpack)] < 0;
+    }
+
+    // ---- world pickups ------------------------------------------------------
+    // The seeded loot must build unit-cube geometry tagged mat 8, and a pickup
+    // must auto-place into a pack that has room.
+    {
+        ensurePickupBuffer();
+        g_pickupMeshDirty = true;
+        updatePickupMesh();
+        rep.pickupVerts = static_cast<int>(g_pickupVertexCount);
+        rep.pickupOk = false;
+        if (g_pickupMapped && rep.pickupVerts > 0) {
+            // All-pickup-mat8 check plus the same own-basis unit-cube test.
+            const Vertex* pv = reinterpret_cast<const Vertex*>(g_pickupMapped);
+            bool allMat8 = true;
+            for (int i = 0; i < rep.pickupVerts; ++i)
+                if (pv[i].mat < 7.5f) allMat8 = false;
+            const Vec3 ax[3] = {Vec3(pv[0].nx, pv[0].ny, pv[0].nz),
+                                Vec3(pv[12].nx, pv[12].ny, pv[12].nz),
+                                Vec3(pv[24].nx, pv[24].ny, pv[24].nz)};
+            bool ortho = true;
+            for (int a = 0; a < 3; ++a)
+                if (std::fabs(ax[a].length() - 1.0f) > 1e-3f) ortho = false;
+            if (ax[0].dot(ax[1]) > 1e-3f || ax[0].dot(ax[2]) > 1e-3f || ax[1].dot(ax[2]) > 1e-3f)
+                ortho = false;
+            float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+            for (int i = 0; i < 36; ++i) {
+                const Vec3 p(pv[i].px, pv[i].py, pv[i].pz);
+                for (int a = 0; a < 3; ++a) {
+                    const float d = p.dot(ax[a]);
+                    lo[a] = std::min(lo[a], d);
+                    hi[a] = std::max(hi[a], d);
+                }
+            }
+            const float ptol = VOXEL_SIZE * 0.02f;
+            const bool unit = std::fabs((hi[0] - lo[0]) - VOXEL_SIZE) < ptol &&
+                              std::fabs((hi[1] - lo[1]) - VOXEL_SIZE) < ptol &&
+                              std::fabs((hi[2] - lo[2]) - VOXEL_SIZE) < ptol;
+            rep.pickupOk = allMat8 && ortho && unit;
+
+            // Auto-place into a fresh pack; the source must then read as taken.
+            // tryPickupAt writes to the LIVE g_inventory, so swap in the scratch
+            // pack for the duration rather than testing a pack nothing touched.
+            if (!g_pickups.empty()) {
+                Inventory w;
+                initInventory(w, g_itemDefs);
+                const Inventory savedInv = g_inventory;
+                g_inventory = w;
+                const int before = g_inventory.usedCells();
+                const size_t idx = 0;
+                g_pickupHover = 0;
+                const bool took = tryPickupAt(static_cast<int>(idx));
+                rep.pickupTaken = took && !g_pickups[idx].alive &&
+                                  g_inventory.usedCells() > before;
+                g_inventory = savedInv;
+                g_pickupHover = -1;
+                g_pickupMeshDirty = true;
+            }
+        }
+    }
+    return rep;
+}
+
 static void updateProjectiles(float dt) {
     if (!g_chunks) return;
     for (auto& p : g_projectiles) {
@@ -2387,7 +3632,16 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         g_drawnChunks = 1;
     }
 
-// Visual debris cubes (8x8x8 chips) after world mesh, before sky
+    // World item pickups (mat 8) live in the main pass so they depth-test against
+    // the map and cast/receive light like the world does. Only the player's own
+    // lattice is overlay-only.
+    if (g_pickupVB != VK_NULL_HANDLE && g_pickupVertexCount > 0) {
+        VkDeviceSize pOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_pickupVB, &pOff);
+        vkCmdDraw(cmd, g_pickupVertexCount, 1, 0, 0);
+    }
+
+    // Visual debris cubes (8x8x8 chips) after world mesh, before sky
     if (g_debrisVB != VK_NULL_HANDLE && g_debrisVertexCount > 0) {
         VkDeviceSize dOff = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &g_debrisVB, &dOff);
@@ -2402,6 +3656,30 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     }
 
     vkCmdEndRenderPass(cmd);
+
+    // Inventory overlay (RULES.md rule 12): second pass, color LOAD + depth
+    // DONT_CARE, so the lattice paints over the map while still self-occluding
+    // against a fresh depth buffer.
+    if (g_inventoryOpen && g_inventoryVB != VK_NULL_HANDLE && g_inventoryVertexCount > 0) {
+        ++g_inventoryOverlayFrames;
+        VkRenderPassBeginInfo ovp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        ovp.renderPass = g_overlayRenderPass;
+        ovp.framebuffer = g_overlayFramebuffers[imageIndex];
+        ovp.renderArea.extent = g_extent;
+        ovp.clearValueCount = 0;
+        ovp.pClearValues = nullptr;
+        vkCmdBeginRenderPass(cmd, &ovp, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_overlayPipeline);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        VkDeviceSize ioff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_inventoryVB, &ioff);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelineLayout, 0, 1,
+                                &g_descSets[frameIndex], 0, nullptr);
+        vkCmdDraw(cmd, g_inventoryVertexCount, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
+    }
+
     vkEndCommandBuffer(cmd);
 }
 
@@ -2481,6 +3759,9 @@ static void spawnPlayerOnMap(const std::vector<Chunk>& chunks) {
         Block b = getWorldBlock(chunks, sx, y, sz);
         if (isSolidBlock(b)) { gy = y + 1; break; }
     }
+    g_spawnCellX = sx;
+    g_spawnCellY = gy;
+    g_spawnCellZ = sz;
     g_player.px = (sx + 0.5f) * VOXEL_SIZE;
     g_player.py = gy * VOXEL_SIZE + 0.0002f;
     g_player.pz = (sz + 0.5f) * VOXEL_SIZE;
@@ -2765,6 +4046,15 @@ static void drawFrame(float timeSec, float dt) {
     updateUBO(static_cast<uint32_t>(g_frame), timeSec);
     updateMoonSkyTile();
     updateDebrisMesh();
+    // Pickup hover drives a brightness tint, so the mesh follows the crosshair.
+    const int prevHover = g_pickupHover;
+    g_pickupHover = g_inventoryOpen ? -1 : pickupUnderCrosshair();
+    if (prevHover != g_pickupHover) g_pickupMeshDirty = true;
+    updatePickupMesh();
+    // Resolve g_invHover first (it needs this frame's camera basis), then act on
+    // it, so a click always lands on the cell that was under the cursor.
+    updateInventoryMesh();
+    drainInventoryInput();
     recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -2800,8 +4090,10 @@ static void cleanup() {
     if (g_device) vkDeviceWaitIdle(g_device);
     destroySwapchainObjects();
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, nullptr);
+    if (g_overlayPipeline) vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
     if (g_pipelineLayout) vkDestroyPipelineLayout(g_device, g_pipelineLayout, nullptr);
     if (g_renderPass) vkDestroyRenderPass(g_device, g_renderPass, nullptr);
+    if (g_overlayRenderPass) vkDestroyRenderPass(g_device, g_overlayRenderPass, nullptr);
     if (g_descPool) vkDestroyDescriptorPool(g_device, g_descPool, nullptr);
     if (g_dsl) vkDestroyDescriptorSetLayout(g_device, g_dsl, nullptr);
     for (int i = 0; i < MAX_FRAMES; ++i) {
@@ -2840,15 +4132,38 @@ if (g_skyTileVB) {
         g_debrisMem = VK_NULL_HANDLE;
     }
     g_debrisVertexCount = 0;
+    if (g_pickupVB) {
+        vkDestroyBuffer(g_device, g_pickupVB, nullptr);
+        vkUnmapMemory(g_device, g_pickupMem);
+        vkFreeMemory(g_device, g_pickupMem, nullptr);
+        g_pickupVB = VK_NULL_HANDLE;
+        g_pickupMem = VK_NULL_HANDLE;
+        g_pickupMapped = nullptr;
+    }
+    if (g_inventoryVB) {
+        if (g_inventoryMapped) { vkUnmapMemory(g_device, g_inventoryMem); g_inventoryMapped = nullptr; }
+        vkDestroyBuffer(g_device, g_inventoryVB, nullptr);
+        g_inventoryVB = VK_NULL_HANDLE;
+    }
+    if (g_inventoryMem) {
+        vkFreeMemory(g_device, g_inventoryMem, nullptr);
+        g_inventoryMem = VK_NULL_HANDLE;
+    }
+    g_inventoryVertexCount = 0;
     destroyWorldMeshBuffer();
     if (g_cmdPool) vkDestroyCommandPool(g_device, g_cmdPool, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
+    if (g_debugMessenger != VK_NULL_HANDLE && g_destroyDUM)
+        g_destroyDUM(g_instance, g_debugMessenger, nullptr);
+    g_debugMessenger = VK_NULL_HANDLE;
     if (g_surface) vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
     if (g_instance) vkDestroyInstance(g_instance, nullptr);
     if (g_hwnd) DestroyWindow(g_hwnd);
     g_pipeline = VK_NULL_HANDLE;
+    g_overlayPipeline = VK_NULL_HANDLE;
     g_pipelineLayout = VK_NULL_HANDLE;
     g_renderPass = VK_NULL_HANDLE;
+    g_overlayRenderPass = VK_NULL_HANDLE;
     g_descPool = VK_NULL_HANDLE;
     g_dsl = VK_NULL_HANDLE;
     g_vertexBuffer = VK_NULL_HANDLE;
@@ -2890,6 +4205,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createCommandPoolAndBuffers();
         createSwapchain();
         createRenderPass();
+        createOverlayRenderPass(); // must exist before createPipeline binds it
         createDepthResources();
         createFramebuffers();
         createDescriptors();
@@ -2918,6 +4234,14 @@ auto chunks = buildWarehouseMap();
 
         // Weapon defs from data/weapons or build/weapons
         tryLoadWeapons();
+
+        // Inventory item defs (RULES.md rule 12)
+        tryLoadItems();
+
+        // Starter world loot, placed relative to the spawn cell so it is always
+        // on the apron in front of the player. Needs items + chunks, hence here.
+        seedPickups();
+        ensurePickupBuffer();
 
         auto mesh = meshAllChunks(chunks);
         char msg[256];
@@ -3018,6 +4342,10 @@ if (g_fireCooldown > 0.0f) {
                 g_firePressed = false;
             }
 
+            // Hold the inventory open for a stretch so the smoke actually
+            // records and submits the overlay render pass (RULES.md rule 12).
+            g_inventoryOpen = g_smoke && frames >= 100 && frames < 200;
+
 const bool wasDirty = g_meshDirty;
             g_debris.beginFrame();
             updateProjectiles(dt);
@@ -3051,6 +4379,7 @@ const bool wasDirty = g_meshDirty;
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
+            g_invSmoke = runInventorySmoke();
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
 out << "frames=" << frames << "\nvertices=" << g_vertexCount
@@ -3121,6 +4450,57 @@ out << "frames=" << frames << "\nvertices=" << g_vertexCount
                 << "\nsky_verts=" << g_skyTileVertexCount
                 << "\nmoon_light=" << (g_isNight ? 1 : 0)
                 << "\nmoon_dir=" << g_moonDirWorld.x << "," << g_moonDirWorld.y << "," << g_moonDirWorld.z
+                << "\nitems_loaded=" << g_itemDefs.size()
+                << "\ninventory_slots=" << kEquipSlotCount
+                << "\ninventory_open=" << (g_inventoryOpen ? 1 : 0)
+                << "\npack_size=" << g_inventory.vol.sx << "," << g_inventory.vol.sy << ","
+                << g_inventory.vol.sz
+                << "\npack_cells=" << g_inventory.vol.cells()
+                << "\npack_used=" << g_invSmoke.baseUsed
+                << "\npack_free=" << g_invSmoke.baseFree
+                << "\nhit_cells=" << kHitCells
+                << "\narmor_zones=" << static_cast<int>(ArmorZone::Count)
+                << "\narmor_zones_tile=" << (g_invSmoke.zonesTile ? 1 : 0)
+                << "\ninventory_equip_ok=" << (g_invSmoke.equipOk ? 1 : 0)
+                << "\ninventory_wide_arm_rejected=" << (g_invSmoke.wideArmRejected ? 1 : 0)
+                << "\ninventory_class_gate_ok=" << (g_invSmoke.classGateOk ? 1 : 0)
+                << "\ninventory_base_pack_ok=" << (g_invSmoke.basePackOk ? 1 : 0)
+                << "\ninventory_base_full_rejected=" << (g_invSmoke.baseFullRejected ? 1 : 0)
+                << "\npack_upgrade_cells=" << g_invSmoke.upgradeCells
+                << "\npack_upgrade_used=" << g_invSmoke.upgradeUsed
+                << "\ninventory_upgrade_pack_ok=" << (g_invSmoke.upgradePackOk ? 1 : 0)
+                << "\nweapon_mag_rounds=" << g_invSmoke.magRounds
+                << "\npouch_rounds=" << g_invSmoke.pouchRounds
+                << "\noverlay_verts=" << g_invSmoke.overlayVerts
+                << "\noverlay_lattice_verts=" << g_invSmoke.overlayLatticeVerts
+                << "\noverlay_slot_verts=" << g_invSmoke.overlaySlotVerts
+                << "\noverlay_built=" << (g_invSmoke.overlayBuilt ? 1 : 0)
+                << "\noverlay_unit_cubes=" << (g_invSmoke.overlayUnitCubes ? 1 : 0)
+                << "\noverlay_frames_drawn=" << g_inventoryOverlayFrames
+                << "\nhover_resolved=" << (g_invSmoke.hoverResolved ? 1 : 0)
+                << "\nhand_lift_ok=" << (g_invSmoke.liftOk ? 1 : 0)
+                << "\nhand_place_ok=" << (g_invSmoke.placeOk ? 1 : 0)
+                << "\nhand_rotate_ok=" << (g_invSmoke.rotateOk ? 1 : 0)
+                << "\nhand_stow_ok=" << (g_invSmoke.stowOk ? 1 : 0)
+                << "\nhand_invalid_place_rejected=" << (g_invSmoke.invalidPlaceRejected ? 1 : 0)
+                << "\nbackpack_volume_ok=" << (g_invSmoke.backpackVolumeOk ? 1 : 0)
+                << "\nbackpack_unequip_lift_ok=" << (g_invSmoke.backpackLiftOk ? 1 : 0)
+                << "\npickup_verts=" << g_invSmoke.pickupVerts
+                << "\npickup_unit_cubes=" << (g_invSmoke.pickupOk ? 1 : 0)
+                << "\npickup_taken=" << (g_invSmoke.pickupTaken ? 1 : 0)
+                << "\ninventory_ok="
+                << ((!g_itemDefs.empty() && g_invSmoke.zonesTile && g_invSmoke.equipOk &&
+                     g_invSmoke.wideArmRejected && g_invSmoke.classGateOk &&
+                     g_invSmoke.basePackOk && g_invSmoke.baseFullRejected &&
+                     g_invSmoke.upgradePackOk && g_invSmoke.overlayBuilt &&
+                     g_invSmoke.overlayUnitCubes && g_inventoryOverlayFrames > 0 &&
+                     g_invSmoke.hoverResolved && g_invSmoke.liftOk && g_invSmoke.placeOk &&
+                     g_invSmoke.rotateOk && g_invSmoke.stowOk &&
+                     g_invSmoke.invalidPlaceRejected && g_invSmoke.backpackVolumeOk &&
+                     g_invSmoke.backpackLiftOk &&
+                     g_invSmoke.pickupOk && g_invSmoke.pickupTaken)
+                        ? 1
+                        : 0)
                 << "\n";
         }
     } catch (const std::exception& e) {
