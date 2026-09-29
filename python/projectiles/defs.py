@@ -31,7 +31,9 @@ class ProjectileType:
 
 # Bullet size is one 8x8x8 subunit of a unit voxel (VOXEL_SIZE=0.001).
 # subunit edge = 0.001/8; projectile radius = half-edge (fits one subunit cube).
-VOXEL_SIZE = 0.001
+# VOXEL_SIZE is owned by materials.py; do not redeclare it here.
+from .materials import VOXEL_SIZE  # noqa: E402
+
 SUB_DIV = 8
 SUB_EDGE = VOXEL_SIZE / SUB_DIV  # 0.000125
 SUB_RADIUS = SUB_EDGE * 0.5  # one subunit projectile

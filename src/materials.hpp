@@ -1,6 +1,12 @@
 #pragma once
 // Material qualities used by C++ destruction resolution.
-// IDs must stay in sync with python/projectiles/materials.py
+//
+// C++ owns this table. python/projectiles/materials.py mirrors it, and
+// java/painter/src/voxel/painter/grid/MaterialPalette.java mirrors the ids.
+// There is no codegen between them, so scripts/check_constants.py asserts on
+// every build that all three still agree (ids, names, all five properties,
+// kVoxelSize, and the voxelMass scale factor). If you edit a table, edit the
+// mirrors or the build will fail.
 
 #include <cmath>
 #include <cstdint>
@@ -45,7 +51,7 @@ inline const MaterialProps& materialProps(MaterialId id) {
         {"bush_leaves",    0.15f,  0.35f,  0.95f,     0.15f,    0.10f},
         {"bush_branch",    0.55f,  0.80f,  0.55f,     0.85f,    0.30f},
         {"sheet_metal",    7.80f,  0.55f,  0.35f,     2.10f,    0.28f},
-{"girder",         7.85f,  1.40f,  0.12f,     4.20f,    0.50f},
+        {"girder",         7.85f,  1.40f,  0.12f,     4.20f,    0.50f},
         {"water",          1.00f,  1.00f,  1.00f,     0.05f,    0.05f},
         {"plexiglass",     1.20f,  0.40f,  0.00f,   9999.0f,    0.95f},
         {"carbon_fiber",   1.75f,  0.45f,  0.25f,     2.80f,    0.22f},
@@ -75,7 +81,7 @@ inline MaterialId materialFromName(const std::string& name) {
     if (name == "bush_leaves") return MaterialId::BushLeaves;
     if (name == "bush_branch") return MaterialId::BushBranch;
     if (name == "sheet_metal") return MaterialId::SheetMetal;
-if (name == "girder") return MaterialId::Girder;
+    if (name == "girder") return MaterialId::Girder;
     if (name == "water") return MaterialId::Water;
     if (name == "plexiglass") return MaterialId::Plexiglass;
     if (name == "carbon_fiber") return MaterialId::CarbonFiber;
