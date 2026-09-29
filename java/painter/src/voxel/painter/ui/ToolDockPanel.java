@@ -1,6 +1,7 @@
 package voxel.painter.ui;
 
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -15,6 +16,7 @@ import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JColorChooser;
 import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JPanel;
@@ -46,6 +48,7 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
     private final JSpinner sizeSpinner;
     private final JSpinner stretchSpinner;
     private final JPanel weaponCard;
+    private final JPanel toolModes;
     private final JComboBox<String> partBox;
     private final JComboBox<String> calBox;
     private final JComboBox<String> ammoBox;
@@ -68,8 +71,8 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
         add(Box.createVerticalStrut(6));
 
         add(section("Tool mode"));
-        JPanel modes = new JPanel(new GridLayout(0, 2, 4, 4));
-        modes.setOpaque(false);
+        toolModes = new JPanel(new GridLayout(0, 2, 4, 4));
+        toolModes.setOpaque(false);
         ButtonGroup modeGroup = new ButtonGroup();
         for (PainterModel.UiTool t : PainterModel.UiTool.values()) {
             JRadioButton rb = new JRadioButton(t.name());
@@ -79,10 +82,10 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
             rb.addActionListener(e -> { if (!syncing) model.setUiTool(t); });
             rb.putClientProperty("uitool", t);
             modeGroup.add(rb);
-            modes.add(rb);
+            toolModes.add(rb);
         }
-        modes.setAlignmentX(LEFT_ALIGNMENT);
-        add(modes);
+        toolModes.setAlignmentX(LEFT_ALIGNMENT);
+        add(toolModes);
 
         add(section("Brush shape"));
         JPanel shapes = new JPanel(new GridLayout(0, 2, 4, 4));
@@ -360,8 +363,17 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
     }
 
     private void refreshWeaponVisibility() {
-        boolean w = model.document().mode == VoxDocument.Mode.WEAPON;
+        VoxDocument.Mode m = model.document().mode;
+        boolean w = m == VoxDocument.Mode.WEAPON;
         weaponCard.setVisible(w);
+        // The entity tools address map entities, not voxels, so they only make
+        // sense in map mode. Without this they would sit in the dock in every
+        // mode and silently no-op.
+        boolean map = m == VoxDocument.Mode.MAP;
+        for (Component c : toolModes.getComponents()) {
+            Object t = ((JComponent) c).getClientProperty("uitool");
+            c.setVisible(map || !(t instanceof PainterModel.UiTool) || !PainterModel.isEntityTool((PainterModel.UiTool) t));
+        }
         revalidate();
         repaint();
     }

@@ -111,6 +111,7 @@ Splitting simulation systems across machines is a planned goal, so the simulatio
 - **New material** → add to both C++ and Python material tables, then map `Block` → `MaterialId`.
 - **Painted asset** → save via painter voxfmt (unit cubes); optional crushed PNG is preview only.
 - **Inventory item** → author in painter `Mode.ITEM` and export `*.item.json` into `data/items/`; the footprint is the painted cells' tight box (rule 14).
+- **Map / map entities** → author in painter `Mode.MAP`. The grid is ordinary unit-cubic voxels and entity coordinates are integer cell coordinates on that same grid, so they rescale with `VOXEL_SIZE` alone. Entity ids are assigned per document in authoring order, never from a clock or RNG, so identical authoring order always yields identical ids. Schema: `data/voxfmt/schema.md`. Authoring and interchange only until an engine consumer exists.
 
 ## Launcher contract
 

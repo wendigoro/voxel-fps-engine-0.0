@@ -7,7 +7,7 @@ Cell extent on Z always equals X and Y (no non-cubic voxels).
 {
   "unit": 1,
   "voxel_size": 0.001,
-  "mode": "model|sky|character|weapon|item",
+  "mode": "model|sky|character|weapon|item|map",
   "dims": [sx, sy, sz],
   "seg_u": 28,
   "seg_v": 14,
@@ -32,6 +32,50 @@ Cell extent on Z always equals X and Y (no non-cubic voxels).
 
 `item_*`/`armor_zone`/`pack_size` are item-mode only. `dims` is the painter work area; it is
 **not** the item footprint (see the item export below).
+
+## Map mode (`"mode": "map"`)
+
+Map mode is a `vox.json` carrying a cubic unit voxel grid **plus** authored entities. Entity
+coordinates are integer cell coordinates on that same grid, so a map rescales with
+`VOXEL_SIZE` alone — no separate map scale exists. All three sections are optional and are
+omitted entirely when empty, so "no section" means "none authored", never "empty list".
+
+```json
+{
+  "mode": "map",
+  "scripted_events": [
+    {"x":10,"y":1,"z":10,"id":"evt_1","name":"Test \"Event\"","script":"open_door.ps1",
+     "trigger":"on_signal","radius":2.000,"cooldown":20,"required_signal":"key_found",
+     "emit_signal":"door_open","condition":"count(\"kills\") > 0","repeat":3,"enabled":false}
+  ],
+  "npcs": [
+    {"x":15,"y":1,"z":15,"id":"npc_1","name":"Guard","type":"guard","ai_profile":"patrol",
+     "patrol_route":"route_1","health":120,"max_health":150,"speed":0.075,"view_dist":24.500,
+     "view_angle":110.0,"faction":"hostile","dialogue":"guard_taunt","inventory":"",
+     "static":true,"spawn_tick":120,"spawn_condition":"wave_2","enabled":true}
+  ],
+  "patrol_routes": [
+    {"id":"route_1","name":"Guard Patrol","loop":false,
+     "nodes":[{"x":15,"y":1,"z":15,"wait":2.00,"action":"idle"}]}
+  ]
+}
+```
+
+| Field | Notes |
+|-------|-------|
+| `trigger` | `on_enter`, `on_interact`, `on_timer`, `on_signal` |
+| `cooldown` | ticks, since `sim_hz` is fixed at 120 |
+| `repeat` | fire limit; absent means unlimited |
+| `ai_profile` | `static` or `patrol` |
+| `static` | NPC never moves regardless of `patrol_route` |
+| `speed`/`view_dist`/`view_angle` | authoring hints in cells and degrees |
+| `loop` | whether a patrol route wraps back to its first node |
+
+Entity `id`s are assigned per document in authoring order (`evt_1`, `npc_1`, `route_1`, …) so
+the same authoring order always produces the same ids. The writer escapes `"` and `\` in every
+string, and the reader unescapes them, so a quote in an event name survives a round trip.
+
+Map mode currently has no engine consumer: it is an authoring and interchange format only.
 
 ## Weapon parts (per-voxel `part` field)
 

@@ -108,6 +108,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         modeTabs.addTab("Character", modeCard(VoxDocument.Mode.CHARACTER));
         modeTabs.addTab("Weapon", modeCard(VoxDocument.Mode.WEAPON));
         modeTabs.addTab("Item", modeCard(VoxDocument.Mode.ITEM));
+        modeTabs.addTab("Map", modeCard(VoxDocument.Mode.MAP));
         modeTabs.addChangeListener(e -> {
             if (syncingTabs) return;
             int i = modeTabs.getSelectedIndex();
@@ -115,8 +116,9 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
                 case 1 -> VoxDocument.Mode.SKY;
                 case 2 -> VoxDocument.Mode.CHARACTER;
                 case 3 -> VoxDocument.Mode.WEAPON;
-                case 4 -> VoxDocument.Mode.ITEM;
-                default -> VoxDocument.Mode.MODEL;
+                  case 4 -> VoxDocument.Mode.ITEM;
+                  case 5 -> VoxDocument.Mode.MAP;
+                  default -> VoxDocument.Mode.MODEL;
             };
             if (model.document().mode != mode) {
                 int choice = JOptionPane.showConfirmDialog(
@@ -315,7 +317,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
     }
 
     private void onNew() {
-        Object[] opts = {"model", "sky", "character", "weapon", "item"};
+        Object[] opts = {"model", "sky", "character", "weapon", "item", "map"};
         Object pick = JOptionPane.showInputDialog(
                 this, "New document mode", "New", JOptionPane.QUESTION_MESSAGE,
                 null, opts, model.document().modeName());
@@ -477,6 +479,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
             case CHARACTER -> 2;
             case WEAPON -> 3;
             case ITEM -> 4;
+            case MAP -> 5;
             default -> 0;
         };
         if (modeTabs.getSelectedIndex() != idx) {

@@ -4,7 +4,7 @@ import java.util.Locale;
 
 /** In-memory .vox.json document. */
 public final class VoxDocument {
-public enum Mode { MODEL, SKY, CHARACTER, WEAPON, ITEM }
+public enum Mode { MODEL, SKY, CHARACTER, WEAPON, ITEM, MAP }
 
     public final int unit = VoxelGrid.UNIT;
     public final float voxelSize = VoxelGrid.VOXEL_SIZE;
@@ -26,6 +26,10 @@ public int feetX, feetY, feetZ;
     public String itemClass = "misc"; // see Items.CLASSES
     public String armorZone = "";     // head|chest|arms|legs (armor only)
     public int packSX, packSY, packSZ; // granted storage volume (backpack only)
+    // Map mode metadata: scripted events, NPCs and patrol routes. The grid is
+    // the map itself, still on the cubic unit grid. Entity coordinates are
+    // integer cell indices, never world-space floats.
+    public MapEntities.MapData mapData = new MapEntities.MapData();
 
     public VoxDocument(Mode mode, int sx, int sy, int sz) {
         this.mode = mode;
@@ -40,6 +44,7 @@ return switch (s.toLowerCase(Locale.ROOT)) {
             case "character" -> Mode.CHARACTER;
             case "weapon" -> Mode.WEAPON;
             case "item" -> Mode.ITEM;
+            case "map" -> Mode.MAP;
             default -> Mode.MODEL;
         };
     }
@@ -50,6 +55,7 @@ return switch (mode) {
             case CHARACTER -> "character";
             case WEAPON -> "weapon";
             case ITEM -> "item";
+            case MAP -> "map";
             default -> "model";
         };
     }

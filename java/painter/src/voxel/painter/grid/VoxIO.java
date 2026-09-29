@@ -46,6 +46,9 @@ if (doc.mode == VoxDocument.Mode.CHARACTER) {
             sb.append("  \"pack_size\": [").append(doc.packSX).append(", ")
                     .append(doc.packSY).append(", ").append(doc.packSZ).append("],\n");
         }
+        if (doc.mode == VoxDocument.Mode.MAP) {
+            saveMapEntities(sb, doc.mapData);
+        }
         sb.append("  \"voxels\": [\n");
         List<String> rows = new ArrayList<>();
         VoxelGrid g = doc.grid;
@@ -93,6 +96,9 @@ doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
         doc.armorZone = findString(text, "armor_zone", doc.armorZone);
         int[] pack = findIntArray(text, "pack_size", new int[]{0, 0, 0});
         doc.packSX = pack[0]; doc.packSY = pack[1]; doc.packSZ = pack[2];
+        if (doc.mode == VoxDocument.Mode.MAP) {
+            loadMapEntities(text, doc.mapData);
+        }
 
         Matcher vm = Pattern.compile(
                 "\\{\\s*\"x\"\\s*:\\s*(\\d+)\\s*,\\s*\"y\"\\s*:\\s*(\\d+)\\s*,\\s*\"z\"\\s*:\\s*(\\d+)\\s*,\\s*\"mat\"\\s*:\\s*\"([^\"]+)\"\\s*,\\s*\"rgb\"\\s*:\\s*(\\d+)(?:\\s*,\\s*\"part\"\\s*:\\s*\"([^\"]+)\")?\\s*\\}")
@@ -108,6 +114,266 @@ doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
         }
         doc.grid.assertCubicUnitInvariant();
         return doc;
+    }
+
+    // ---- MAP mode serialization --------------------------------------------
+    // Map entities live in the same .vox.json file as the voxel grid, in three
+    // optional sections emitted before "voxels": scripted_events, npcs and
+    // patrol_routes. Each section is omitted when its list is empty.
+
+    /** A JSON string value, tolerant of backslash escapes written by appendEscaped. */
+    /**
+     * One JSON string, capture group included, quotes NOT included in the capture.
+     * The trailing quote is part of the pattern: the body alternation stops at an
+     * unescaped quote, so without it every string field failed to match.
+     */
+    private static final String JSON_STR = "\"((?:[^\"\\\\]|\\\\.)*)\"";
+    /** A JSON number we emit: optional sign, integer part, optional fraction. */
+    private static final String JSON_NUM = "(-?\\d+(?:\\.\\d+)?)";
+
+    /** Append a quoted, escaped JSON string. */
+    private static void appendEscaped(StringBuilder sb, String s) {
+        if (s == null) { sb.append("\"\""); return; }
+        sb.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                case '\b' -> sb.append("\\b");
+                case '\f' -> sb.append("\\f");
+                default -> {
+                    if (c < 0x20) sb.append(String.format(Locale.ROOT, "\\u%04x", (int) c));
+                    else sb.append(c);
+                }
+            }
+        }
+        sb.append('"');
+    }
+
+    /** Reverse of appendEscaped, so round-tripped names keep their punctuation. */
+    private static String unescape(String s) {
+        if (s == null || s.indexOf('\\') < 0) return s;
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c != '\\' || i + 1 >= s.length()) { sb.append(c); continue; }
+            char n = s.charAt(++i);
+            switch (n) {
+                case 'n' -> sb.append('\n');
+                case 'r' -> sb.append('\r');
+                case 't' -> sb.append('\t');
+                case 'b' -> sb.append('\b');
+                case 'f' -> sb.append('\f');
+                case 'u' -> {
+                    if (i + 4 < s.length()) {
+                        sb.append((char) Integer.parseInt(s.substring(i + 1, i + 5), 16));
+                        i += 4;
+                    } else {
+                        sb.append(n);
+                    }
+                }
+                default -> sb.append(n);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void saveMapEntities(StringBuilder sb, MapEntities.MapData mapData) {
+        if (!mapData.events.isEmpty()) {
+            sb.append("  \"scripted_events\": [\n");
+            List<String> eventRows = new ArrayList<>();
+            for (MapEntities.ScriptedEvent e : mapData.events) {
+                StringBuilder esb = new StringBuilder();
+                esb.append("    {\"x\":").append(e.x)
+                        .append(",\"y\":").append(e.y)
+                        .append(",\"z\":").append(e.z);
+                appendEscaped(esb.append(",\"id\":"), e.id);
+                appendEscaped(esb.append(",\"name\":"), e.name);
+                appendEscaped(esb.append(",\"script\":"), e.scriptName);
+                appendEscaped(esb.append(",\"trigger\":"), e.triggerType);
+                esb.append(",\"radius\":").append(String.format(Locale.ROOT, "%.3f", e.radius))
+                        .append(",\"cooldown\":").append(e.cooldownTicks);
+                appendEscaped(esb.append(",\"required_signal\":"), e.requiredSignal);
+                appendEscaped(esb.append(",\"emit_signal\":"), e.emitSignal);
+                appendEscaped(esb.append(",\"condition\":"), e.condition);
+                esb.append(",\"repeat\":").append(e.repeatLimit)
+                        .append(",\"enabled\":").append(e.enabled);
+                esb.append("}");
+                eventRows.add(esb.toString());
+            }
+            sb.append(String.join(",\n", eventRows));
+            sb.append("\n  ],\n");
+        }
+        if (!mapData.npcs.isEmpty()) {
+            sb.append("  \"npcs\": [\n");
+            List<String> npcRows = new ArrayList<>();
+            for (MapEntities.Npc n : mapData.npcs) {
+                StringBuilder nsb = new StringBuilder();
+                nsb.append("    {\"x\":").append(n.x)
+                        .append(",\"y\":").append(n.y)
+                        .append(",\"z\":").append(n.z);
+                appendEscaped(nsb.append(",\"id\":"), n.id);
+                appendEscaped(nsb.append(",\"name\":"), n.name);
+                appendEscaped(nsb.append(",\"type\":"), n.npcType);
+                appendEscaped(nsb.append(",\"ai_profile\":"), n.aiProfile);
+                appendEscaped(nsb.append(",\"patrol_route\":"), n.patrolRouteId);
+                nsb.append(",\"health\":").append(n.health)
+                        .append(",\"max_health\":").append(n.maxHealth)
+                        .append(",\"speed\":").append(String.format(Locale.ROOT, "%.3f", n.moveSpeed))
+                        .append(",\"view_dist\":").append(String.format(Locale.ROOT, "%.3f", n.viewDistance))
+                        .append(",\"view_angle\":").append(String.format(Locale.ROOT, "%.1f", n.viewAngle));
+                appendEscaped(nsb.append(",\"faction\":"), n.faction);
+                appendEscaped(nsb.append(",\"dialogue\":"), n.dialogueId);
+                appendEscaped(nsb.append(",\"inventory\":"), n.inventoryJson);
+                nsb.append(",\"static\":").append(n.isStatic)
+                        .append(",\"spawn_tick\":").append(n.spawnTick);
+                appendEscaped(nsb.append(",\"spawn_condition\":"), n.spawnCondition);
+                nsb.append(",\"enabled\":").append(n.enabled);
+                nsb.append("}");
+                npcRows.add(nsb.toString());
+            }
+            sb.append(String.join(",\n", npcRows));
+            sb.append("\n  ],\n");
+        }
+        if (!mapData.patrolRoutes.isEmpty()) {
+            sb.append("  \"patrol_routes\": [\n");
+            List<String> routeRows = new ArrayList<>();
+            for (MapEntities.PatrolRoute r : mapData.patrolRoutes) {
+                StringBuilder rsb = new StringBuilder();
+                appendEscaped(rsb.append("    {\"id\":"), r.id);
+                appendEscaped(rsb.append(",\"name\":"), r.name);
+                rsb.append(",\"loop\":").append(r.loop);
+                rsb.append(",\"nodes\":[");
+                List<String> nodeRows = new ArrayList<>();
+                for (MapEntities.PatrolNode node : r.nodes) {
+                    StringBuilder nodeSb = new StringBuilder();
+                    nodeSb.append("{\"x\":").append(node.x)
+                            .append(",\"y\":").append(node.y)
+                            .append(",\"z\":").append(node.z)
+                            .append(",\"wait\":").append(String.format(Locale.ROOT, "%.2f", node.waitTime));
+                    appendEscaped(nodeSb.append(",\"action\":"), node.action);
+                    nodeSb.append("}");
+                    nodeRows.add(nodeSb.toString());
+                }
+                rsb.append(String.join(",", nodeRows));
+                rsb.append("]}");
+                routeRows.add(rsb.toString());
+            }
+            sb.append(String.join(",\n", routeRows));
+            sb.append("\n  ],\n");
+        }
+    }
+
+    private static void loadMapEntities(String text, MapEntities.MapData mapData) {
+        Matcher eventMatcher = Pattern.compile(
+                "\\{\\s*\"x\"\\s*:\\s*(-?\\d+)\\s*,\\s*\"y\"\\s*:\\s*(-?\\d+)\\s*,\\s*\"z\"\\s*:\\s*(-?\\d+)\\s*,"
+                        + "\\s*\"id\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"name\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"script\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"trigger\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"radius\"\\s*:\\s*" + JSON_NUM + "\\s*,"
+                        + "\\s*\"cooldown\"\\s*:\\s*(-?\\d+)\\s*,"
+                        + "\\s*\"required_signal\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"emit_signal\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"condition\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"repeat\"\\s*:\\s*(-?\\d+)\\s*,"
+                        + "\\s*\"enabled\"\\s*:\\s*(true|false)\\s*\\}")
+                .matcher(text);
+        while (eventMatcher.find()) {
+            MapEntities.ScriptedEvent e = new MapEntities.ScriptedEvent(
+                    Integer.parseInt(eventMatcher.group(1)),
+                    Integer.parseInt(eventMatcher.group(2)),
+                    Integer.parseInt(eventMatcher.group(3)),
+                    unescape(eventMatcher.group(4)),
+                    unescape(eventMatcher.group(5)),
+                    unescape(eventMatcher.group(6)));
+            e.triggerType = unescape(eventMatcher.group(7));
+            e.radius = Float.parseFloat(eventMatcher.group(8));
+            e.cooldownTicks = Integer.parseInt(eventMatcher.group(9));
+            e.requiredSignal = unescape(eventMatcher.group(10));
+            e.emitSignal = unescape(eventMatcher.group(11));
+            e.condition = unescape(eventMatcher.group(12));
+            e.repeatLimit = Integer.parseInt(eventMatcher.group(13));
+            e.enabled = Boolean.parseBoolean(eventMatcher.group(14));
+            mapData.addEvent(e);
+        }
+
+        Matcher npcMatcher = Pattern.compile(
+                "\\{\\s*\"x\"\\s*:\\s*(-?\\d+)\\s*,\\s*\"y\"\\s*:\\s*(-?\\d+)\\s*,\\s*\"z\"\\s*:\\s*(-?\\d+)\\s*,"
+                        + "\\s*\"id\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"name\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"type\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"ai_profile\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"patrol_route\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"health\"\\s*:\\s*(-?\\d+)\\s*,"
+                        + "\\s*\"max_health\"\\s*:\\s*(-?\\d+)\\s*,"
+                        + "\\s*\"speed\"\\s*:\\s*" + JSON_NUM + "\\s*,"
+                        + "\\s*\"view_dist\"\\s*:\\s*" + JSON_NUM + "\\s*,"
+                        + "\\s*\"view_angle\"\\s*:\\s*" + JSON_NUM + "\\s*,"
+                        + "\\s*\"faction\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"dialogue\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"inventory\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"static\"\\s*:\\s*(true|false)\\s*,"
+                        + "\\s*\"spawn_tick\"\\s*:\\s*(-?\\d+)\\s*,"
+                        + "\\s*\"spawn_condition\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"enabled\"\\s*:\\s*(true|false)\\s*\\}")
+                .matcher(text);
+        while (npcMatcher.find()) {
+            MapEntities.Npc n = new MapEntities.Npc(
+                    Integer.parseInt(npcMatcher.group(1)),
+                    Integer.parseInt(npcMatcher.group(2)),
+                    Integer.parseInt(npcMatcher.group(3)),
+                    unescape(npcMatcher.group(4)),
+                    unescape(npcMatcher.group(5)),
+                    unescape(npcMatcher.group(6)));
+            n.aiProfile = unescape(npcMatcher.group(7));
+            n.patrolRouteId = unescape(npcMatcher.group(8));
+            n.health = Integer.parseInt(npcMatcher.group(9));
+            n.maxHealth = Integer.parseInt(npcMatcher.group(10));
+            n.moveSpeed = Float.parseFloat(npcMatcher.group(11));
+            n.viewDistance = Float.parseFloat(npcMatcher.group(12));
+            n.viewAngle = Float.parseFloat(npcMatcher.group(13));
+            n.faction = unescape(npcMatcher.group(14));
+            n.dialogueId = unescape(npcMatcher.group(15));
+            n.inventoryJson = unescape(npcMatcher.group(16));
+            n.isStatic = Boolean.parseBoolean(npcMatcher.group(17));
+            n.spawnTick = Integer.parseInt(npcMatcher.group(18));
+            n.spawnCondition = unescape(npcMatcher.group(19));
+            n.enabled = Boolean.parseBoolean(npcMatcher.group(20));
+            n.currentHealth = n.health;
+            mapData.addNpc(n);
+        }
+
+        Matcher routeMatcher = Pattern.compile(
+                "\\{\\s*\"id\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"name\"\\s*:\\s*" + JSON_STR + "\\s*,"
+                        + "\\s*\"loop\"\\s*:\\s*(true|false)\\s*,"
+                        + "\\s*\"nodes\"\\s*:\\s*\\[(.*?)\\]\\s*\\}")
+                .matcher(text);
+        while (routeMatcher.find()) {
+            MapEntities.PatrolRoute route = new MapEntities.PatrolRoute(
+                    unescape(routeMatcher.group(1)), unescape(routeMatcher.group(2)));
+            route.loop = Boolean.parseBoolean(routeMatcher.group(3));
+            Matcher nodeMatcher = Pattern.compile(
+                    "\\{\\s*\"x\"\\s*:\\s*(-?\\d+)\\s*,\\s*\"y\"\\s*:\\s*(-?\\d+)\\s*,"
+                            + "\\s*\"z\"\\s*:\\s*(-?\\d+)\\s*,"
+                            + "\\s*\"wait\"\\s*:\\s*" + JSON_NUM + "\\s*,"
+                            + "\\s*\"action\"\\s*:\\s*" + JSON_STR + "\\s*\\}")
+                    .matcher(routeMatcher.group(4));
+            while (nodeMatcher.find()) {
+                route.addNode(new MapEntities.PatrolNode(
+                        Integer.parseInt(nodeMatcher.group(1)),
+                        Integer.parseInt(nodeMatcher.group(2)),
+                        Integer.parseInt(nodeMatcher.group(3)),
+                        Float.parseFloat(nodeMatcher.group(4)),
+                        unescape(nodeMatcher.group(5))));
+            }
+            mapData.addPatrolRoute(route);
+        }
     }
 
     private static String findString(String text, String key, String def) {

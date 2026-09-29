@@ -52,6 +52,15 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
     private final JButton bakeItem;
     private final JButton exportItem;
     private final Runnable requestItemExport;
+    // Map mode. Placement controls for the entity tools; the map grid itself is
+    // painted with the normal voxel tools, and entities are dropped on cells.
+    private final JPanel mapRow;
+    private final JTextField eventScriptField;
+    private final JComboBox<String> eventTriggerCombo;
+    private final JTextField npcTypeField;
+    private final JTextField npcAiProfileField;
+    private final JLabel mapInfo;
+    private final JButton bakeMap;
     private boolean syncing;
 
     public ModeExtrasPanel(PainterModel model) {
@@ -162,6 +171,27 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         itemRow.add(itemInfo);
         c.gridy = 4;
         add(itemRow, c);
+
+        mapRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        mapRow.setOpaque(false);
+        mapRow.add(dim("script"));
+        eventScriptField = new JTextField(22);
+        mapRow.add(eventScriptField);
+        mapRow.add(dim("trigger"));
+        eventTriggerCombo = new JComboBox<>(new String[]{"on_enter", "on_interact", "on_timer", "on_signal"});
+        mapRow.add(eventTriggerCombo);
+        mapRow.add(dim("npc"));
+        npcTypeField = new JTextField(10);
+        mapRow.add(npcTypeField);
+        mapRow.add(dim("ai"));
+        npcAiProfileField = new JTextField(10);
+        mapRow.add(npcAiProfileField);
+        mapInfo = new JLabel(" ");
+        mapInfo.setForeground(PainterTheme.modeColor(VoxDocument.Mode.MAP));
+        mapInfo.setFont(PainterTheme.monoFont());
+        mapRow.add(mapInfo);
+        c.gridy = 5;
+        add(mapRow, c);
         c.gridwidth = 1;
 
         bakeSky = new JButton("Bake sky tiles");
@@ -190,6 +220,14 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             push();
             if (requestItemExport != null) requestItemExport.run();
         });
+        bakeMap = new JButton("Bake starter arena");
+        bakeMap.addActionListener(e -> {
+            push();
+            VoxDocument doc = model.document();
+            doc.grid.clear();
+            PainterModel.seedMap(doc);
+            model.markDirty();
+        });
 
         JPanel bakes = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         bakes.setOpaque(false);
@@ -198,7 +236,8 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         bakes.add(bakeWeapon);
         bakes.add(bakeItem);
         bakes.add(exportItem);
-        c.gridy = 5;
+        bakes.add(bakeMap);
+        c.gridy = 6;
         c.gridx = 0;
         c.gridwidth = 8;
         add(bakes, c);
@@ -231,6 +270,22 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             if (syncing) return;
             model.setItemName(itemName.getText().trim());
             push();
+        });
+        eventScriptField.addActionListener(e -> {
+            if (syncing) return;
+            model.setPendingEventScript(eventScriptField.getText().trim());
+        });
+        npcTypeField.addActionListener(e -> {
+            if (syncing) return;
+            model.setPendingNpcType(npcTypeField.getText().trim());
+        });
+        npcAiProfileField.addActionListener(e -> {
+            if (syncing) return;
+            model.setPendingNpcAiProfile(npcAiProfileField.getText().trim());
+        });
+        eventTriggerCombo.addActionListener(e -> {
+            if (syncing) return;
+            model.setPendingEventTrigger((String) eventTriggerCombo.getSelectedItem());
         });
 
         for (JSpinner s : new JSpinner[] {segU, segV, moonX, moonY, moonZ, moonI, feetX, feetY, feetZ,
@@ -266,6 +321,14 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             model.setItemId(itemId.getText().trim());
             model.setItemName(itemName.getText().trim());
         }
+        // Same guard for map mode: the placement fields describe the NEXT entity
+        // to drop, not the map, so they must never be written onto the document.
+        if (doc.mode == VoxDocument.Mode.MAP) {
+            model.setPendingEventScript(eventScriptField.getText().trim());
+            model.setPendingEventTrigger((String) eventTriggerCombo.getSelectedItem());
+            model.setPendingNpcType(npcTypeField.getText().trim());
+            model.setPendingNpcAiProfile(npcAiProfileField.getText().trim());
+        }
         doc.segU = (Integer) segU.getValue();
         doc.segV = (Integer) segV.getValue();
         doc.moonDirX = ((Number) moonX.getValue()).floatValue();
@@ -286,6 +349,7 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             boolean character = doc.mode == VoxDocument.Mode.CHARACTER;
             boolean weapon = doc.mode == VoxDocument.Mode.WEAPON;
             boolean item = doc.mode == VoxDocument.Mode.ITEM;
+            boolean map = doc.mode == VoxDocument.Mode.MAP;
 
             if (item) {
                 // The canvas is only a work area; the engine charges for the tight
@@ -327,6 +391,17 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
                         doc.itemClass, doc.grid.solidCount());
             }
 
+            if (map) {
+                mapInfo.setText(String.format(
+                        "events=%d  npcs=%d  routes=%d",
+                        doc.mapData.events.size(), doc.mapData.npcs.size(),
+                        doc.mapData.patrolRoutes.size()));
+                String sel = model.selectedEntity();
+                if (!sel.isEmpty()) mapInfo.setText(mapInfo.getText() + "  sel=" + sel);
+            } else {
+                mapInfo.setText(" ");
+            }
+
             modeLabel.setText(
                     "Active: " + PainterTheme.modeTitle(doc.mode)
                             + "   unit=" + doc.unit
@@ -359,11 +434,13 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             charRow.setVisible(character);
             weaponRow.setVisible(weapon);
             itemRow.setVisible(item);
+            mapRow.setVisible(map);
             bakeSky.setEnabled(sky);
             bakeChar.setEnabled(character);
             bakeWeapon.setVisible(true);
             bakeItem.setVisible(item);
             exportItem.setVisible(item);
+            bakeMap.setVisible(map);
         } finally {
             syncing = false;
         }
@@ -377,7 +454,8 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
     @Override
     public void toolsChanged() {
         VoxDocument.Mode m = model.document().mode;
-        if (m == VoxDocument.Mode.WEAPON || m == VoxDocument.Mode.ITEM) pull();
+        if (m == VoxDocument.Mode.WEAPON || m == VoxDocument.Mode.ITEM
+                || m == VoxDocument.Mode.MAP) pull();
     }
 
     @Override
