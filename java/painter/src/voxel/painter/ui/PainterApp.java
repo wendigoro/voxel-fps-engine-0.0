@@ -54,11 +54,12 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         setMinimumSize(new Dimension(1100, 720));
         setJMenuBar(buildMenu());
 
-        JPanel center = new JPanel(new BorderLayout(6, 6));
-modeTabs.addTab("Model", modePlaceholder(VoxDocument.Mode.MODEL));
+JPanel center = new JPanel(new BorderLayout(6, 6));
+        modeTabs.addTab("Model", modePlaceholder(VoxDocument.Mode.MODEL));
         modeTabs.addTab("Sky tiles/background", modePlaceholder(VoxDocument.Mode.SKY));
         modeTabs.addTab("Character", modePlaceholder(VoxDocument.Mode.CHARACTER));
         modeTabs.addTab("Weapon", modePlaceholder(VoxDocument.Mode.WEAPON));
+        modeTabs.addTab("Map", modePlaceholder(VoxDocument.Mode.MAP));
         modeTabs.addChangeListener(e -> {
             if (syncingTabs) return;
             int i = modeTabs.getSelectedIndex();
@@ -66,6 +67,7 @@ modeTabs.addTab("Model", modePlaceholder(VoxDocument.Mode.MODEL));
                 case 1 -> VoxDocument.Mode.SKY;
                 case 2 -> VoxDocument.Mode.CHARACTER;
                 case 3 -> VoxDocument.Mode.WEAPON;
+                case 4 -> VoxDocument.Mode.MAP;
                 default -> VoxDocument.Mode.MODEL;
             };
             if (model.document().mode != mode) {
@@ -79,6 +81,9 @@ modeTabs.addTab("Model", modePlaceholder(VoxDocument.Mode.MODEL));
                     if (mode == VoxDocument.Mode.SKY) {
                         model.setSliceAxis(PainterModel.SliceAxis.Y);
                         model.setSliceIndex(0);
+                    } else if (mode == VoxDocument.Mode.MAP) {
+                        model.setSliceAxis(PainterModel.SliceAxis.Y);
+                        model.setSliceIndex(1);
                     }
                 } else {
                     syncModeTab();
@@ -192,8 +197,8 @@ file.add(item("Export 32× bitcrush preview…", null, this::onExportPreview));
         scripts.runScript(script, args);
     }
 
-    private void onNew() {
-Object[] opts = {"model", "sky", "character", "weapon"};
+private void onNew() {
+        Object[] opts = {"model", "sky", "character", "weapon", "map"};
         Object pick = JOptionPane.showInputDialog(
                 this, "New document mode", "New", JOptionPane.QUESTION_MESSAGE,
                 null, opts, model.document().modeName());
@@ -323,6 +328,7 @@ private void syncModeTab() {
             case SKY -> 1;
             case CHARACTER -> 2;
             case WEAPON -> 3;
+            case MAP -> 4;
             default -> 0;
         };
         if (modeTabs.getSelectedIndex() != idx) {

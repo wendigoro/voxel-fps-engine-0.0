@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import voxel.painter.grid.MaterialPalette;
+import voxel.painter.grid.MapEntities;
 import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.SkyAndCharacter;
 import voxel.painter.grid.VoxDocument;
@@ -21,7 +22,7 @@ public final class PainterModel {
 
     public enum SliceAxis { X, Y, Z }
 
-    public enum UiTool { BRUSH, FILL, STRETCH, DROPPER, LINE }
+    public enum UiTool { BRUSH, FILL, STRETCH, DROPPER, LINE, PLACE_EVENT, PLACE_NPC, SELECT_ENTITY }
 
     private final List<Listener> listeners = new CopyOnWriteArrayList<>();
     private final PaintTools tools = new PaintTools();
@@ -73,6 +74,7 @@ public void newDocument(VoxDocument.Mode mode) {
             case SKY -> new VoxDocument(VoxDocument.Mode.SKY, 28, 1, 14);
             case CHARACTER -> new VoxDocument(VoxDocument.Mode.CHARACTER, 24, 16, 12);
             case WEAPON -> new VoxDocument(VoxDocument.Mode.WEAPON, 24, 12, 12);
+            case MAP -> new VoxDocument(VoxDocument.Mode.MAP, 64, 32, 64);
             default -> new VoxDocument(VoxDocument.Mode.MODEL, 32, 24, 32);
         };
         if (mode == VoxDocument.Mode.SKY) {
@@ -86,11 +88,107 @@ public void newDocument(VoxDocument.Mode mode) {
             doc.ammoId = "medium_fmj";
             WeaponParts.paintStarterRifle(doc.grid);
             tools.activePart = WeaponParts.BARREL;
+        } else if (mode == VoxDocument.Mode.MAP) {
+            seedMap(doc);
         } else {
             seedDemo(doc);
         }
         setDocument(doc, null, true);
     }
+
+    public static void seedMap(VoxDocument doc) {
+        VoxelGrid g = doc.grid;
+        int cx = g.sizeX() / 2, cy = 1, cz = g.sizeZ() / 2;
+        // Simple floor
+        for (int z = 0; z < g.sizeZ(); z++)
+            for (int x = 0; x < g.sizeX(); x++)
+                g.setMat(x, 0, z, MaterialPalette.CONCRETE);
+        // Walls
+        for (int y = 1; y < 8; y++) {
+            for (int x = 0; x < g.sizeX(); x++) {
+                g.setMat(x, y, 0, MaterialPalette.SHEET_METAL);
+                g.setMat(x, y, g.sizeZ() - 1, MaterialPalette.SHEET_METAL);
+            }
+            for (int z = 0; z < g.sizeZ(); z++) {
+                g.setMat(0, y, z, MaterialPalette.SHEET_METAL);
+                g.setMat(g.sizeX() - 1, y, z, MaterialPalette.SHEET_METAL);
+            }
+        }
+        // Some crates
+        for (int i = 0; i < 3; i++) {
+            int bx = cx + (i - 1) * 10;
+            int bz = cz + (i - 1) * 8;
+            for (int z = bz; z < bz + 4; z++)
+                for (int y = 1; y < 5; y++)
+                    for (int x = bx; x < bx + 4; x++)
+                        g.setMat(x, y, z, MaterialPalette.WOOD);
+        }
+    }
+
+    // Map entity placement
+    private String pendingEventScript = "trigger_door_open.ps1";
+    private String pendingEventTrigger = "on_enter";
+    private String pendingNpcType = "guard";
+    private String pendingNpcAiProfile = "patrol";
+
+    public String pendingEventScript() { return pendingEventScript; }
+    public void setPendingEventScript(String s) { pendingEventScript = s; }
+    public String pendingEventTrigger() { return pendingEventTrigger; }
+    public void setPendingEventTrigger(String s) { pendingEventTrigger = s; }
+    public String pendingNpcType() { return pendingNpcType; }
+    public void setPendingNpcType(String s) { pendingNpcType = s; }
+    public String pendingNpcAiProfile() { return pendingNpcAiProfile; }
+    public void setPendingNpcAiProfile(String s) { pendingNpcAiProfile = s; }
+
+    public void placeScriptedEvent(int x, int y, int z) {
+        if (document.mode != VoxDocument.Mode.MAP) return;
+        if (!grid().inBounds(x, y, z)) return;
+        MapEntities.ScriptedEvent e = new MapEntities.ScriptedEvent(
+                x, y, z,
+                MapEntities.generateId("evt"),
+                "Event " + (document.mapData.events.size() + 1),
+                pendingEventScript);
+        e.triggerType = pendingEventTrigger;
+        document.mapData.addEvent(e);
+        markDirty();
+    }
+
+    public void placeNpc(int x, int y, int z) {
+        if (document.mode != VoxDocument.Mode.MAP) return;
+        if (!grid().inBounds(x, y, z)) return;
+        MapEntities.Npc n = new MapEntities.Npc(
+                x, y, z,
+                MapEntities.generateId("npc"),
+                "NPC " + (document.mapData.npcs.size() + 1),
+                pendingNpcType);
+        n.aiProfile = pendingNpcAiProfile;
+        document.mapData.addNpc(n);
+        markDirty();
+    }
+
+    public void removeEntityAt(int x, int y, int z) {
+        if (document.mode != VoxDocument.Mode.MAP) return;
+        MapEntities.MapData md = document.mapData;
+        md.events.removeIf(e -> e.x == x && e.y == y && e.z == z);
+        md.npcs.removeIf(n -> n.x == x && n.y == y && n.z == z);
+        markDirty();
+    }
+
+    public MapEntities.ScriptedEvent findEventAt(int x, int y, int z) {
+        for (MapEntities.ScriptedEvent e : document.mapData.events) {
+            if (e.x == x && e.y == y && e.z == z) return e;
+        }
+        return null;
+    }
+
+    public MapEntities.Npc findNpcAt(int x, int y, int z) {
+        for (MapEntities.Npc n : document.mapData.npcs) {
+            if (n.x == x && n.y == y && n.z == z) return n;
+        }
+        return null;
+    }
+
+    public MapEntities.MapData mapData() { return document.mapData; }
 
     public void setActivePart(int partId) {
         tools.activePart = partId;
@@ -252,6 +350,11 @@ public void newDocument(VoxDocument.Mode mode) {
         }
 
         if (erase) {
+            if (document.mode == VoxDocument.Mode.MAP &&
+                    (uiTool == UiTool.PLACE_EVENT || uiTool == UiTool.PLACE_NPC || uiTool == UiTool.SELECT_ENTITY)) {
+                removeEntityAt(x, y, z);
+                return;
+            }
             int saveMat = tools.activeMat();
             int saveRgb = tools.activeRgb();
             boolean useB = tools.useB;
@@ -291,22 +394,30 @@ public void newDocument(VoxDocument.Mode mode) {
                     markDirty();
                 }
             }
+            case PLACE_EVENT -> { placeScriptedEvent(x, y, z); }
+            case PLACE_NPC -> { placeNpc(x, y, z); }
+            case SELECT_ENTITY -> { /* Selection handled by UI */ }
             default -> { tools.paintAt(g, x, y, z); markDirty(); }
         }
     }
 
-    public String statusLine() {
+public String statusLine() {
         List<String> bits = new ArrayList<>();
         bits.add(document.modeName());
         bits.add(uiTool.name().toLowerCase());
         bits.add(tools.shape.name().toLowerCase());
         bits.add("size=" + tools.brushSize);
-bits.add("mat=" + MaterialPalette.nameFromId(tools.activeMat()) + (tools.useB ? "(B)" : "(A)"));
+        bits.add("mat=" + MaterialPalette.nameFromId(tools.activeMat()) + (tools.useB ? "(B)" : "(A)"));
         if (document.mode == VoxDocument.Mode.WEAPON) {
             bits.add("part=" + WeaponParts.name(tools.activePart));
             bits.add("cal=" + document.caliber);
             WeaponParts.Stats st = WeaponParts.compose(document.grid, document.caliber);
             bits.add(String.format("dmg=%.1f imp=%.1f rec=%.1f hnd=%.1f w=%.1f", st.damage, st.impact, st.recoil, st.handling, st.weight));
+        }
+        if (document.mode == VoxDocument.Mode.MAP) {
+            bits.add("events=" + document.mapData.events.size());
+            bits.add("npcs=" + document.mapData.npcs.size());
+            bits.add("routes=" + document.mapData.patrolRoutes.size());
         }
         bits.add("slice=" + sliceAxis + ":" + sliceIndex);
         bits.add("unit=" + grid().unitSizeX() + "=" + grid().unitSizeY() + "=" + grid().unitSizeZ());

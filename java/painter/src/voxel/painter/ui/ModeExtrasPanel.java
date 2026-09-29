@@ -4,12 +4,18 @@ import java.awt.FlowLayout;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
 import javax.swing.BorderFactory;
+import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JSpinner;
+import javax.swing.JTextField;
 import javax.swing.SpinnerNumberModel;
+import voxel.painter.grid.MapEntities;
 import voxel.painter.grid.SkyAndCharacter;
 import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxelGrid;
@@ -20,6 +26,14 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
     private final JSpinner segV;
     private final JSpinner moonX, moonY, moonZ, moonI;
     private final JSpinner feetX, feetY, feetZ;
+
+    // Map mode controls
+    private final JTextField eventScriptField;
+    private final JComboBox<String> eventTriggerCombo;
+    private final JTextField npcTypeField;
+    private final JTextField npcAiProfileField;
+    private final JLabel mapInfoLabel;
+
     private final JLabel modeLabel;
     private boolean syncing;
 
@@ -111,6 +125,49 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         c.gridx = 4;
         add(bakeWeapon, c);
 
+        // Map mode controls
+        c.gridy = 5;
+        c.gridx = 0;
+        add(new JLabel("Event script"), c);
+        eventScriptField = new JTextField(model.pendingEventScript(), 18);
+        eventScriptField.addActionListener(e -> model.setPendingEventScript(eventScriptField.getText()));
+        c.gridx = 1;
+        c.gridwidth = 3;
+        add(eventScriptField, c);
+        c.gridwidth = 1;
+
+        c.gridy = 6;
+        c.gridx = 0;
+        add(new JLabel("Event trigger"), c);
+        eventTriggerCombo = new JComboBox<>(new String[]{"on_enter", "on_interact", "on_timer", "on_signal"});
+        eventTriggerCombo.setSelectedItem(model.pendingEventTrigger());
+        eventTriggerCombo.addActionListener(e -> model.setPendingEventTrigger((String) eventTriggerCombo.getSelectedItem()));
+        c.gridx = 1;
+        c.gridwidth = 2;
+        add(eventTriggerCombo, c);
+        c.gridwidth = 1;
+
+        c.gridy = 7;
+        c.gridx = 0;
+        add(new JLabel("NPC type"), c);
+        npcTypeField = new JTextField(model.pendingNpcType(), 12);
+        npcTypeField.addActionListener(e -> model.setPendingNpcType(npcTypeField.getText()));
+        c.gridx = 1;
+        add(npcTypeField, c);
+        c.gridx = 2;
+        add(new JLabel("AI profile"), c);
+        npcAiProfileField = new JTextField(model.pendingNpcAiProfile(), 12);
+        npcAiProfileField.addActionListener(e -> model.setPendingNpcAiProfile(npcAiProfileField.getText()));
+        c.gridx = 3;
+        add(npcAiProfileField, c);
+
+        c.gridy = 8;
+        c.gridx = 0;
+        c.gridwidth = 6;
+        mapInfoLabel = new JLabel();
+        add(mapInfoLabel, c);
+        c.gridwidth = 1;
+
         for (JSpinner s : new JSpinner[] {segU, segV, moonX, moonY, moonZ, moonI, feetX, feetY, feetZ}) {
             s.addChangeListener(ev -> push());
         }
@@ -130,6 +187,10 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         doc.feetX = (Integer) feetX.getValue();
         doc.feetY = (Integer) feetY.getValue();
         doc.feetZ = (Integer) feetZ.getValue();
+        model.setPendingEventScript(eventScriptField.getText());
+        model.setPendingEventTrigger((String) eventTriggerCombo.getSelectedItem());
+        model.setPendingNpcType(npcTypeField.getText());
+        model.setPendingNpcAiProfile(npcAiProfileField.getText());
         model.markDirty();
     }
 
@@ -140,6 +201,8 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             String extra = "";
             if (doc.mode == VoxDocument.Mode.WEAPON) {
                 extra = " cal=" + doc.caliber + " ammo=" + doc.ammoId;
+            } else if (doc.mode == VoxDocument.Mode.MAP) {
+                extra = " events=" + doc.mapData.events.size() + " npcs=" + doc.mapData.npcs.size();
             }
             modeLabel.setText(
                     "Active: " + doc.modeName()
@@ -156,8 +219,10 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             feetX.setValue(doc.feetX);
             feetY.setValue(doc.feetY);
             feetZ.setValue(doc.feetZ);
+
             boolean sky = doc.mode == VoxDocument.Mode.SKY;
             boolean character = doc.mode == VoxDocument.Mode.CHARACTER;
+            boolean map = doc.mode == VoxDocument.Mode.MAP;
             segU.setEnabled(sky);
             segV.setEnabled(sky);
             moonX.setEnabled(sky);
@@ -167,6 +232,20 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             feetX.setEnabled(character);
             feetY.setEnabled(character);
             feetZ.setEnabled(character);
+            eventScriptField.setEnabled(map);
+            eventTriggerCombo.setEnabled(map);
+            npcTypeField.setEnabled(map);
+            npcAiProfileField.setEnabled(map);
+
+            if (map) {
+                eventScriptField.setText(model.pendingEventScript());
+                eventTriggerCombo.setSelectedItem(model.pendingEventTrigger());
+                npcTypeField.setText(model.pendingNpcType());
+                npcAiProfileField.setText(model.pendingNpcAiProfile());
+                mapInfoLabel.setText("Events: " + doc.mapData.events.size() + " | NPCs: " + doc.mapData.npcs.size() + " | Patrol routes: " + doc.mapData.patrolRoutes.size());
+            } else {
+                mapInfoLabel.setText("");
+            }
         } finally {
             syncing = false;
         }

@@ -1,6 +1,7 @@
 package voxel.painter;
 
 import voxel.painter.filter.BitcrushUpscale;
+import voxel.painter.grid.MapEntities;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.SkyAndCharacter;
@@ -89,6 +90,49 @@ public final class SmokeMain {
         VoxIO.save(character, charPath);
         if (character.grid.solidCount() < 10) throw new IllegalStateException("character too small");
 
+        // --- map mode with entities ---
+        VoxDocument map = new VoxDocument(VoxDocument.Mode.MAP, 32, 16, 32);
+        // Add a floor
+        for (int z = 0; z < map.grid.sizeZ(); z++)
+            for (int x = 0; x < map.grid.sizeX(); x++)
+                map.grid.setMat(x, 0, z, MaterialPalette.CONCRETE);
+        // Add a scripted event
+        MapEntities.ScriptedEvent evt = new MapEntities.ScriptedEvent(10, 1, 10,
+                "evt_test", "Test Event", "open_door.ps1");
+        evt.triggerType = "on_enter";
+        evt.radius = 2.0f;
+        map.mapData.addEvent(evt);
+        // Add an NPC
+        MapEntities.Npc npc = new MapEntities.Npc(15, 1, 15,
+                "npc_guard1", "Guard", "guard");
+        npc.aiProfile = "patrol";
+        npc.patrolRouteId = "route1";
+        map.mapData.addNpc(npc);
+        // Add a patrol route
+        MapEntities.PatrolRoute route = new MapEntities.PatrolRoute("route1", "Guard Patrol");
+        route.addNode(new MapEntities.PatrolNode(15, 1, 15, 2.0f, "idle"));
+        route.addNode(new MapEntities.PatrolNode(20, 1, 15, 1.0f, "look"));
+        route.addNode(new MapEntities.PatrolNode(20, 1, 20, 2.0f, "idle"));
+        route.addNode(new MapEntities.PatrolNode(15, 1, 20, 1.0f, "look"));
+        map.mapData.addPatrolRoute(route);
+        // Save and load map
+        Path mapPath = outDir.resolve("smoke_map.vox.json");
+        VoxIO.save(map, mapPath);
+        VoxDocument loadedMap = VoxIO.load(mapPath);
+        if (loadedMap.mapData.events.size() != 1) throw new IllegalStateException("map event not loaded");
+        if (loadedMap.mapData.npcs.size() != 1) throw new IllegalStateException("map npc not loaded");
+        if (loadedMap.mapData.patrolRoutes.size() != 1) throw new IllegalStateException("map patrol route not loaded");
+        MapEntities.ScriptedEvent loadedEvt = loadedMap.mapData.events.get(0);
+        if (!loadedEvt.id.equals("evt_test") || !loadedEvt.scriptName.equals("open_door.ps1"))
+            throw new IllegalStateException("event data mismatch");
+        MapEntities.Npc loadedNpc = loadedMap.mapData.npcs.get(0);
+        if (!loadedNpc.id.equals("npc_guard1") || !loadedNpc.npcType.equals("guard"))
+            throw new IllegalStateException("npc data mismatch");
+        MapEntities.PatrolRoute loadedRoute = loadedMap.mapData.patrolRoutes.get(0);
+        if (!loadedRoute.id.equals("route1") || loadedRoute.nodes.size() != 4)
+            throw new IllegalStateException("patrol route data mismatch");
+        loadedMap.grid.assertCubicUnitInvariant();
+
         // --- bitcrush 32x filter (display only) ---
         int[][] rgbSlice = new int[sky.grid.sizeZ()][sky.grid.sizeX()];
         for (int z = 0; z < sky.grid.sizeZ(); z++)
@@ -98,7 +142,7 @@ public final class SmokeMain {
         if (crushed.length != sky.grid.sizeZ() * 32 || crushed[0].length != sky.grid.sizeX() * 32) {
             throw new IllegalStateException("bitcrush dims wrong");
         }
-// occupancy unchanged
+        // occupancy unchanged
         sky.grid.assertCubicUnitInvariant();
 
         // --- weapon parts ---
