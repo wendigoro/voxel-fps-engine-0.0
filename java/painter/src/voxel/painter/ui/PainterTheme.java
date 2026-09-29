@@ -37,6 +37,8 @@ public final class PainterTheme {
     public static final Color MODE_SKY = new Color(0x6A, 0x8C, 0xE8);
     public static final Color MODE_CHARACTER = new Color(0x5C, 0xC0, 0x9A);
     public static final Color MODE_WEAPON = new Color(0xE0, 0x8A, 0x3C);
+    public static final Color MODE_ITEM = new Color(0xB8, 0x7A, 0xD8);
+    public static final Color MODE_MAP = new Color(0xD8, 0x6A, 0x6A);
 
     public static Font uiFont() {
         return new Font(Font.SANS_SERIF, Font.PLAIN, 12);
@@ -55,6 +57,8 @@ public final class PainterTheme {
             case SKY -> MODE_SKY;
             case CHARACTER -> MODE_CHARACTER;
             case WEAPON -> MODE_WEAPON;
+            case ITEM -> MODE_ITEM;
+            case MAP -> MODE_MAP;
             default -> MODE_MODEL;
         };
     }
@@ -64,6 +68,8 @@ public final class PainterTheme {
             case SKY -> "Sky tiles";
             case CHARACTER -> "Character";
             case WEAPON -> "Weapon assembly";
+            case ITEM -> "Inventory item";
+            case MAP -> "Map";
             default -> "Model";
         };
     }
@@ -73,6 +79,8 @@ public final class PainterTheme {
             case SKY -> "Hemisphere tile grid + moon bearing for engine sky";
             case CHARACTER -> "Unit-voxel body kit; feet anchor for submersion tests";
             case WEAPON -> "Part-tagged voxels → stats, caliber, ammo, fire mode export";
+            case ITEM -> "Painted grid is the packing footprint → item.json export";
+            case MAP -> "Cubic map grid + scripted events, NPCs and patrol routes";
             default -> "General cubic unit occupancy editing";
         };
     }

@@ -1,0 +1,14 @@
+{
+  "id": "weapon_starter_rifle",
+  "name": "Starter Rifle",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "weapon_primary",
+  "material": "carbon_fiber",
+  "color": [0.30, 0.30, 0.33],
+  "size": [3, 2, 2],
+  "weapon_id": "starter_rifle",
+  "caliber": "medium",
+  "ammo_id": "medium_fmj",
+  "magazine_size": 30
+}

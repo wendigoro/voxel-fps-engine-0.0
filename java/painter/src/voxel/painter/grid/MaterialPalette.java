@@ -56,6 +56,8 @@ public final class MaterialPalette {
     }
     private MaterialPalette() {}
     public static List<Entry> entries() { return ENTRIES; }
+    /** Number of material ids, so callers can size a per-material histogram. */
+    public static int count() { return ENTRIES.size(); }
     public static int idFromName(String name) {
         if (name == null) return AIR;
         Integer id = BY_NAME.get(name.toLowerCase(Locale.ROOT));

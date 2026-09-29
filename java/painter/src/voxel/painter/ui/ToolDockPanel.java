@@ -1,6 +1,7 @@
 package voxel.painter.ui;
 
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -15,6 +16,7 @@ import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JColorChooser;
 import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JPanel;
@@ -27,9 +29,11 @@ import javax.swing.ListSelectionModel;
 import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingConstants;
 import javax.swing.border.EmptyBorder;
+import voxel.painter.grid.Items;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.VoxDocument;
+import voxel.painter.grid.VoxelGrid;
 import voxel.painter.grid.WeaponParts;
 
 /** Left tool dock — mode-aware; weapon assembly card only in weapon mode. */
@@ -44,6 +48,7 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
     private final JSpinner sizeSpinner;
     private final JSpinner stretchSpinner;
     private final JPanel weaponCard;
+    private final JPanel toolModes;
     private final JComboBox<String> partBox;
     private final JComboBox<String> calBox;
     private final JComboBox<String> ammoBox;
@@ -66,8 +71,8 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
         add(Box.createVerticalStrut(6));
 
         add(section("Tool mode"));
-        JPanel modes = new JPanel(new GridLayout(0, 2, 4, 4));
-        modes.setOpaque(false);
+        toolModes = new JPanel(new GridLayout(0, 2, 4, 4));
+        toolModes.setOpaque(false);
         ButtonGroup modeGroup = new ButtonGroup();
         for (PainterModel.UiTool t : PainterModel.UiTool.values()) {
             JRadioButton rb = new JRadioButton(t.name());
@@ -77,10 +82,10 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
             rb.addActionListener(e -> { if (!syncing) model.setUiTool(t); });
             rb.putClientProperty("uitool", t);
             modeGroup.add(rb);
-            modes.add(rb);
+            toolModes.add(rb);
         }
-        modes.setAlignmentX(LEFT_ALIGNMENT);
-        add(modes);
+        toolModes.setAlignmentX(LEFT_ALIGNMENT);
+        add(toolModes);
 
         add(section("Brush shape"));
         JPanel shapes = new JPanel(new GridLayout(0, 2, 4, 4));
@@ -358,14 +363,56 @@ public final class ToolDockPanel extends JPanel implements PainterModel.Listener
     }
 
     private void refreshWeaponVisibility() {
-        boolean w = model.document().mode == VoxDocument.Mode.WEAPON;
+        VoxDocument.Mode m = model.document().mode;
+        boolean w = m == VoxDocument.Mode.WEAPON;
         weaponCard.setVisible(w);
+        // The entity tools address map entities, not voxels, so they only make
+        // sense in map mode. Without this they would sit in the dock in every
+        // mode and silently no-op.
+        boolean map = m == VoxDocument.Mode.MAP;
+        for (Component c : toolModes.getComponents()) {
+            Object t = ((JComponent) c).getClientProperty("uitool");
+            c.setVisible(map || !(t instanceof PainterModel.UiTool) || !PainterModel.isEntityTool((PainterModel.UiTool) t));
+        }
         revalidate();
         repaint();
     }
 
     private void refreshWeaponStats() {
-        if (model.document().mode != VoxDocument.Mode.WEAPON) {
+        VoxDocument.Mode m = model.document().mode;
+        if (m == VoxDocument.Mode.ITEM) {
+            // The canvas is a work area; what the packer charges for is the tight
+            // bounding box of solid cells, in whole unit cubes.
+            VoxDocument doc = model.document();
+            VoxelGrid g = doc.grid;
+            int[] fp = Items.footprintSize(g);
+            int cells = Items.solidCells(g);
+            StringBuilder sb = new StringBuilder();
+            sb.append("canvas   ");
+            sb.append(String.format("%dx%dx%d%n", g.sizeX(), g.sizeY(), g.sizeZ()));
+            if (fp == null) {
+                sb.append("footprint empty\n");
+                sb.append("solid    0\n");
+            } else {
+                int volume = fp[0] * fp[1] * fp[2];
+                sb.append(String.format("footprint %dx%dx%d%n", fp[0], fp[1], fp[2]));
+                sb.append(String.format("volume   %7d%n", volume));
+                sb.append(String.format("solid    %7d%n", cells));
+                sb.append(String.format("wasted   %7d%n", volume - cells));
+                sb.append(String.format("density  %6d%%n", cells * 100 / volume));
+            }
+            sb.append('\n');
+            sb.append("class    ").append(doc.itemClass).append('\n');
+            if (Items.needsArmorZone(doc.itemClass))
+                sb.append("zone     ").append(doc.armorZone.isEmpty() ? "(none)" : doc.armorZone).append('\n');
+            if (Items.needsPackSize(doc.itemClass))
+                sb.append(String.format("pack     %dx%dx%d%n", doc.packSX, doc.packSY, doc.packSZ));
+            sb.append('\n');
+            sb.append("file     ").append(Items.fileNameFor(doc.itemId));
+            statsArea.setText(sb.toString());
+            return;
+        }
+        if (m != VoxDocument.Mode.WEAPON) {
             statsArea.setText("");
             return;
         }

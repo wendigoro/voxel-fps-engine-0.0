@@ -47,6 +47,11 @@ struct ProjectileRuntime {
     float vx = 0, vy = 0, vz = 0;
     float energy = 0;
     bool alive = false;
+    // Fired by the player. Self damage is ON, but a shooter is never hurt by
+    // their own bullet passing through their own body (the hitscan origin is
+    // inside the player's head) — the flag is what keeps that honest, and it is
+    // also the hook enemy fire will need.
+    bool ownerIsPlayer = false;
 };
 
 // Shared gravity with Python effects loop (m/s^2 style, world-unit scaled).

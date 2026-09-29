@@ -15,8 +15,19 @@ $OutDir  = Join-Path $RepoRoot "java\painter\out"
 $Main    = "voxel.painter.ui.PainterApp"
 
 Write-Host "RepoRoot = $RepoRoot"
-& javac -version
-& java -version
+# `java -version` prints to stderr, which ErrorActionPreference=Stop promotes to a
+# fatal NativeCommandError and turns into a failed launch. Relax the preference
+# around the version probes and judge them by exit code instead.
+$ErrorActionPreference = "Continue"
+$javacVersion = (& javac -version 2>&1 | Out-String).Trim()
+$javacExit = $LASTEXITCODE
+$javaVersion = (& java -version 2>&1 | Out-String).Trim()
+$javaExit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+Write-Host $javacVersion
+Write-Host $javaVersion
+if ($javacExit -ne 0) { throw "javac not usable ($javacExit): $javacVersion" }
+if ($javaExit -ne 0) { throw "java not usable ($javaExit): $javaVersion" }
 if (-not (Test-Path $SrcRoot)) { throw "Missing sources at $SrcRoot" }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

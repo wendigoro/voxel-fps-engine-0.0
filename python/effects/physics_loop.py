@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 from projectiles.defs import WORLD_GRAVITY, get_projectile  # noqa: E402
-from projectiles.materials import MATERIALS  # noqa: E402
+from projectiles.materials import MATERIALS, break_threshold, voxel_mass  # noqa: E402
 
 
 @dataclass
@@ -49,15 +49,11 @@ class SimResult:
 
 
 def _voxel_mass(material: str) -> float:
-    m = MATERIALS[material]
-    vol = 0.001**3
-    return m.density * m.weight * vol * 1000.0
+    return voxel_mass(MATERIALS[material])
 
 
 def _break_threshold(material: str) -> float:
-    m = MATERIALS[material]
-    frag = max(0.05, m.fragility)
-    return m.toughness * _voxel_mass(material) / frag
+    return break_threshold(MATERIALS[material])
 
 
 def _effect_mul(effect: str, material: str) -> float:

@@ -18,8 +18,8 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float ambientScale;
     float muzzleFlash;
     float fireOverlay;
-    float _fxPad0;
-    float _fxPad1;
+    float damageFlash;
+    float healthTint;
     vec4 bulbPos[4];
     vec4 bulbColor[4];
 } ubo;
@@ -87,27 +87,76 @@ float shadowRayPoint(vec3 origin, vec3 lightPos, out float edge) {
 void applyFireOverlay(inout vec3 lit) {
     float flash = ubo.muzzleFlash;
     float border = ubo.fireOverlay;
-    if (flash < 0.001 && border < 0.001) return;
+    float dmgFlash = ubo.damageFlash;
+    float hpTint = ubo.healthTint;
 
     float r = length(fragNdc);
-    // Center bloom + warm fill
-    float center = 1.0 - smoothstep(0.0, 0.72, r);
-    lit += vec3(1.0, 0.78, 0.32) * flash * (0.18 + 0.55 * center);
-    // Frame burn / corner vignette pulse
-    float edgeX = smoothstep(0.72, 1.08, abs(fragNdc.x));
-    float edgeY = smoothstep(0.68, 1.05, abs(fragNdc.y));
-    float frame = max(edgeX, edgeY);
-    float corner = edgeX * edgeY;
-    lit += vec3(1.0, 0.42, 0.12) * border * (frame * 0.55 + corner * 0.85);
-    // Slight desat crush on hard flash for "shutter" feel
-    float luma = dot(lit, vec3(0.299, 0.587, 0.114));
-    lit = mix(lit, vec3(luma) * vec3(1.05, 0.95, 0.85), flash * 0.12);
+
+    if (flash >= 0.001 || border >= 0.001) {
+        // Center bloom + warm fill
+        float center = 1.0 - smoothstep(0.0, 0.72, r);
+        lit += vec3(1.0, 0.78, 0.32) * flash * (0.18 + 0.55 * center);
+        // Frame burn / corner vignette pulse
+        float edgeX = smoothstep(0.72, 1.08, abs(fragNdc.x));
+        float edgeY = smoothstep(0.68, 1.05, abs(fragNdc.y));
+        float frame = max(edgeX, edgeY);
+        float corner = edgeX * edgeY;
+        lit += vec3(1.0, 0.42, 0.12) * border * (frame * 0.55 + corner * 0.85);
+        // Slight desat crush on hard flash for "shutter" feel
+        float luma = dot(lit, vec3(0.299, 0.587, 0.114));
+        lit = mix(lit, vec3(luma) * vec3(1.05, 0.95, 0.85), flash * 0.12);
+    }
+
+    // Combat feel: rapid crimson wash on impact damage
+    if (dmgFlash > 0.001) {
+        float bloom = 1.0 - smoothstep(0.0, 0.95, r);
+        lit = mix(lit, vec3(0.85, 0.04, 0.04), dmgFlash * 0.45);
+        lit += vec3(0.9, 0.08, 0.08) * dmgFlash * (0.15 + 0.35 * bloom);
+    }
+
+    // Low health: dark red vignette pulse around screen border
+    if (hpTint > 0.001) {
+        float edge = smoothstep(0.55, 1.15, r);
+        float pulse = 0.8 + 0.2 * sin(ubo.time * 6.0);
+        lit = mix(lit, vec3(0.55, 0.02, 0.02), hpTint * edge * pulse * 0.65);
+    }
 }
 
 void main() {
     vec3 n = normalize(fragNormal);
     vec3 base = fragColor;
     float matId = fragMat;
+
+    // mat 8: world item pickups. These are real world objects, not overlay UI, so
+    // they take the mat-0 lighting path (shadow rays, height AO, vignette) and sit
+    // in the scene instead of floating on top of it. Remapping the id to 0 lets
+    // them fall through every branch below into that shared world path; testing
+    // it here is required because the chain is a descending `matId > N.5` and an
+    // untested mat 8 would be swallowed by the mat-7 lattice branch.
+    if (matId > 7.5) matId = 0.0;
+
+    // mat 7: inventory lattice unit cubes (RULES.md rule 12).
+    // Must be tested FIRST of the remaining ids: the chain below is a descending
+    // `matId > N.5` and an
+    // untested mat 7 would fall into the muzzle-flash branch. Deliberately skips
+    // the mat-0 path's world-space shadow rays, world-Y height AO and vignette —
+    // none of which mean anything on a lattice parented to the camera. The
+    // vertex stage also skips the fisheye for mat 7, so this is a clean 3D
+    // projection. Flat face shading plus a light bitcrush to match the look.
+    if (matId > 6.5) {
+        vec3 key = normalize(vec3(0.42, 0.78, 0.30));
+        float ndl = max(dot(n, key), 0.0);
+        float fill = 0.42 + 0.58 * max(n.y, 0.0);
+        vec3 lit = base * (0.34 + 0.52 * ndl) * fill;
+        // Emphasise the cube silhouette so single cells stay legible.
+        float face = pow(max(abs(n.x), max(abs(n.y), abs(n.z))), 8.0);
+        lit += base * face * 0.14;
+        float levels = 20.0;
+        lit = floor(lit * levels + 0.5) / levels;
+        applyFireOverlay(lit);
+        outColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
+        return;
+    }
 
     // mat 6: muzzle flash cubes (emissive, no lighting)
     if (matId > 5.5) {

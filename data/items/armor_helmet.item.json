@@ -1,0 +1,12 @@
+{
+  "id": "armor_helmet",
+  "name": "Combat Helmet",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "armor",
+  "armor_zone": "head",
+  "armor_points": 40,
+  "material": "sheet_metal",
+  "color": [0.35, 0.37, 0.34],
+  "size": [3, 2, 3]
+}

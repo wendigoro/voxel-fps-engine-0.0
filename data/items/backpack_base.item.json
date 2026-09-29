@@ -1,0 +1,11 @@
+{
+  "id": "backpack_base",
+  "name": "Field Pack (Base)",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "backpack",
+  "material": "treated_wood",
+  "color": [0.46, 0.36, 0.22],
+  "size": [2, 3, 2],
+  "pack_size": [3, 3, 4]
+}

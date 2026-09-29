@@ -29,7 +29,7 @@ MATERIALS: dict[str, Material] = {
         "sheet_metal", density=7.80, weight=0.55, fragility=0.35, toughness=2.10, damping=0.28
     ),
     "girder": Material("girder", density=7.85, weight=1.40, fragility=0.12, toughness=4.20, damping=0.50),
-"water": Material("water", density=1.00, weight=1.00, fragility=1.00, toughness=0.05, damping=0.05),
+    "water": Material("water", density=1.00, weight=1.00, fragility=1.00, toughness=0.05, damping=0.05),
     "plexiglass": Material(
         "plexiglass", density=1.20, weight=0.40, fragility=0.00, toughness=9999.0, damping=0.95
     ),
@@ -42,7 +42,25 @@ MATERIALS: dict[str, Material] = {
 }
 
 # Engine unit voxel edge length (1000x smaller than original 1.0 blocks).
+# This is the single Python declaration. C++ reads it from src/materials.hpp
+# (kVoxelSize); the Java painter has its own copy in VoxelGrid.java.
+# scripts/check_constants.py asserts all of them still agree.
 VOXEL_SIZE = 0.001
+
+# Scale applied to density*weight*volume to reach engine mass units.
+# MUST match the 1.0e6f literal in voxelMass() in src/materials.hpp.
+# Getting this wrong scales every destruction threshold in the engine.
+MASS_SCALE = 1.0e6
+
+
+def voxel_mass(m: Material) -> float:
+    """Canonical voxel mass. Mirrors voxelMass() in src/materials.hpp."""
+    return m.density * m.weight * (VOXEL_SIZE**3) * MASS_SCALE
+
+
+def break_threshold(m: Material) -> float:
+    """Canonical break threshold. Mirrors breakEnergyThreshold() in src/materials.hpp."""
+    return m.toughness * voxel_mass(m) / max(0.05, m.fragility)
 
 
 def materials_json() -> list[dict]:

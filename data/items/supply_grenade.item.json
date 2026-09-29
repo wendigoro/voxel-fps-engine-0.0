@@ -1,0 +1,10 @@
+{
+  "id": "supply_grenade",
+  "name": "Grenade",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "class": "misc",
+  "material": "sheet_metal",
+  "color": [0.30, 0.42, 0.26],
+  "size": [1, 1, 1]
+}

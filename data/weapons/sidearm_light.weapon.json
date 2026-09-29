@@ -1,0 +1,25 @@
+{
+  "id": "sidearm_light",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "light",
+  "hitscan": 0,
+  "fire_mode": "semi",
+  "ammo_id": "light_fmj",
+  "stats": {
+    "damage": 9.5,
+    "impact": 14.0,
+    "recoil": 7.0,
+    "handling": 16.0,
+    "weight": 6.0,
+    "optic": 1.0
+  },
+  "parts": {
+    "barrel": 4,
+    "action": 5,
+    "bolt_chamber": 2,
+    "trigger": 1,
+    "grip_stock": 3,
+    "sight": 1
+  }
+}

@@ -33,18 +33,25 @@ $Scripts = $PSScriptRoot
 function Invoke-RepoScript {
   param(
     [Parameter(Mandatory = $true)][string]$Name,
-    [string[]]$ScriptArgs = @()
+    # Positional arguments, splatted as an array. NOTE: splatting a string array
+    # passes each element POSITIONALLY, so "-SomeSwitch" is treated as a literal
+    # value and never binds to a switch parameter. Use -NamedArgs for that.
+    [string[]]$ScriptArgs = @(),
+    # Named parameters, splatted as a hashtable so switches actually bind.
+    [hashtable]$NamedArgs = @{}
   )
   $path = Join-Path $Scripts $Name
   if (-not (Test-Path $path)) {
     throw "Missing script: $path"
   }
-  Write-Host "== $Name $($ScriptArgs -join ' ') ==" -ForegroundColor Cyan
-  if ($ScriptArgs.Count -gt 0) {
-    & $path @ScriptArgs
-  } else {
-    & $path
-  }
+  $named = ($NamedArgs.Keys | ForEach-Object { "-$_" }) -join ' '
+  Write-Host "== $Name $named $($ScriptArgs -join ' ') ==" -ForegroundColor Cyan
+  # A hashtable must be splatted as a hashtable for switches to bind; folding it
+  # into a string[] would pass everything positionally.
+  # Out-Host keeps the child's diagnostics (smoke_ok.txt dumps, painter logs) on
+  # the host. Without it those lines become this function's return value, get
+  # swallowed by the caller, and the action looks like it printed nothing.
+  & $path @NamedArgs @ScriptArgs | Out-Host
   return $LASTEXITCODE
 }
 
@@ -116,7 +123,7 @@ function Invoke-Action {
       return Invoke-RepoScript -Name "run.ps1"
     }
     "SmokeEngine" {
-      return Invoke-RepoScript -Name "demo.ps1" -ScriptArgs @("-SkipInteractive")
+      return Invoke-RepoScript -Name "demo.ps1" -NamedArgs @{ SkipInteractive = $true }
     }
     "SmokePainter" {
       $smoke = Join-Path $Scripts "smoke_painter.ps1"
