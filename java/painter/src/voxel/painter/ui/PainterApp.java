@@ -58,6 +58,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
 modeTabs.addTab("Model", modePlaceholder(VoxDocument.Mode.MODEL));
         modeTabs.addTab("Sky tiles/background", modePlaceholder(VoxDocument.Mode.SKY));
         modeTabs.addTab("Character", modePlaceholder(VoxDocument.Mode.CHARACTER));
+        modeTabs.addTab("Character Cosmetic", modePlaceholder(VoxDocument.Mode.CHARACTER_COSMETIC));
         modeTabs.addTab("Weapon", modePlaceholder(VoxDocument.Mode.WEAPON));
         modeTabs.addChangeListener(e -> {
             if (syncingTabs) return;
@@ -65,7 +66,8 @@ modeTabs.addTab("Model", modePlaceholder(VoxDocument.Mode.MODEL));
             VoxDocument.Mode mode = switch (i) {
                 case 1 -> VoxDocument.Mode.SKY;
                 case 2 -> VoxDocument.Mode.CHARACTER;
-                case 3 -> VoxDocument.Mode.WEAPON;
+                case 3 -> VoxDocument.Mode.CHARACTER_COSMETIC;
+                case 4 -> VoxDocument.Mode.WEAPON;
                 default -> VoxDocument.Mode.MODEL;
             };
             if (model.document().mode != mode) {
@@ -192,8 +194,8 @@ file.add(item("Export 32× bitcrush preview…", null, this::onExportPreview));
         scripts.runScript(script, args);
     }
 
-    private void onNew() {
-Object[] opts = {"model", "sky", "character", "weapon"};
+private void onNew() {
+ Object[] opts = {"model", "sky", "character", "character_cosmetic", "weapon"};
         Object pick = JOptionPane.showInputDialog(
                 this, "New document mode", "New", JOptionPane.QUESTION_MESSAGE,
                 null, opts, model.document().modeName());
@@ -322,7 +324,8 @@ private void syncModeTab() {
         int idx = switch (model.document().mode) {
             case SKY -> 1;
             case CHARACTER -> 2;
-            case WEAPON -> 3;
+            case CHARACTER_COSMETIC -> 3;
+            case WEAPON -> 4;
             default -> 0;
         };
         if (modeTabs.getSelectedIndex() != idx) {

@@ -102,32 +102,66 @@ public final class SkyAndCharacter {
         return Math.max(0, Math.min(255, v));
     }
 
-    /** Unit-voxel humanoid standing at feet (fx,fy,fz). All cells 1x1x1. */
+    /** Unit-voxel humanoid with solid segment volumes for impact/penetration.
+     * Segments: head, neck, torso, pelvis, upper_arms, lower_arms, upper_legs, lower_legs.
+     * Each segment has 1-2 voxel thick walls + solid interior (1-2 voxels deep).
+     * Uses CHARACTER_BONE (breakable, non-reflecting) and CHARACTER_FLESH (low density, high damping). */
     public static void paintCharacter(VoxelGrid g, int fx, int fy, int fz) {
         g.assertCubicUnitInvariant();
-        int[][] units = {
-            // legs
-            {0,0,0},{1,0,0},{0,1,0},{1,1,0},{3,0,0},{4,0,0},{3,1,0},{4,1,0},
-            // torso
-            {0,2,0},{1,2,0},{2,2,0},{3,2,0},{4,2,0},
-            {0,3,0},{1,3,0},{2,3,0},{3,3,0},{4,3,0},
-            {0,4,0},{1,4,0},{2,4,0},{3,4,0},{4,4,0},
-            // head
-            {1,5,0},{2,5,0},{3,5,0},{1,6,0},{2,6,0},{3,6,0},
-            // arms
-            {-1,3,0},{-1,4,0},{5,3,0},{5,4,0}
+        // Segment definitions: [x0,y0,z0, x1,y1,z1, material]
+        // Y-up from feet. All coords relative to (fx, fy, fz).
+        int[][] segments = {
+            // head: 3x3x3 box at y=6..8, x=1..3, z=-1..1 (centered)
+            {1, 6, -1, 3, 8, 1, MaterialPalette.CHARACTER_BONE},      // skull outer
+            {2, 7, 0, 2, 7, 0, MaterialPalette.CHARACTER_FLESH},      // brain cavity
+
+            // neck: 1x2x1 at y=5..6, x=2, z=0
+            {2, 5, 0, 2, 6, 0, MaterialPalette.CHARACTER_BONE},
+
+            // torso: 5x7x3 box at y=2..8, x=0..4, z=-1..1
+            {0, 2, -1, 4, 8, 1, MaterialPalette.CHARACTER_BONE},      // ribcage shell
+            {1, 3, 0, 3, 7, 0, MaterialPalette.CHARACTER_FLESH},      // organ cavity
+
+            // pelvis: 5x3x3 at y=0..2, x=0..4, z=-1..1
+            {0, 0, -1, 4, 2, 1, MaterialPalette.CHARACTER_BONE},      // pelvic bone shell
+            {1, 1, 0, 3, 1, 0, MaterialPalette.CHARACTER_FLESH},      // pelvic cavity
+
+            // upper arms (shoulders to elbows): 2x4x2 at y=3..6
+            {-2, 3, -1, -1, 6, 0, MaterialPalette.CHARACTER_BONE},    // left upper arm shell
+            {5, 3, -1, 6, 6, 0, MaterialPalette.CHARACTER_BONE},      // right upper arm shell
+            {-2, 4, 0, -1, 5, 0, MaterialPalette.CHARACTER_FLESH},    // left upper arm interior
+            {5, 4, 0, 6, 5, 0, MaterialPalette.CHARACTER_FLESH},      // right upper arm interior
+
+            // lower arms (forearms): 2x3x2 at y=0..2 (attached at elbow y=3)
+            {-2, 0, -1, -1, 2, 0, MaterialPalette.CHARACTER_BONE},    // left forearm shell
+            {5, 0, -1, 6, 2, 0, MaterialPalette.CHARACTER_BONE},      // right forearm shell
+            {-2, 1, 0, -1, 1, 0, MaterialPalette.CHARACTER_FLESH},    // left forearm interior
+            {5, 1, 0, 6, 1, 0, MaterialPalette.CHARACTER_FLESH},      // right forearm interior
+
+            // upper legs (thighs): 3x5x2 at y=0..4 (attached at hip y=2)
+            {0, 0, -1, 2, 4, 0, MaterialPalette.CHARACTER_BONE},      // left thigh shell
+            {2, 0, -1, 4, 4, 0, MaterialPalette.CHARACTER_BONE},      // right thigh shell
+            {1, 1, 0, 1, 3, 0, MaterialPalette.CHARACTER_FLESH},      // left thigh interior
+            {3, 1, 0, 3, 3, 0, MaterialPalette.CHARACTER_FLESH},      // right thigh interior
+
+            // lower legs (calves): 2x4x2 at y=-3..0 (below feet at y=0)
+            {0, -3, -1, 1, 0, 0, MaterialPalette.CHARACTER_BONE},     // left calf shell
+            {3, -3, -1, 4, 0, 0, MaterialPalette.CHARACTER_BONE},     // right calf shell
+            {0, -2, 0, 1, -1, 0, MaterialPalette.CHARACTER_FLESH},    // left calf interior
+            {3, -2, 0, 4, -1, 0, MaterialPalette.CHARACTER_FLESH},    // right calf interior
         };
-        for (int[] u : units) {
-            int x = fx + u[0], y = fy + u[1], z = fz + u[2];
-            int mat;
-            int yrel = u[1];
-            if (yrel <= 1) mat = MaterialPalette.GIRDER; // pants stand-in
-            else if (yrel <= 4) mat = MaterialPalette.SHEET_METAL; // shirt
-            else mat = MaterialPalette.CONCRETE; // head/skin stand-in
-            if (u[0] < 0 || u[0] > 4) mat = MaterialPalette.CONCRETE; // arms
-            g.setMat(x, y, z, mat);
+
+        for (int[] s : segments) {
+            int x0 = fx + s[0], y0 = fy + s[1], z0 = fz + s[2];
+            int x1 = fx + s[3], y1 = fy + s[4], z1 = fz + s[5];
+            int mat = s[6];
+            if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+            if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+            if (z0 > z1) { int t = z0; z0 = z1; z1 = t; }
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++)
+                        g.setMat(x, y, z, mat);
         }
-        // accent belt
-        g.setMat(fx + 2, fy + 3, fz, MaterialPalette.WOOD);
     }
 }

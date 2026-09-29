@@ -21,7 +21,9 @@ public final class MaterialPalette {
     public static final int PLEXIGLASS = 9;
     public static final int CARBON_FIBER = 10;
     public static final int TREATED_WOOD = 11;
-    public static final int CUSTOM = 12;
+    public static final int CHARACTER_FLESH = 12;
+    public static final int CHARACTER_BONE = 13;
+    public static final int CUSTOM = 14;
 
     public static final class Entry {
         public final int id;
@@ -48,6 +50,8 @@ public final class MaterialPalette {
         list.add(new Entry(PLEXIGLASS, "plexiglass", 0xA8D4E8));
         list.add(new Entry(CARBON_FIBER, "carbon_fiber", 0x1A1A1E));
         list.add(new Entry(TREATED_WOOD, "treated_wood", 0x6B4423));
+        list.add(new Entry(CHARACTER_FLESH, "character_flesh", 0xE8705A)); // pinkish flesh
+        list.add(new Entry(CHARACTER_BONE, "character_bone", 0xE8E0D8)); // off-white bone
         list.add(new Entry(CUSTOM, "custom", 0xFFFFFF));
         ENTRIES = Collections.unmodifiableList(list);
         Map<String, Integer> map = new LinkedHashMap<>();
@@ -75,6 +79,7 @@ public final class MaterialPalette {
             case BUSH_LEAVES -> 0.15f; case BUSH_BRANCH -> 0.55f;
             case SHEET_METAL -> 7.80f; case GIRDER -> 7.85f; case WATER -> 1.00f;
             case PLEXIGLASS -> 1.20f; case CARBON_FIBER -> 1.75f; case TREATED_WOOD -> 0.75f;
+            case CHARACTER_FLESH -> 0.35f; case CHARACTER_BONE -> 1.80f;
             default -> 0.001f;
         };
     }
@@ -84,6 +89,7 @@ public final class MaterialPalette {
             case BUSH_LEAVES -> 0.35f; case BUSH_BRANCH -> 0.80f;
             case SHEET_METAL -> 0.55f; case GIRDER -> 1.40f; case WATER -> 1.00f;
             case PLEXIGLASS -> 0.40f; case CARBON_FIBER -> 0.45f; case TREATED_WOOD -> 0.95f;
+            case CHARACTER_FLESH -> 0.50f; case CHARACTER_BONE -> 1.20f;
             default -> 0.001f;
         };
     }

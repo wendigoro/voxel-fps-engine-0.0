@@ -30,7 +30,8 @@ public final class VoxIO {
                     .append(doc.moonDirY).append(", ").append(doc.moonDirZ).append("],\n");
             sb.append("  \"moon_intensity\": ").append(doc.moonIntensity).append(",\n");
         }
-if (doc.mode == VoxDocument.Mode.CHARACTER) {
+if (doc.mode == VoxDocument.Mode.CHARACTER ||
+                doc.mode == VoxDocument.Mode.CHARACTER_COSMETIC) {
             sb.append("  \"feet\": [").append(doc.feetX).append(", ")
                     .append(doc.feetY).append(", ").append(doc.feetZ).append("],\n");
         }

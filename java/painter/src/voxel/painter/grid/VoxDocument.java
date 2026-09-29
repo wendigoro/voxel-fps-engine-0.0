@@ -4,7 +4,7 @@ import java.util.Locale;
 
 /** In-memory .vox.json document. */
 public final class VoxDocument {
-public enum Mode { MODEL, SKY, CHARACTER, WEAPON }
+public enum Mode { MODEL, SKY, CHARACTER, CHARACTER_COSMETIC, WEAPON }
 
     public final int unit = VoxelGrid.UNIT;
     public final float voxelSize = VoxelGrid.VOXEL_SIZE;
@@ -24,20 +24,22 @@ public int feetX, feetY, feetZ;
         this.grid.assertCubicUnitInvariant();
     }
 
-    public static Mode parseMode(String s) {
+public static Mode parseMode(String s) {
         if (s == null) return Mode.MODEL;
-return switch (s.toLowerCase(Locale.ROOT)) {
+ return switch (s.toLowerCase(Locale.ROOT)) {
             case "sky" -> Mode.SKY;
             case "character" -> Mode.CHARACTER;
+            case "character_cosmetic", "cosmetic" -> Mode.CHARACTER_COSMETIC;
             case "weapon" -> Mode.WEAPON;
             default -> Mode.MODEL;
         };
     }
 
-    public String modeName() {
-return switch (mode) {
+public String modeName() {
+ return switch (mode) {
             case SKY -> "sky";
             case CHARACTER -> "character";
+            case CHARACTER_COSMETIC -> "character_cosmetic";
             case WEAPON -> "weapon";
             default -> "model";
         };

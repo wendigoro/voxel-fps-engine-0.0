@@ -1,6 +1,7 @@
 package voxel.painter;
 
 import voxel.painter.filter.BitcrushUpscale;
+import voxel.painter.grid.HitboxOverlay;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.SkyAndCharacter;
@@ -88,6 +89,19 @@ public final class SmokeMain {
         Path charPath = outDir.resolve("smoke_character.vox.json");
         VoxIO.save(character, charPath);
         if (character.grid.solidCount() < 10) throw new IllegalStateException("character too small");
+
+        // --- character cosmetic (hitbox wireframe + filled) ---
+        VoxDocument cosmetic = new VoxDocument(VoxDocument.Mode.CHARACTER_COSMETIC, 24, 16, 12);
+        cosmetic.feetX = 8;
+        cosmetic.feetY = 3; // must be >=3 to fit legs extending to y=-3
+        cosmetic.feetZ = 4;
+        cosmetic.grid.assertCubicUnitInvariant();
+        HitboxOverlay.paintHitboxFilled(cosmetic.grid, cosmetic.feetX, cosmetic.feetY, cosmetic.feetZ);
+        HitboxOverlay.paintHitboxWireframe(cosmetic.grid, cosmetic.feetX, cosmetic.feetY, cosmetic.feetZ);
+        // Filled hitbox should have substantial voxels (similar to character mode)
+        if (cosmetic.grid.solidCount() < 150) throw new IllegalStateException("cosmetic hitbox too sparse: " + cosmetic.grid.solidCount());
+        Path cosmeticPath = outDir.resolve("smoke_character_cosmetic.vox.json");
+        VoxIO.save(cosmetic, cosmeticPath);
 
         // --- bitcrush 32x filter (display only) ---
         int[][] rgbSlice = new int[sky.grid.sizeZ()][sky.grid.sizeX()];

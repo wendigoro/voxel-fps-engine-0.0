@@ -10,6 +10,7 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JSpinner;
 import javax.swing.SpinnerNumberModel;
+import voxel.painter.grid.HitboxOverlay;
 import voxel.painter.grid.SkyAndCharacter;
 import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxelGrid;
@@ -100,6 +101,17 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             SkyAndCharacter.paintCharacter(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
             model.markDirty();
         });
+        JButton rebuildCosmetic = new JButton("Rebuild hitbox (filled + wireframe)");
+        rebuildCosmetic.addActionListener(e -> {
+            push();
+            VoxDocument doc = model.document();
+            if (doc.mode == VoxDocument.Mode.CHARACTER_COSMETIC) {
+                doc.grid.clear();
+                HitboxOverlay.paintHitboxFilled(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
+                HitboxOverlay.paintHitboxWireframe(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
+                model.markDirty();
+            }
+        });
         JButton bakeWeapon = new JButton("Bake starter rifle");
         bakeWeapon.addActionListener(e -> model.bakeStarterWeapon());
         c.gridy = 4;
@@ -110,6 +122,10 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         add(bakeChar, c);
         c.gridx = 4;
         add(bakeWeapon, c);
+        c.gridy = 5;
+        c.gridx = 0;
+        c.gridwidth = 6;
+        add(rebuildCosmetic, c);
 
         for (JSpinner s : new JSpinner[] {segU, segV, moonX, moonY, moonZ, moonI, feetX, feetY, feetZ}) {
             s.addChangeListener(ev -> push());
@@ -157,7 +173,8 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             feetY.setValue(doc.feetY);
             feetZ.setValue(doc.feetZ);
             boolean sky = doc.mode == VoxDocument.Mode.SKY;
-            boolean character = doc.mode == VoxDocument.Mode.CHARACTER;
+            boolean character = doc.mode == VoxDocument.Mode.CHARACTER ||
+                               doc.mode == VoxDocument.Mode.CHARACTER_COSMETIC;
             segU.setEnabled(sky);
             segV.setEnabled(sky);
             moonX.setEnabled(sky);

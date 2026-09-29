@@ -29,7 +29,7 @@ MATERIALS: dict[str, Material] = {
         "sheet_metal", density=7.80, weight=0.55, fragility=0.35, toughness=2.10, damping=0.28
     ),
     "girder": Material("girder", density=7.85, weight=1.40, fragility=0.12, toughness=4.20, damping=0.50),
-"water": Material("water", density=1.00, weight=1.00, fragility=1.00, toughness=0.05, damping=0.05),
+    "water": Material("water", density=1.00, weight=1.00, fragility=1.00, toughness=0.05, damping=0.05),
     "plexiglass": Material(
         "plexiglass", density=1.20, weight=0.40, fragility=0.00, toughness=9999.0, damping=0.95
     ),
@@ -38,6 +38,12 @@ MATERIALS: dict[str, Material] = {
     ),
     "treated_wood": Material(
         "treated_wood", density=0.75, weight=0.95, fragility=0.35, toughness=1.50, damping=0.42
+    ),
+    "character_flesh": Material(
+        "character_flesh", density=0.35, weight=0.50, fragility=0.95, toughness=0.30, damping=0.85
+    ),
+    "character_bone": Material(
+        "character_bone", density=1.80, weight=1.20, fragility=0.30, toughness=2.00, damping=0.45
     ),
 }
 

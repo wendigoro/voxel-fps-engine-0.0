@@ -281,8 +281,8 @@ inline WeaponDef defaultWeaponDef() {
     w.handling = 11.0f;
     w.weight = 3.8f;
     w.optic = 2.0f;
-    w.ammoId = "fmj_medium";
-    w.ammo.id = "fmj_medium";
+    w.ammoId = "medium_fmj";
+    w.ammo.id = "medium_fmj";
     w.ammo.caliber = "medium";
     w.ammo.effectTags = {"ap"};
     return w;

@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import voxel.painter.grid.HitboxOverlay;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.PaintTools;
 import voxel.painter.grid.SkyAndCharacter;
@@ -72,6 +73,7 @@ public void newDocument(VoxDocument.Mode mode) {
         VoxDocument doc = switch (mode) {
             case SKY -> new VoxDocument(VoxDocument.Mode.SKY, 28, 1, 14);
             case CHARACTER -> new VoxDocument(VoxDocument.Mode.CHARACTER, 24, 16, 12);
+            case CHARACTER_COSMETIC -> new VoxDocument(VoxDocument.Mode.CHARACTER_COSMETIC, 24, 16, 12);
             case WEAPON -> new VoxDocument(VoxDocument.Mode.WEAPON, 24, 12, 12);
             default -> new VoxDocument(VoxDocument.Mode.MODEL, 32, 24, 32);
         };
@@ -81,6 +83,20 @@ public void newDocument(VoxDocument.Mode mode) {
         } else if (mode == VoxDocument.Mode.CHARACTER) {
             doc.feetX = 8; doc.feetY = 0; doc.feetZ = 4;
             SkyAndCharacter.paintCharacter(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
+        } else if (mode == VoxDocument.Mode.CHARACTER_COSMETIC) {
+            // Grid must accommodate legs extending to y=-3, so feetY=3 minimum
+            doc.feetX = 8; doc.feetY = 3; doc.feetZ = 4;
+            // Paint filled hitbox segments as base reference (using actual materials)
+            HitboxOverlay.paintHitboxFilled(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
+            // Paint wireframe overlay on top (CUSTOM material with wireframe colors)
+            HitboxOverlay.paintHitboxWireframe(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
+            // Set default tool to brush with flesh material for cosmetic painting
+            tools.activePart = 0; // no weapon part
+            tools.shape = PaintTools.BrushShape.CUBE;
+            tools.brushSize = 1;
+            tools.matA = MaterialPalette.CHARACTER_FLESH;
+            tools.rgbA = MaterialPalette.defaultRgb(MaterialPalette.CHARACTER_FLESH);
+            tools.useB = false;
         } else if (mode == VoxDocument.Mode.WEAPON) {
             doc.caliber = "medium";
             doc.ammoId = "medium_fmj";

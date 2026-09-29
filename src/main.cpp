@@ -200,6 +200,14 @@ static bool g_fullySubmerged = false;
 static int g_touchingWaterUnits = 0;
 static int g_characterUnitCount = 0;
 
+// Character health / damage / knockback
+static float g_playerHealth = 100.0f;
+static float g_playerMaxHealth = 100.0f;
+static Vec3 g_knockbackVel = {0, 0, 0};
+static float g_knockbackDecay = 8.0f; // per second
+static bool g_playerAlive = true;
+static float g_respawnTimer = 0.0f;
+
 static VkInstance g_instance = VK_NULL_HANDLE;
 static VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 static VkPhysicalDevice g_phys = VK_NULL_HANDLE;
@@ -1672,6 +1680,19 @@ static void applyRecoilKick(const WeaponDef& w) {
     g_pitch = std::max(-lim, std::min(lim, g_pitch));
 }
 
+// Character hit detection
+struct CharacterHit {
+    bool hit = false;
+    int segmentIndex = -1;
+    int localX = 0, localY = 0, localZ = 0;
+    MaterialId material = MaterialId::Air;
+    Vec3 worldPos = {0, 0, 0};
+    Vec3 hitNormal = {0, 0, 0};
+};
+
+static CharacterHit checkCharacterHit(int vx, int vy, int vz);
+static void applyCharacterDamage(float damage, const CharacterHit& hit, const ProjectileDef& def);
+
 // Unit-grid DDA ray (Amanatides & Woo). Hitscan/energy only — gravity_scale=0 path.
 static int fireHitscanRay(const ProjectileDef& def, float energyScale) {
     if (!g_chunks) return 0;
@@ -1726,6 +1747,15 @@ static int fireHitscanRay(const ProjectileDef& def, float energyScale) {
             Block b = getWorldBlock(*g_chunks, ix, iy, iz);
             MaterialId mat = blockMaterial(b);
             if (mat != MaterialId::Air) {
+                // Check for character hit first
+                CharacterHit charHit = checkCharacterHit(ix, iy, iz);
+                if (charHit.hit && g_playerAlive) {
+                    float e = energy * effectMultiplier(def.effect, charHit.material);
+                    applyCharacterDamage(e * 0.5f, charHit, def);
+                    ++breaks;
+                    break; // hitscan stops on character hit
+                }
+
                 float e = energy * effectMultiplier(def.effect, mat);
                 if (resolveVoxelHit(mat, e, def.penetration)) {
                     destroyVoxelAt(ix, iy, iz);
@@ -1807,10 +1837,10 @@ static void fireProjectile() {
     else fired.ammo.caliber = caliber;
     // Ammo scaffold ids aligned with python/projectiles/ammo.py when overriding caliber.
     if (caliber != weapon.caliber || fired.ammoId.empty()) {
-        if (caliber == "light") fired.ammoId = "fmj_light";
-        else if (caliber == "heavy") fired.ammoId = "fmj_heavy";
-        else if (caliberIsHitscan(caliber)) fired.ammoId = "cell_energy";
-        else fired.ammoId = "fmj_medium";
+        if (caliber == "light") fired.ammoId = "light_fmj";
+        else if (caliber == "heavy") fired.ammoId = "heavy_fmj";
+        else if (caliberIsHitscan(caliber)) fired.ammoId = "energy_bolt";
+        else fired.ammoId = "medium_fmj";
     }
 
     ProjectileDef def = projectileForCaliber(g_projDefs, caliber);
@@ -1928,6 +1958,17 @@ static void updateProjectiles(float dt) {
             MaterialId mat = blockMaterial(b);
             if (mat == MaterialId::Air) continue;
 
+            // Check for character hit first
+            CharacterHit charHit = checkCharacterHit(ix, iy, iz);
+            if (charHit.hit && g_playerAlive) {
+                // Apply damage based on projectile energy and material
+                float dmgMult = effectMultiplier(p.def.effect, charHit.material);
+                float damage = p.energy * dmgMult * 0.5f; // scale for gameplay
+                applyCharacterDamage(damage, charHit, p.def);
+                p.alive = false; // projectile stops on character hit
+                continue;
+            }
+
             float e = p.energy * effectMultiplier(p.def.effect, mat);
             if (resolveVoxelHit(mat, e, p.def.penetration)) {
                 destroyVoxelAt(ix, iy, iz);
@@ -2036,28 +2077,86 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     vkEndCommandBuffer(cmd);
 }
 
-// Character body as unit voxels relative to feet grid position (for submersion tests).
-static const int kCharUnits[][3] = {
-    // legs
-    {0,0,0},{1,0,0},{0,1,0},{1,1,0}, {3,0,0},{4,0,0},{3,1,0},{4,1,0},
-    // torso
-    {0,2,0},{1,2,0},{2,2,0},{3,2,0},{4,2,0},
-    {0,3,0},{1,3,0},{2,3,0},{3,3,0},{4,3,0},
-    {0,4,0},{1,4,0},{2,4,0},{3,4,0},{4,4,0},
-    // head
-    {1,5,0},{2,5,0},{3,5,0},{1,6,0},{2,6,0},{3,6,0},
+// Character body as solid segment volumes (unit voxels) relative to feet grid position.
+// Segments: head, neck, torso, pelvis, upper_arms, lower_arms, upper_legs, lower_legs.
+// Each segment has 1-2 voxel thick walls + solid interior for future penetration.
+static const int kCharSegments[][7] = {
+    // {x0,y0,z0, x1,y1,z1, material}  materials: 1=wood(viscera), 2=concrete(bone/skin), 4=bush_branch, 6=sheet_metal, 7=girder
+    // head: 3x3x3 at y=6..8, x=1..3, z=-1..1
+    {1, 6, -1, 3, 8, 1, 13},      // skull - CharacterBone
+    {2, 7, 0, 2, 7, 0, 12},       // brain - CharacterFlesh
+
+    // neck: 1x2x1 at y=5..6, x=2, z=0
+    {2, 5, 0, 2, 6, 0, 13},       // neck - CharacterBone
+
+    // torso: 5x7x3 at y=2..8, x=0..4, z=-1..1
+    {0, 2, -1, 4, 8, 1, 13},      // ribcage shell - CharacterBone
+    {1, 3, 0, 3, 7, 0, 12},       // organ cavity - CharacterFlesh
+
+    // pelvis: 5x3x3 at y=0..2, x=0..4, z=-1..1
+    {0, 0, -1, 4, 2, 1, 13},      // pelvic bone - CharacterBone
+    {1, 1, 0, 3, 1, 0, 12},       // pelvic cavity - CharacterFlesh
+
+    // upper arms: 2x4x2 at y=3..6
+    {-2, 3, -1, -1, 6, 0, 13},    // L upper arm shell - CharacterBone
+    {5, 3, -1, 6, 6, 0, 13},      // R upper arm shell - CharacterBone
+    {-2, 4, 0, -1, 5, 0, 12},     // L upper arm interior - CharacterFlesh
+    {5, 4, 0, 6, 5, 0, 12},       // R upper arm interior - CharacterFlesh
+
+    // lower arms: 2x3x2 at y=0..2
+    {-2, 0, -1, -1, 2, 0, 13},    // L forearm shell - CharacterBone
+    {5, 0, -1, 6, 2, 0, 13},      // R forearm shell - CharacterBone
+    {-2, 1, 0, -1, 1, 0, 12},     // L forearm interior - CharacterFlesh
+    {5, 1, 0, 6, 1, 0, 12},       // R forearm interior - CharacterFlesh
+
+    // upper legs: 3x5x2 at y=0..4
+    {0, 0, -1, 2, 4, 0, 13},      // L thigh shell - CharacterBone
+    {2, 0, -1, 4, 4, 0, 13},      // R thigh shell - CharacterBone
+    {1, 1, 0, 1, 3, 0, 12},       // L thigh interior - CharacterFlesh
+    {3, 1, 0, 3, 3, 0, 12},       // R thigh interior - CharacterFlesh
+
+    // lower legs: 2x4x2 at y=-3..0
+    {0, -3, -1, 1, 0, 0, 13},     // L calf shell - CharacterBone
+    {3, -3, -1, 4, 0, 0, 13},     // R calf shell - CharacterBone
+    {0, -2, 0, 1, -1, 0, 12},     // L calf interior - CharacterFlesh
+    {3, -2, 0, 4, -1, 0, 12},     // R calf interior - CharacterFlesh
 };
-static constexpr int kCharUnitCount = sizeof(kCharUnits) / sizeof(kCharUnits[0]);
+static constexpr int kCharSegmentCount = sizeof(kCharSegments) / sizeof(kCharSegments[0]);
+
+// Flatten segments into unit voxel array for submersion/impact sampling
+static int kCharUnits[400][3];
+static int kCharUnitCount = 0;
+
+static void initCharUnits() {
+    if (kCharUnitCount > 0) return;
+    for (int si = 0; si < kCharSegmentCount; ++si) {
+        int x0 = kCharSegments[si][0], y0 = kCharSegments[si][1], z0 = kCharSegments[si][2];
+        int x1 = kCharSegments[si][3], y1 = kCharSegments[si][4], z1 = kCharSegments[si][5];
+        int mat = kCharSegments[si][6];
+        if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+        if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+        if (z0 > z1) { int t = z0; z0 = z1; z1 = t; }
+        for (int z = z0; z <= z1; ++z)
+            for (int y = y0; y <= y1; ++y)
+                for (int x = x0; x <= x1; ++x) {
+                    kCharUnits[kCharUnitCount][0] = x;
+                    kCharUnits[kCharUnitCount][1] = y;
+                    kCharUnits[kCharUnitCount][2] = z;
+                    ++kCharUnitCount;
+                }
+    }
+}
 
 struct SubmersionInfo {
     int touching = 0;
-    int total = kCharUnitCount;
+    int total = 0;
     int currentTouching = 0;
     bool anyCurrent = false;
     bool fullySubmerged = false;
 };
 
 static SubmersionInfo sampleCharacterWater(const std::vector<Chunk>& chunks, int gx, int gy, int gz) {
+    initCharUnits();
     SubmersionInfo info;
     info.total = kCharUnitCount;
     for (int i = 0; i < kCharUnitCount; ++i) {
@@ -2075,6 +2174,121 @@ static SubmersionInfo sampleCharacterWater(const std::vector<Chunk>& chunks, int
     }
     info.fullySubmerged = (info.touching >= info.total);
     return info;
+}
+
+// Check if a voxel coordinate hits the character hitbox.
+// Returns true if hit, and optionally fills out hit segment info.
+static CharacterHit checkCharacterHit(int vx, int vy, int vz) {
+    if (!g_playerAlive) return CharacterHit{};
+    initCharUnits();
+    for (int i = 0; i < kCharUnitCount; ++i) {
+        int cx = g_playerGX + kCharUnits[i][0];
+        int cy = g_playerGY + kCharUnits[i][1];
+        int cz = g_playerGZ + kCharUnits[i][2];
+        if (cx == vx && cy == vy && cz == vz) {
+            // Determine which segment this voxel belongs to
+            int segIdx = -1;
+            for (int si = 0; si < kCharSegmentCount; ++si) {
+                int x0 = kCharSegments[si][0], y0 = kCharSegments[si][1], z0 = kCharSegments[si][2];
+                int x1 = kCharSegments[si][3], y1 = kCharSegments[si][4], z1 = kCharSegments[si][5];
+                if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+                if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+                if (z0 > z1) { int t = z0; z0 = z1; z1 = t; }
+                if (kCharUnits[i][0] >= x0 && kCharUnits[i][0] <= x1 &&
+                    kCharUnits[i][1] >= y0 && kCharUnits[i][1] <= y1 &&
+                    kCharUnits[i][2] >= z0 && kCharUnits[i][2] <= z1) {
+                    segIdx = si;
+                    break;
+                }
+            }
+            // Compute hit normal (approximate from voxel face)
+            Vec3 normal = {0, 0, 0};
+            // Check neighbors to find exposed face
+            Block nb = getWorldBlock(*g_chunks, vx + 1, vy, vz);
+            if (nb == Block::Air) normal.x = -1;
+            nb = getWorldBlock(*g_chunks, vx - 1, vy, vz);
+            if (nb == Block::Air) normal.x = 1;
+            nb = getWorldBlock(*g_chunks, vx, vy + 1, vz);
+            if (nb == Block::Air) normal.y = -1;
+            nb = getWorldBlock(*g_chunks, vx, vy - 1, vz);
+            if (nb == Block::Air) normal.y = 1;
+            nb = getWorldBlock(*g_chunks, vx, vy, vz + 1);
+            if (nb == Block::Air) normal.z = -1;
+            nb = getWorldBlock(*g_chunks, vx, vy, vz - 1);
+            if (nb == Block::Air) normal.z = 1;
+            if (normal.length() < 0.5f) normal = {0, 1, 0}; // fallback up
+            normal = normal.normalized();
+
+            int matId = kCharSegments[segIdx >= 0 ? segIdx : 0][6];
+            MaterialId mat = MaterialId::Air;
+            switch (matId) {
+                case 1: mat = MaterialId::Wood; break;
+                case 2: mat = MaterialId::Concrete; break;
+                case 3: mat = MaterialId::BushBranch; break;
+                case 4: mat = MaterialId::BushLeaves; break;
+                case 6: mat = MaterialId::SheetMetal; break;
+                case 7: mat = MaterialId::Girder; break;
+                case 12: mat = MaterialId::CharacterFlesh; break;
+                case 13: mat = MaterialId::CharacterBone; break;
+                default: mat = MaterialId::Dirt; break;
+            }
+
+            CharacterHit hit;
+            hit.hit = true;
+            hit.segmentIndex = segIdx;
+            hit.localX = kCharUnits[i][0];
+            hit.localY = kCharUnits[i][1];
+            hit.localZ = kCharUnits[i][2];
+            hit.material = mat;
+            hit.worldPos = {vx * VOXEL_SIZE, vy * VOXEL_SIZE, vz * VOXEL_SIZE};
+            hit.hitNormal = normal;
+            return hit;
+        }
+    }
+    return CharacterHit{};
+}
+
+// Apply damage and knockback to character from projectile impact
+static void applyCharacterDamage(float damage, const CharacterHit& hit, const ProjectileDef& def) {
+    if (!g_playerAlive) return;
+
+    // Segment-specific damage multipliers
+    float segmentMult = 1.0f;
+    switch (hit.segmentIndex) {
+        case 0: case 1: segmentMult = 2.5f; break; // head
+        case 2: segmentMult = 1.5f; break; // neck
+        case 3: case 4: segmentMult = 1.0f; break; // torso
+        case 5: case 6: segmentMult = 0.8f; break; // pelvis
+        case 7: case 8: case 9: case 10: segmentMult = 0.6f; break; // upper arms
+        case 11: case 12: case 13: case 14: segmentMult = 0.5f; break; // lower arms
+        case 15: case 16: case 17: case 18: segmentMult = 0.7f; break; // upper legs
+        case 19: case 20: case 21: case 22: segmentMult = 0.6f; break; // lower legs
+        default: segmentMult = 1.0f; break;
+    }
+
+    // Material-specific damage resistance (armor)
+    float armorMult = 1.0f;
+    const auto& m = materialProps(hit.material);
+    armorMult = 1.0f / (1.0f + m.toughness * 0.1f); // higher toughness = more armor
+
+    float finalDamage = damage * segmentMult * armorMult;
+    g_playerHealth -= finalDamage;
+
+    // Knockback: apply impulse opposite to hit normal, scaled by damage and projectile mass
+    float knockbackForce = finalDamage * 0.015f * (1.0f + def.mass * 5.0f);
+    g_knockbackVel = g_knockbackVel + (hit.hitNormal * -knockbackForce);
+
+    // Headshots add upward kick
+    if (hit.segmentIndex == 0 || hit.segmentIndex == 1) {
+        g_knockbackVel.y += knockbackForce * 0.5f;
+    }
+
+    // Death handling
+    if (g_playerHealth <= 0.0f) {
+        g_playerHealth = 0.0f;
+        g_playerAlive = false;
+        g_respawnTimer = 3.0f; // 3 second respawn
+    }
 }
 
 // Basic current function: how many character units touch moving water.
@@ -2111,6 +2325,32 @@ static void updatePlayerCurrentAndWeight(float dt) {
         g_camPos.z += g_currentDir.z * acc * dt;
     }
     (void)ratio;
+}
+
+// Update player knockback velocity and handle respawn
+static void updatePlayerState(float dt) {
+    if (!g_playerAlive) {
+        g_respawnTimer -= dt;
+        if (g_respawnTimer <= 0.0f) {
+            g_playerAlive = true;
+            g_playerHealth = g_playerMaxHealth;
+            g_knockbackVel = {0, 0, 0};
+            // Respawn at safe position
+            g_camPos = {WORLD_W * VOXEL_SIZE * 0.5f, 0.05f, WORLD_D * VOXEL_SIZE + 0.05f};
+        }
+        return;
+    }
+
+    // Apply knockback velocity to camera position
+    if (g_knockbackVel.length() > 0.001f) {
+        g_camPos = g_camPos + g_knockbackVel * dt;
+        // Decay knockback
+        float decay = std::exp(-g_knockbackDecay * dt);
+        g_knockbackVel = g_knockbackVel * decay;
+        if (g_knockbackVel.length() < 0.001f) {
+            g_knockbackVel = {0, 0, 0};
+        }
+    }
 }
 
 static Vec3 cameraForward() {
@@ -2194,6 +2434,7 @@ static void updateUBO(uint32_t frameIndex, float timeSec) {
 static void drawFrame(float timeSec, float dt) {
     updateCamera(dt);
     updatePlayerCurrentAndWeight(dt);
+    updatePlayerState(dt);
 
     vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
 
