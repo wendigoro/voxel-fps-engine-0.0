@@ -31,8 +31,18 @@ struct SimInput {
     // teleport the player by sending a world-space direction.
     float moveForward = 0.0f;
     float moveRight = 0.0f;
-    bool sprint = false;
+    bool sprint = false;      // level: gait multiplier while held
     bool jump = false;        // edge
+
+    // --- stance and locomotion edges ---
+    // Held crouch and the stance cycle are deliberately different fields. Crouch
+    // is a level ("stay crouched"), stanceCycle is an edge ("advance one step
+    // through standing -> crouch -> prone"). Inferring the toggle from the level
+    // changing would make the result depend on whether a frame happened to sample
+    // the press, which is the nondeterminism the fixed-step rule forbids.
+    bool crouch = false;      // level: hold crouch
+    bool stanceCycle = false; // edge: advance stance one step
+    bool dash = false;        // edge: one dash attempt this tick
 
     // --- look: accumulated pointer deltas in pixels, consumed and zeroed by the
     // tick. Accumulating here (rather than applying in the message handler) is
@@ -63,6 +73,8 @@ struct SimInput {
 // re-asserted by the view and edges never fire twice.
 inline void simInputClearEdges(SimInput& in) {
     in.jump = false;
+    in.stanceCycle = false;
+    in.dash = false;
     in.firePressed = false;
     in.cycleAmmo = false;
     in.cycleWeapon = false;

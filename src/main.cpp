@@ -205,6 +205,11 @@ static int g_width = WIDTH;
 static int g_height = HEIGHT;
 
 static bool g_keys[256]{};
+// Previous-tick level of the edge-detected movement keys. These exist only in the
+// view, to turn a press into an edge for SimInput; the sim sees the edge and never
+// the latch.
+static bool g_dashHeldPrev = false;
+static bool g_stanceHeldPrev = false;
 static bool g_mouseDown = false;
 static int g_mouseX = 0, g_mouseY = 0, g_lastMouseX = 0, g_lastMouseY = 0;
 // The view's raw device state. The simulation never reads this: buildSimInput()
@@ -5129,7 +5134,17 @@ static SimInput buildSimInput() {
     in.moveForward = std::max(-1.0f, std::min(1.0f, fwd));
     in.moveRight = std::max(-1.0f, std::min(1.0f, right));
     in.sprint = g_keys[VK_SHIFT] != 0;
+    in.crouch = g_keys[VK_CONTROL] != 0;
     in.ads = in.ads || (g_keys['X'] != 0);
+
+    // Dash and stance-cycle are edges: they are detected here, in the view, where
+    // the press actually happened, and consumed by the sim on the next tick. The
+    // sim never learns a key is held, only that a press arrived. Q/E stay reserved
+    // for lean and E for interact, so dash is C and the stance cycle is F.
+    if (g_keys['C'] && !g_dashHeldPrev) g_pendingInput.dash = true;
+    g_dashHeldPrev = g_keys['C'] != 0;
+    if (g_keys['F'] && !g_stanceHeldPrev) g_pendingInput.stanceCycle = true;
+    g_stanceHeldPrev = g_keys['F'] != 0;
 
     // Held lean keys -> one axis, so a view cannot send contradictory Q and E.
     float lean = 0.0f;
