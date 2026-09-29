@@ -17,6 +17,7 @@ immediately if the file is restructured — `scripts/build.ps1` and
 | `_write_shaders.py` | earliest `shaders/voxel.*` (superseded) |
 | `_write_night_shaders.py` | current `shaders/voxel.vert` + `voxel.frag`, incl. analytic shadow code |
 | `_write_launchers.py` | `scripts/demo.ps1` + `scripts/run.ps1` |
+| `_patch_simview_smoke_flags.py` | sim/view smoke flag output lines in `runSimViewSmoke` |
 
 ## Do not re-run
 
