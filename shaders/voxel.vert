@@ -16,8 +16,8 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float ambientScale;
     float muzzleFlash;
     float fireOverlay;
-    float _fxPad0;
-    float _fxPad1;
+    float damageFlash;
+    float healthTint;
     vec4 bulbPos[4];
     vec4 bulbColor[4];
 } ubo;

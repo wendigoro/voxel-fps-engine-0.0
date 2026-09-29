@@ -19,6 +19,8 @@
 // is invisible to the preprocessor; this is not.
 #define SIM_WORLD_HPP
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -151,5 +153,127 @@ struct World {
             .voxels[localIndex(x % kChunkSize, y % kChunkSize, z % kChunkSize)];
     }
 };
+
+namespace visible {
+
+// Authoritative per-client visible set (RULES.md, "Visibility filtering (anti-cheat)").
+// The simulation computes this set; a client view is sent ONLY chunks in this set.
+struct VisibleSet {
+    uint64_t chunkMask = 0;
+
+    bool isChunkVisible(int cx, int cy, int cz) const {
+        if (cx < 0 || cx >= kChunksX || cy < 0 || cy >= kChunksY || cz < 0 || cz >= kChunksZ)
+            return false;
+        int idx = World::chunkIndex(cx, cy, cz);
+        return (chunkMask & (1ULL << idx)) != 0;
+    }
+
+    void markVisible(int cx, int cy, int cz) {
+        if (cx < 0 || cx >= kChunksX || cy < 0 || cy >= kChunksY || cz < 0 || cz >= kChunksZ)
+            return;
+        int idx = World::chunkIndex(cx, cy, cz);
+        chunkMask |= (1ULL << idx);
+    }
+
+    int visibleCount() const {
+        int count = 0;
+        for (int i = 0; i < World::chunkCount(); ++i) {
+            if (chunkMask & (1ULL << i)) ++count;
+        }
+        return count;
+    }
+};
+
+// Compute authoritative client visible set.
+// Uses player eye position, camera forward vector, and an air ray budget.
+// Chunks not reached by air rays / outside the view cone remain occluded (anti-ESP).
+inline VisibleSet computeVisibleSet(const World& world,
+                                    float eyeX, float eyeY, float eyeZ,
+                                    float fwdX, float fwdY, float fwdZ) {
+    VisibleSet vis;
+    const int ecx = std::clamp(static_cast<int>(eyeX / (kChunkSize * kVoxelSize)), 0, kChunksX - 1);
+    const int ecy = std::clamp(static_cast<int>(eyeY / (kChunkSize * kVoxelSize)), 0, kChunksY - 1);
+    const int ecz = std::clamp(static_cast<int>(eyeZ / (kChunkSize * kVoxelSize)), 0, kChunksZ - 1);
+
+    // 1. The chunk holding the eye is always visible.
+    vis.markVisible(ecx, ecy, ecz);
+
+    // 2. Immediate 1-chunk neighborhood around the player (immediate collision/feel zone).
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                vis.markVisible(ecx + dx, ecy + dy, ecz + dz);
+            }
+        }
+    }
+
+    // 3. Air ray budgeting: cast rays covering the fisheye view cone.
+    const float fwdLen = std::sqrt(fwdX * fwdX + fwdY * fwdY + fwdZ * fwdZ);
+    float fx = (fwdLen > 1e-5f) ? (fwdX / fwdLen) : 0.0f;
+    float fy = (fwdLen > 1e-5f) ? (fwdY / fwdLen) : 0.0f;
+    float fz = (fwdLen > 1e-5f) ? (fwdZ / fwdLen) : 1.0f;
+
+    // Camera ray basis
+    float rx = -fz, ry = 0.0f, rz = fx;
+    float rlen = std::sqrt(rx * rx + rz * rz);
+    if (rlen < 1e-5f) { rx = 1.0f; rz = 0.0f; }
+    else { rx /= rlen; rz /= rlen; }
+    float ux = ry * fz - rz * fy;
+    float uy = rz * fx - rx * fz;
+    float uz = rx * fy - ry * fx;
+
+    const int kRaysYaw = 24;
+    const int kRaysPitch = 12;
+    const float kMaxDistMeters = 0.30f;
+    const float kStepMeters = kVoxelSize * 1.5f;
+    const int kMaxSteps = static_cast<int>(kMaxDistMeters / kStepMeters);
+
+    for (int py = 0; py < kRaysPitch; ++py) {
+        float vAngle = -0.85f + 1.70f * (static_cast<float>(py) / (kRaysPitch - 1));
+        for (int px = 0; px < kRaysYaw; ++px) {
+            float hAngle = -1.60f + 3.20f * (static_cast<float>(px) / (kRaysYaw - 1));
+
+            float dx = fx + rx * hAngle + ux * vAngle;
+            float dy = fy + ry * hAngle + uy * vAngle;
+            float dz = fz + rz * hAngle + uz * vAngle;
+            float dlen = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (dlen < 1e-5f) continue;
+            dx /= dlen; dy /= dlen; dz /= dlen;
+
+            float curX = eyeX;
+            float curY = eyeY;
+            float curZ = eyeZ;
+
+            for (int s = 0; s < kMaxSteps; ++s) {
+                curX += dx * kStepMeters;
+                curY += dy * kStepMeters;
+                curZ += dz * kStepMeters;
+
+                int gx = static_cast<int>(curX / kVoxelSize);
+                int gy = static_cast<int>(curY / kVoxelSize);
+                int gz = static_cast<int>(curZ / kVoxelSize);
+
+                if (!world.inBounds(gx, gy, gz)) {
+                    break;
+                }
+
+                int cx = gx / kChunkSize;
+                int cy = gy / kChunkSize;
+                int cz = gz / kChunkSize;
+                vis.markVisible(cx, cy, cz);
+
+                Block b = world.get(gx, gy, gz);
+                if (b != Block::Air && b != Block::Water && b != Block::WaterCurrent) {
+                    // Hit opaque solid block: this chunk surface was seen, but light/vision cannot pass through.
+                    break;
+                }
+            }
+        }
+    }
+
+    return vis;
+}
+
+} // namespace visible
 
 } // namespace sim

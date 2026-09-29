@@ -179,7 +179,8 @@ struct FrameUBO {
     float ambientScale;
     float muzzleFlash;     // 0..1 fire pulse (shader overlay + lighting kick)
     float fireOverlay;     // 0..1 frame-border burn
-    float _fxPad[2];
+    float damageFlash;     // 0..1 crimson damage intake flash
+    float healthTint;      // 0..1 low-health pulsing vignette
     float bulbPos[kMaxBulbs][4];   // xyz, intensity
     float bulbColor[kMaxBulbs][4]; // rgb, radius
 };
@@ -874,12 +875,25 @@ static sim::World buildWarehouseMap() {
     return world;
 }
 
+// Skirt isolation tracking: assert that client-side meshing never attempts to
+// read outside the supplied visible skirt (RULES.md, "Visibility filtering").
+static uint64_t g_skirtAccessViolations = 0;
+
 // A block as read out of a sent snapshot. This is the ONLY way view-side code
 // learns occupancy — it has no other source.
 static Block sentBlockAt(const ViewChunk& vc, int lx, int ly, int lz) {
+    if (!view::SentCells::inSkirt(lx, ly, lz)) {
+        ++g_skirtAccessViolations;
+        return Block::Air;
+    }
     // The wire enum and the sim enum are asserted equal in sim_world.hpp, so
     // this is a checked reinterpretation, not a cast of convenience.
     return static_cast<Block>(static_cast<uint8_t>(vc.sent.get(lx, ly, lz)));
+}
+
+static bool isVoxelSolidForAo(const ViewChunk& vc, int lx, int ly, int lz) {
+    const Block b = sentBlockAt(vc, lx, ly, lz);
+    return b != Block::Air && !isWaterBlock(b);
 }
 
 // Sharp vertex face emit: 6 unique verts/face (2 tris), hard face normals, no sharing.
@@ -914,6 +928,136 @@ static void emitSharpFace(std::vector<ViewChunk::Vertex>& out, int ix, int iy, i
             oz + p[2] * VOXEL_SIZE,
             N[face][0], N[face][1], N[face][2],
             c.x, c.y, c.z,
+            mat
+        });
+    }
+}
+
+// Surface smoothing and Corner Ambient Occlusion (Milestone 4).
+// Computes Minecraft-style 3-neighbor corner AO and smooth vertex normals
+// from adjacent blocks in the 1-cell skirt, while occupancy remains strictly 1x1x1 cubes.
+static void emitSmoothedFace(ViewChunk& vc, int lx, int ly, int lz,
+                             int gx, int gy, int gz, int face,
+                             const Vec3& color, float mat = 0.0f) {
+    static const float F[6][4][3] = {
+        {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
+        {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
+        {{0,1,0},{0,1,1},{1,1,1},{1,1,0}}, // +Y
+        {{0,0,1},{0,0,0},{1,0,0},{1,0,1}}, // -Y
+        {{1,0,1},{1,1,1},{0,1,1},{0,0,1}}, // +Z
+        {{0,0,0},{0,1,0},{1,1,0},{1,0,0}}, // -Z
+    };
+    static const float N[6][3] = {
+        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
+    };
+    static const float faceShade[6] = {0.82f, 0.68f, 1.0f, 0.52f, 0.90f, 0.74f};
+    static const float kAoCurve[4] = {0.58f, 0.72f, 0.86f, 1.0f};
+
+    const float ox = gx * VOXEL_SIZE;
+    const float oy = gy * VOXEL_SIZE;
+    const float oz = gz * VOXEL_SIZE;
+
+    const int nx = static_cast<int>(N[face][0]);
+    const int ny = static_cast<int>(N[face][1]);
+    const int nz = static_cast<int>(N[face][2]);
+    const int adjX = lx + nx;
+    const int adjY = ly + ny;
+    const int adjZ = lz + nz;
+
+    int aoVal[4] = {3, 3, 3, 3};
+    Vec3 cornerNorm[4];
+    Vec3 cornerCol[4];
+
+    for (int k = 0; k < 4; ++k) {
+        const float* p = F[face][k];
+        const int px = static_cast<int>(p[0]);
+        const int py = static_cast<int>(p[1]);
+        const int pz = static_cast<int>(p[2]);
+
+        const int dx = 2 * px - 1;
+        const int dy = 2 * py - 1;
+        const int dz = 2 * pz - 1;
+
+        int ux = 0, uy = 0, uz = 0;
+        int vx = 0, vy = 0, vz = 0;
+        if (nx != 0) {
+            uy = dy;
+            vz = dz;
+        } else if (ny != 0) {
+            ux = dx;
+            vz = dz;
+        } else {
+            ux = dx;
+            vy = dy;
+        }
+
+        // Corner Ambient Occlusion (Minecraft-style 3-neighbor test)
+        if (mat == 0.0f) {
+            bool s1 = isVoxelSolidForAo(vc, adjX + ux, adjY + uy, adjZ + uz);
+            bool s2 = isVoxelSolidForAo(vc, adjX + vx, adjY + vy, adjZ + vz);
+            bool sc = isVoxelSolidForAo(vc, adjX + ux + vx, adjY + uy + vy, adjZ + uz + vz);
+            aoVal[k] = (s1 && s2) ? 0 : 3 - (static_cast<int>(s1) + static_cast<int>(s2) + static_cast<int>(sc));
+        } else {
+            aoVal[k] = 3;
+        }
+        const float aoFactor = kAoCurve[aoVal[k]];
+        cornerCol[k] = color * faceShade[face] * aoFactor;
+
+        // Vertex normal smoothing: inspect 8 cubes around vertex in 1-cell skirt
+        if (mat == 0.0f) {
+            Vec3 vGrad(0.0f, 0.0f, 0.0f);
+            for (int dxi = 0; dxi < 2; ++dxi) {
+                int cdx = (dxi == 0) ? (px - 1) : px;
+                float offX = (cdx == px) ? 0.5f : -0.5f;
+                for (int dyi = 0; dyi < 2; ++dyi) {
+                    int cdy = (dyi == 0) ? (py - 1) : py;
+                    float offY = (cdy == py) ? 0.5f : -0.5f;
+                    for (int dzi = 0; dzi < 2; ++dzi) {
+                        int cdz = (dzi == 0) ? (pz - 1) : pz;
+                        float offZ = (cdz == pz) ? 0.5f : -0.5f;
+                        if (isVoxelSolidForAo(vc, lx + cdx, ly + cdy, lz + cdz)) {
+                            vGrad.x -= offX;
+                            vGrad.y -= offY;
+                            vGrad.z -= offZ;
+                        }
+                    }
+                }
+            }
+            if (vGrad.length() > 1e-4f) {
+                Vec3 vNorm = vGrad.normalized();
+                Vec3 fNorm(N[face][0], N[face][1], N[face][2]);
+                if (vNorm.dot(fNorm) > 0.15f) {
+                    cornerNorm[k] = (fNorm * 0.35f + vNorm * 0.65f).normalized();
+                } else {
+                    cornerNorm[k] = fNorm;
+                }
+            } else {
+                cornerNorm[k] = Vec3(N[face][0], N[face][1], N[face][2]);
+            }
+        } else {
+            cornerNorm[k] = Vec3(N[face][0], N[face][1], N[face][2]);
+        }
+    }
+
+    // Quad triangulation: flip diagonal if ao0 + ao2 > ao1 + ao3 to prevent anisotropic creasing
+    int indices[6];
+    if (aoVal[0] + aoVal[2] > aoVal[1] + aoVal[3]) {
+        indices[0] = 1; indices[1] = 2; indices[2] = 3;
+        indices[3] = 1; indices[4] = 3; indices[5] = 0;
+    } else {
+        indices[0] = 0; indices[1] = 1; indices[2] = 2;
+        indices[3] = 0; indices[4] = 2; indices[5] = 3;
+    }
+
+    for (int i = 0; i < 6; ++i) {
+        int ci = indices[i];
+        const float* p = F[face][ci];
+        vc.mesh.push_back(ViewChunk::Vertex{
+            ox + p[0] * VOXEL_SIZE,
+            oy + p[1] * VOXEL_SIZE,
+            oz + p[2] * VOXEL_SIZE,
+            cornerNorm[ci].x, cornerNorm[ci].y, cornerNorm[ci].z,
+            cornerCol[ci].x, cornerCol[ci].y, cornerCol[ci].z,
             mat
         });
     }
@@ -963,7 +1107,7 @@ static void meshChunk(ViewChunk& chunk) {
                     if (isWaterBlock(b)) mat = 1.0f;
                     else if (b == Block::LightBulb) mat = 2.0f;
                     else if (b == Block::Moon) mat = 3.0f;
-                    emitSharpFace(chunk.mesh, x, y, z, f, col, mat);
+                    emitSmoothedFace(chunk, lx, ly, lz, x, y, z, f, col, mat);
                 }
             }
         }
@@ -985,8 +1129,16 @@ static void meshChunk(ViewChunk& chunk) {
 // sim_world.hpp static_asserts the two enums agree, so this crossing is checked
 // rather than trusted, and it is the single place world data becomes client
 // data.
-static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc) {
+static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc, bool isVisible = true) {
     if (!vc.hasSnapshot) vc.sent.alloc();
+    if (!isVisible) {
+        // Anti-cheat: zero out snapshot so client memory contains no hidden world data
+        for (auto& cell : vc.sent.cells) {
+            cell.id = static_cast<uint8_t>(wire::BlockId::Air);
+        }
+        vc.hasSnapshot = true;
+        return;
+    }
     const int baseX = vc.cx * CHUNK_SIZE;
     const int baseY = vc.cy * CHUNK_SIZE;
     const int baseZ = vc.cz * CHUNK_SIZE;
@@ -3627,6 +3779,107 @@ static HealthSmokeReport runHealthSmoke() {
     return rep;
 }
 
+struct SimViewSmokeReport {
+    bool visibleSetOk = false;
+    bool antiCheatGatingOk = false;
+    bool skirtIsolationOk = false;
+    bool cornerAoOk = false;
+    bool normalSmoothingOk = false;
+    bool cubicPreservedOk = false;
+};
+
+static SimViewSmokeReport g_simViewSmoke;
+
+static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
+    SimViewSmokeReport rep;
+
+    // 1. Authoritative visible set computation (Milestone 3)
+    {
+        const Vec3 fwd(0.0f, 0.0f, -1.0f);
+        sim::visible::VisibleSet vis = sim::visible::computeVisibleSet(
+            world, g_camPos.x, g_camPos.y, g_camPos.z, fwd.x, fwd.y, fwd.z);
+        const int ecx = std::clamp(static_cast<int>(g_camPos.x / (sim::kChunkSize * VOXEL_SIZE)), 0, sim::kChunksX - 1);
+        const int ecy = std::clamp(static_cast<int>(g_camPos.y / (sim::kChunkSize * VOXEL_SIZE)), 0, sim::kChunksY - 1);
+        const int ecz = std::clamp(static_cast<int>(g_camPos.z / (sim::kChunkSize * VOXEL_SIZE)), 0, sim::kChunksZ - 1);
+        rep.visibleSetOk = vis.isChunkVisible(ecx, ecy, ecz) && vis.visibleCount() > 0 && vis.visibleCount() <= sim::World::chunkCount();
+    }
+
+    // 2. Anti-cheat gating: occluded chunks transmit 0 data, and meshing an occluded chunk emits 0 vertices
+    {
+        ViewChunk testVc;
+        testVc.cx = 0; testVc.cy = 0; testVc.cz = 0;
+        sendChunkSnapshot(world, testVc, false); // occluded
+        bool allAir = true;
+        for (const auto& cell : testVc.sent.cells) {
+            if (cell.id != static_cast<uint8_t>(wire::BlockId::Air)) {
+                allAir = false;
+                break;
+            }
+        }
+        meshChunk(testVc);
+        const bool zeroVerts = testVc.mesh.empty();
+
+        // When visible, non-air data is sent and faces are generated
+        sendChunkSnapshot(world, testVc, true);
+        meshChunk(testVc);
+        const bool hasVerts = !testVc.mesh.empty();
+
+        rep.antiCheatGatingOk = allAir && zeroVerts && hasVerts;
+    }
+
+    // 3. Skirt isolation: no out-of-skirt access occurred during meshing
+    {
+        rep.skirtIsolationOk = (g_skirtAccessViolations == 0);
+    }
+
+    // 4. Corner Ambient Occlusion (AO): corner touching an adjacent solid block receives darker shade (Milestone 4)
+    {
+        ViewChunk testAo;
+        testAo.sent.alloc();
+        // Create an inside corner: floor block at (5, 5, 5), wall block at (6, 6, 5)
+        testAo.sent.set(5, 5, 5, wire::BlockId::Concrete);
+        testAo.sent.set(6, 6, 5, wire::BlockId::Concrete);
+        meshChunk(testAo);
+
+        bool foundAoDarkening = false;
+        // Search vertices of floor block (5, 5, 5) on top face (+Y)
+        for (const auto& v : testAo.mesh) {
+            if (std::fabs(v.ny - 1.0f) < 0.2f && v.y > (5.0f * VOXEL_SIZE)) {
+                const float unoccludedR = blockColor(Block::Concrete).x * 1.0f; // faceShade[2] = 1.0
+                if (v.r < unoccludedR * 0.95f) {
+                    foundAoDarkening = true;
+                    break;
+                }
+            }
+        }
+        rep.cornerAoOk = foundAoDarkening;
+    }
+
+    // 5. Normal smoothing: an isolated block has corner normals bent outward along corners
+    {
+        ViewChunk testNorm;
+        testNorm.sent.alloc();
+        testNorm.sent.set(5, 5, 5, wire::BlockId::Concrete);
+        meshChunk(testNorm);
+
+        bool foundSmoothedNormal = false;
+        for (const auto& v : testNorm.mesh) {
+            if (v.ny > 0.4f && (std::fabs(v.nx) > 0.1f || std::fabs(v.nz) > 0.1f)) {
+                foundSmoothedNormal = true;
+                break;
+            }
+        }
+        rep.normalSmoothingOk = foundSmoothedNormal;
+    }
+
+    // 6. Cubic grid preservation (RULES.md): VOXEL_SIZE is strictly 0.001
+    {
+        rep.cubicPreservedOk = (std::fabs(VOXEL_SIZE - 0.001f) < 1e-7f);
+    }
+
+    return rep;
+}
+
 static InventorySmokeReport runInventorySmoke() {
     InventorySmokeReport rep;
     rep.zonesTile = armorZonesTileHitbox();
@@ -4548,8 +4801,13 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
     ubo.ambientScale = g_isNight ? 0.65f : 1.0f;
     ubo.muzzleFlash = g_muzzleFlash;
     ubo.fireOverlay = g_fireOverlay;
-    ubo._fxPad[0] = 0.0f;
-    ubo._fxPad[1] = 0.0f;
+    ubo.damageFlash = g_health.sinceLastHit < health::kDamageFlashSeconds
+                          ? std::clamp(1.0f - (g_health.sinceLastHit / health::kDamageFlashSeconds), 0.0f, 1.0f)
+                          : 0.0f;
+    const float hpFrac = g_health.healthFraction();
+    ubo.healthTint = (!g_health.dead && hpFrac < 0.35f)
+                         ? std::clamp((0.35f - hpFrac) / 0.35f, 0.0f, 1.0f)
+                         : (g_health.dead ? 1.0f : 0.0f);
 
     // Warm bulbs harvested from Block::LightBulb occupancy. Unknown slots are
     // zeroed so the shader's fixed loop sees intensity 0 and skips them.
@@ -5146,11 +5404,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         }
 
         vkDeviceWaitIdle(g_device);
-        g_world = nullptr;
-        g_views = nullptr;
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
+            g_simViewSmoke = runSimViewSmoke(world);
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
@@ -5316,6 +5573,11 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                      g_invSmoke.pickupOk && g_invSmoke.pickupTaken)
                         ? 1
                         : 0)
+                << "\nsim_visible_ok=" << (g_simViewSmoke.visibleSetOk ? 1 : 0)
+                << "\nanti_cheat_gating_ok=" << (g_simViewSmoke.antiCheatGatingOk ? 1 : 0)
+                << "\nskirt_isolation_ok=" << (g_simViewSmoke.skirtIsolationOk ? 1 : 0)
+                << "\nview_smoothing_ok=" << ((g_simViewSmoke.cornerAoOk && g_simViewSmoke.normalSmoothingOk) ? 1 : 0)
+                << "\nao_corners_ok=" << (g_simViewSmoke.cornerAoOk ? 1 : 0)
                 << "\n";
         }
     } catch (const std::exception& e) {

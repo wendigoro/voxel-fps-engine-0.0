@@ -18,8 +18,8 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float ambientScale;
     float muzzleFlash;
     float fireOverlay;
-    float _fxPad0;
-    float _fxPad1;
+    float damageFlash;
+    float healthTint;
     vec4 bulbPos[4];
     vec4 bulbColor[4];
 } ubo;
@@ -87,21 +87,39 @@ float shadowRayPoint(vec3 origin, vec3 lightPos, out float edge) {
 void applyFireOverlay(inout vec3 lit) {
     float flash = ubo.muzzleFlash;
     float border = ubo.fireOverlay;
-    if (flash < 0.001 && border < 0.001) return;
+    float dmgFlash = ubo.damageFlash;
+    float hpTint = ubo.healthTint;
 
     float r = length(fragNdc);
-    // Center bloom + warm fill
-    float center = 1.0 - smoothstep(0.0, 0.72, r);
-    lit += vec3(1.0, 0.78, 0.32) * flash * (0.18 + 0.55 * center);
-    // Frame burn / corner vignette pulse
-    float edgeX = smoothstep(0.72, 1.08, abs(fragNdc.x));
-    float edgeY = smoothstep(0.68, 1.05, abs(fragNdc.y));
-    float frame = max(edgeX, edgeY);
-    float corner = edgeX * edgeY;
-    lit += vec3(1.0, 0.42, 0.12) * border * (frame * 0.55 + corner * 0.85);
-    // Slight desat crush on hard flash for "shutter" feel
-    float luma = dot(lit, vec3(0.299, 0.587, 0.114));
-    lit = mix(lit, vec3(luma) * vec3(1.05, 0.95, 0.85), flash * 0.12);
+
+    if (flash >= 0.001 || border >= 0.001) {
+        // Center bloom + warm fill
+        float center = 1.0 - smoothstep(0.0, 0.72, r);
+        lit += vec3(1.0, 0.78, 0.32) * flash * (0.18 + 0.55 * center);
+        // Frame burn / corner vignette pulse
+        float edgeX = smoothstep(0.72, 1.08, abs(fragNdc.x));
+        float edgeY = smoothstep(0.68, 1.05, abs(fragNdc.y));
+        float frame = max(edgeX, edgeY);
+        float corner = edgeX * edgeY;
+        lit += vec3(1.0, 0.42, 0.12) * border * (frame * 0.55 + corner * 0.85);
+        // Slight desat crush on hard flash for "shutter" feel
+        float luma = dot(lit, vec3(0.299, 0.587, 0.114));
+        lit = mix(lit, vec3(luma) * vec3(1.05, 0.95, 0.85), flash * 0.12);
+    }
+
+    // Combat feel: rapid crimson wash on impact damage
+    if (dmgFlash > 0.001) {
+        float bloom = 1.0 - smoothstep(0.0, 0.95, r);
+        lit = mix(lit, vec3(0.85, 0.04, 0.04), dmgFlash * 0.45);
+        lit += vec3(0.9, 0.08, 0.08) * dmgFlash * (0.15 + 0.35 * bloom);
+    }
+
+    // Low health: dark red vignette pulse around screen border
+    if (hpTint > 0.001) {
+        float edge = smoothstep(0.55, 1.15, r);
+        float pulse = 0.8 + 0.2 * sin(ubo.time * 6.0);
+        lit = mix(lit, vec3(0.55, 0.02, 0.02), hpTint * edge * pulse * 0.65);
+    }
 }
 
 void main() {
