@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
   Development launcher: Build | Painter | Engine | smokes | UI.
@@ -18,7 +18,7 @@
   (empty)       - interactive menu
 #>
 param(
-  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokePainter", "SmokeAll", "Ui", "Help", "")]
+  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokeMovement", "SmokePainter", "SmokeAll", "Ui", "Help", "")]
   [string]$Action = "",
 
   [Parameter(ValueFromRemainingArguments = $true)]
@@ -57,13 +57,14 @@ function Invoke-RepoScript {
 
 function Show-Help {
   Write-Host @"
-launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokePainter|SmokeAll|Ui>
+launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokeMovement|SmokePainter|SmokeAll|Ui>
   Build         - engine build.ps1
   Painter       - build_painter.ps1 (core smoke)
   Engine        - run.ps1 interactive
   SmokeEngine   - demo.ps1 -SkipInteractive
+  SmokeMovement - smoke_movement.ps1
   SmokePainter  - smoke_painter.ps1 / build_painter.ps1
-  SmokeAll      - painter + engine smokes
+  SmokeAll      - painter + movement + engine smokes
   Ui            - run_painter_ui.ps1 if present else Painter
   Help          - this text
 
@@ -79,7 +80,7 @@ function Show-Menu {
   Write-Host " 3  Engine         interactive engine (scripts/run.ps1)"
   Write-Host " 4  SmokeEngine    demo.ps1 -SkipInteractive"
   Write-Host " 5  SmokePainter   smoke_painter.ps1"
-  Write-Host " 6  SmokeAll       painter + engine smokes"
+  Write-Host " 6  SmokeAll       painter + movement + engine smokes"
   Write-Host " 7  Ui             run_painter_ui.ps1 (or Painter)"
   Write-Host " h  Help"
   Write-Host " q  Quit"
@@ -132,9 +133,14 @@ function Invoke-Action {
       }
       return Invoke-RepoScript -Name "build_painter.ps1"
     }
+    "SmokeMovement" {
+      return Invoke-RepoScript -Name "smoke_movement.ps1" -NamedArgs @{ SkipBuild = $true }
+    }
     "SmokeAll" {
       $p = Invoke-Action -Name "SmokePainter"
       if ($p -ne 0) { return $p }
+      $m = Invoke-Action -Name "SmokeMovement"
+      if ($m -ne 0) { return $m }
       $e = Invoke-Action -Name "SmokeEngine"
       if ($e -ne 0) { return $e }
       Write-Host "SMOKE_ALL_OK" -ForegroundColor Green
