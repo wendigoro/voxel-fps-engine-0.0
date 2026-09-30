@@ -5660,6 +5660,46 @@ static SimInput buildSimInput() {
     return in;
 }
 
+// Fingerprint of the simulation's end state, for refactors that must not change
+// behaviour. It folds in every cell of the authoritative world, every debris
+// particle, live projectiles, the player body and health. The sim is fixed-step
+// and seeded by nothing, so two runs of the same build must agree, and a
+// behaviour-preserving refactor must reproduce the value exactly. Fields are
+// hashed one by one (never whole structs) so padding bytes cannot leak in.
+struct Fnv64 {
+    uint64_t h = 1469598103934665603ull;
+    void bytes(const void* p, size_t n) {
+        const auto* b = static_cast<const unsigned char*>(p);
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    }
+    template <class T> void add(const T& v) { bytes(&v, sizeof(v)); }
+};
+
+static uint64_t simFingerprint() {
+    Fnv64 f;
+    if (g_world)
+        for (const auto& c : g_world->chunks)
+            if (!c.voxels.empty()) f.bytes(c.voxels.data(), c.voxels.size() * sizeof(c.voxels[0]));
+    for (const auto& d : g_debris.particles) {
+        f.add(d.alive);
+        if (!d.alive) continue;
+        f.add(d.px); f.add(d.py); f.add(d.pz);
+        f.add(d.vx); f.add(d.vy); f.add(d.vz);
+        f.add(d.life); f.add(d.bounces);
+    }
+    f.add(g_debris.ricochets);
+    for (const auto& p : g_projectiles) {
+        f.add(p.px); f.add(p.py); f.add(p.pz);
+        f.add(p.vx); f.add(p.vy); f.add(p.vz);
+        f.add(p.energy); f.add(p.alive);
+    }
+    f.add(g_player.px); f.add(g_player.py); f.add(g_player.pz);
+    f.add(g_player.vx); f.add(g_player.vy); f.add(g_player.vz);
+    f.add(g_health.health); f.add(g_health.dead);
+    f.add(g_voxelsDestroyed);
+    return f.h;
+}
+
 static void simulateOnce(float dt, const SimInput& in) {
     // Health tick (RULES.md rule 15), ahead of input so a dead player is
     // frozen out of every control on the same frame.
@@ -5965,6 +6005,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
+            // Taken before the self-tests below, which may poke player state.
+            const uint64_t simPrint = simFingerprint();
             const bool jsonxOk = jsonxSelfTest();
             g_simViewSmoke = runSimViewSmoke(world);
             g_invSmoke = runInventorySmoke();
@@ -5977,6 +6019,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nsim_hz=" << TICK_HZ
                 << "\nvertices=" << g_liveVertexCount
                 << "\nvertex_slots=" << g_vertexCount
+                << "\nsim_fingerprint=" << std::hex << simPrint << std::dec
                 << "\nmesh_repacks=" << g_meshRepackCount
                 << "\nmesh_relocations=" << g_meshRelocateCount
                 << "\nmesh_touched_avg=" << (g_meshUploadSamples > 0 ? double(g_meshTouchedSum) / g_meshUploadSamples : 0.0)
