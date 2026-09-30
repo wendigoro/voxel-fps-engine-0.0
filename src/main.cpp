@@ -34,6 +34,7 @@
 #include "mesh_view.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
+#include "ballistics.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -289,7 +290,10 @@ static sim::World* g_world = nullptr;
 static std::vector<ViewChunk>* g_views = nullptr;
 static std::vector<ProjectileDef> g_projDefs;
 static std::vector<AmmoDef> g_ammoDefs;
-static std::vector<ProjectileRuntime> g_projectiles;
+// Live rounds and the last impact belong to the ballistics module's state.
+// g_projectiles is the name the rest of this file uses for the round list.
+static ballistics::State g_ballistics;
+static std::vector<ProjectileRuntime>& g_projectiles = g_ballistics.projectiles;
 static int g_activeAmmoIndex = 0; // cycles ammo subtypes for active caliber (R)
 static bool g_meshDirty = false;
 static bool g_firePressed = false; // edge: semi/bolt or smoke
@@ -404,9 +408,6 @@ struct InventoryHover {
 };
 static InventoryHover g_invHover;
 static int g_inventoryHandRot = 0;   // preview rotation while carrying an item
-static float g_lastImpactDx = 0, g_lastImpactDy = 0, g_lastImpactDz = -1;
-static float g_lastImpactEnergy = 10.0f;
-static float g_lastAoeScale = 1.0f;
 static int g_shotgunShots = 0;
 static int g_pelletSpawns = 0;
 // GPU buffer for visual debris cubes (display-only 8^3 chips) + muzzle flash cubes
@@ -647,21 +648,9 @@ static void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
 // Water is painted as slightly larger *logical* cells (2x2x2 unit cubes) for volume/tide.
 static constexpr int WATER_CELL = 2;
 
-static MaterialId blockMaterial(Block b) {
-    switch (b) {
-    case Block::Dirt: return MaterialId::Dirt;
-    case Block::Concrete: return MaterialId::Concrete;
-    case Block::SheetMetal: return MaterialId::SheetMetal;
-    case Block::Girder: return MaterialId::Girder;
-    case Block::Wood: return MaterialId::Wood;
-    case Block::WoodDark: return MaterialId::BushBranch;
-    case Block::Water:
-    case Block::WaterCurrent: return MaterialId::Water;
-    case Block::Moon:
-    case Block::LightBulb: return MaterialId::Air; // emissive, no impact mass
-    default: return MaterialId::Air;
-    }
-}
+// Impact material of a block. Owned by the ballistics module, which is the
+// simulation code that asks the question most.
+using ballistics::blockMaterial;
 
 static bool isWaterBlock(Block b) {
     return b == Block::Water || b == Block::WaterCurrent;
@@ -2929,71 +2918,38 @@ static bool ensureVertexCapacity(uint32_t verts) {
     return g_vertexMapped != nullptr;
 }
 
-static void destroyVoxelAt(int x, int y, int z) {
-    if (!g_world || !worldInBounds(x, y, z)) return;
-    Block b = getWorldBlock(*g_world, x, y, z);
-    if (b == Block::Air) return;
-    MaterialId mat = blockMaterial(b);
-    // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
-    g_debris.spawnFromVoxel(x, y, z, mat,
-                            g_lastImpactDx, g_lastImpactDy, g_lastImpactDz,
-                            g_lastImpactEnergy, VOXEL_SIZE, g_lastAoeScale);
-    setWorldBlock(*g_world, x, y, z, Block::Air);
-    g_meshDirty = true;
-    ++g_voxelsDestroyed;
-}
-
-static void applySplash(int cx, int cy, int cz, float radius, float energy,
-                        const ProjectileDef& def) {
-    if (!g_world || radius <= 0.0f) return;
-    // Expand splash by caliber/damage AOE, then density-scale per cell.
-    const float aoe = impactAoeScale(def);
-    float effectiveR = radius * std::max(0.5f, aoe);
-    int r = std::max(1, static_cast<int>(effectiveR / VOXEL_SIZE) + 1);
-    // Cap neighborhood for shotgun volleys (performance).
-    if (def.pellets > 1) r = std::min(r, 3);
-    else r = std::min(r, 6);
-    for (int dz = -r; dz <= r; ++dz)
-        for (int dy = -r; dy <= r; ++dy)
-            for (int dx = -r; dx <= r; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0) continue;
-                int x = cx + dx, y = cy + dy, z = cz + dz;
-                if (!worldInBounds(x, y, z)) continue;
-                float dist = std::sqrt(float(dx * dx + dy * dy + dz * dz)) * VOXEL_SIZE;
-                Block b = getWorldBlock(*g_world, x, y, z);
-    MaterialId mat = blockMaterial(b);
-    // Removing a fixture changes the light set, not just the surface mesh.
-    if (b == Block::LightBulb) g_bulbsDirty = true;
-                if (mat == MaterialId::Air || mat == MaterialId::Plexiglass) continue;
-                float cellR = densityScaledSplash(effectiveR, mat);
-                if (dist > cellR) continue;
-                float fall = std::pow(std::max(0.0f, 1.0f - dist / std::max(cellR, 1e-6f)), def.splashFalloff);
-                // Dense materials soak energy harder beyond threshold already.
-                float densMul = 1.0f / std::sqrt(std::max(0.2f, materialProps(mat).density));
-                float e = energy * fall * 0.65f * effectMultiplier(def.effect, mat) * densMul;
-                float thr = breakEnergyThreshold(mat);
-                g_lastAoeScale = aoe * densMul;
-                g_lastImpactEnergy = e;
-                if (e >= thr * 0.8f) destroyVoxelAt(x, y, z);
-            }
-
-    // Splash reaches bodies too. Self damage is ON, so the player's own grenade
-    // hurts them; the shooter is only excluded from their own bullet's
-    // *direct* hit (see ProjectileRuntime::ownerIsPlayer).
-    if (health::kSelfFireDamage) {
-        const float impactX = (static_cast<float>(cx) + 0.5f) * VOXEL_SIZE;
-        const float impactY = (static_cast<float>(cy) + 0.5f) * VOXEL_SIZE;
-        const float impactZ = (static_cast<float>(cz) + 0.5f) * VOXEL_SIZE;
-        const health::BodyCellOrigin org = health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
-        const float bodyDist = health::distanceToBody(org, impactX, impactY, impactZ);
-        if (bodyDist <= effectiveR) {
-            const float fall =
-                std::pow(std::max(0.0f, 1.0f - bodyDist / std::max(effectiveR, 1e-6f)), def.splashFalloff);
-            const ArmorZone zone = health::zoneNearestPoint(org, impactX, impactY, impactZ);
-            damagePlayerAtZone(energy * fall * 0.65f, def.effect, zone);
-        }
+// What ballistics does to the rest of this simulation: debris, remesh flags,
+// damage intake and telemetry. The module itself holds none of these.
+struct SimBallisticsHooks final : ballistics::Hooks {
+    void voxelDestroyed(int x, int y, int z, Block was, MaterialId mat,
+                        const ballistics::Impact& imp) override {
+        // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
+        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
+                                imp.aoeScale);
+        // Removing a fixture changes the light set, not just the surface mesh.
+        if (was == Block::LightBulb) g_bulbsDirty = true;
+        g_meshDirty = true;
+        ++g_voxelsDestroyed;
     }
-}
+    void ricochet(int x, int y, int z, MaterialId mat, const ballistics::Impact& imp) override {
+        ++g_debris.ricochets;
+        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
+                                imp.aoeScale);
+    }
+    ArmorZone bodySweep(float ax, float ay, float az, float bx, float by, float bz,
+                        float radiusCells) override {
+        return projectileHitZone(ax, ay, az, bx, by, bz, radiusCells);
+    }
+    float bodyDistance(float x, float y, float z, ArmorZone& nearest) override {
+        const health::BodyCellOrigin org = health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
+        nearest = health::zoneNearestPoint(org, x, y, z);
+        return health::distanceToBody(org, x, y, z);
+    }
+    void damageBody(float energy, const std::string& effect, ArmorZone zone) override {
+        damagePlayerAtZone(energy, effect, zone);
+    }
+};
+static SimBallisticsHooks g_ballisticsHooks;
 
 static WeaponDef activeWeaponOrDefault() {
     if (!g_weapons.empty()) {
@@ -3072,166 +3028,6 @@ static Vec3 aimForward(const WeaponDef& w) {
     return (f + r * ox + u * oy).normalized();
 }
 
-// Unit-grid DDA ray (Amanatides & Woo). Hitscan/energy only — gravity_scale=0 path.
-static int fireHitscanRay(const ProjectileDef& def, float energyScale, const Vec3& aimDir) {
-    if (!g_world) return 0;
-    Vec3 fwd = aimDir.normalized();
-    // Start slightly forward of camera in world space.
-    float ox = (g_camPos.x + fwd.x * 0.02f) / VOXEL_SIZE;
-    float oy = (g_camPos.y + fwd.y * 0.02f) / VOXEL_SIZE;
-    float oz = (g_camPos.z + fwd.z * 0.02f) / VOXEL_SIZE;
-    float dx = fwd.x, dy = fwd.y, dz = fwd.z;
-    // Avoid zero-direction components for DDA.
-    const float eps = 1e-8f;
-    if (std::fabs(dx) < eps) dx = (dx < 0.0f ? -eps : eps);
-    if (std::fabs(dy) < eps) dy = (dy < 0.0f ? -eps : eps);
-    if (std::fabs(dz) < eps) dz = (dz < 0.0f ? -eps : eps);
-
-    int ix = static_cast<int>(std::floor(ox));
-    int iy = static_cast<int>(std::floor(oy));
-    int iz = static_cast<int>(std::floor(oz));
-
-    const int stepX = dx > 0.0f ? 1 : -1;
-    const int stepY = dy > 0.0f ? 1 : -1;
-    const int stepZ = dz > 0.0f ? 1 : -1;
-
-    // World-space distance to cross one unit voxel on each axis.
-    const float tDeltaX = VOXEL_SIZE / std::fabs(dx);
-    const float tDeltaY = VOXEL_SIZE / std::fabs(dy);
-    const float tDeltaZ = VOXEL_SIZE / std::fabs(dz);
-
-    // tMax: world distance along ray to next voxel boundary on each axis.
-    float tMaxX = (stepX > 0)
-        ? ((static_cast<float>(ix) + 1.0f - ox) / dx) * VOXEL_SIZE
-        : ((ox - static_cast<float>(ix)) / -dx) * VOXEL_SIZE;
-    float tMaxY = (stepY > 0)
-        ? ((static_cast<float>(iy) + 1.0f - oy) / dy) * VOXEL_SIZE
-        : ((oy - static_cast<float>(iy)) / -dy) * VOXEL_SIZE;
-    float tMaxZ = (stepZ > 0)
-        ? ((static_cast<float>(iz) + 1.0f - oz) / dz) * VOXEL_SIZE
-        : ((oz - static_cast<float>(iz)) / -dz) * VOXEL_SIZE;
-
-    float energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f) * energyScale;
-    // Energy beams still use kineticEnergy scale; mass is tiny but baseDamage carries power.
-    if (def.gravityScale <= 0.0f)
-        energy = std::max(energy, def.baseDamage * 1.5f * energyScale);
-
-    const float maxDist = 1.75f; // world units (~1750 unit voxels)
-    float traveled = 0.0f;
-    int breaks = 0;
-    const int maxSteps = static_cast<int>(maxDist / VOXEL_SIZE) + 2;
-    // One bullet, one body: the sweep is sampled per cell, and the 5-cell-wide
-    // player would otherwise be counted once per cell it spans. The shooter's
-    // own shot is excluded (the ray origin is inside their head); enemy fire
-    // will use the same path once it exists.
-    bool bodyHit = false;
-    const float radiusCells = std::max(0.5f, std::min(2.0f, def.radius / VOXEL_SIZE));
-    float prevWx = g_camPos.x + fwd.x * 0.02f;
-    float prevWy = g_camPos.y + fwd.y * 0.02f;
-    float prevWz = g_camPos.z + fwd.z * 0.02f;
-
-    for (int step = 0; step < maxSteps; ++step) {
-        // Body sweep for this cell, tested in cell space against the same box
-        // the armor zones tile.
-        {
-            const float curWx = (static_cast<float>(ix) + 0.5f) * VOXEL_SIZE;
-            const float curWy = (static_cast<float>(iy) + 0.5f) * VOXEL_SIZE;
-            const float curWz = (static_cast<float>(iz) + 0.5f) * VOXEL_SIZE;
-            if (!bodyHit) {
-                const ArmorZone zone =
-                    projectileHitZone(prevWx, prevWy, prevWz, curWx, curWy, curWz, radiusCells);
-                if (zone != ArmorZone::Count) {
-                    bodyHit = true;
-                    damagePlayerAtZone(energy, def.effect, zone);
-                    // Soft target: a penetrating round keeps going, weaker.
-                    energy *= (1.0f - std::min(0.95f, def.penetration));
-                    if (energy < 0.05f) break;
-                }
-            }
-            prevWx = curWx;
-            prevWy = curWy;
-            prevWz = curWz;
-        }
-        if (worldInBounds(ix, iy, iz)) {
-            Block b = getWorldBlock(*g_world, ix, iy, iz);
-            MaterialId mat = blockMaterial(b);
-            if (mat != MaterialId::Air) {
-                float e = energy * effectMultiplier(def.effect, mat);
-                g_lastImpactDx = dx; g_lastImpactDy = dy; g_lastImpactDz = dz;
-                g_lastImpactEnergy = e;
-                if (resolveVoxelHit(mat, e, def.penetration)) {
-                    destroyVoxelAt(ix, iy, iz);
-                    applySplash(ix, iy, iz, def.splashRadius, energy, def);
-                    energy = e;
-                    ++breaks;
-                    if (energy < 0.05f) break;
-                } else {
-                    // Ricochet / spark chips on tough surfaces (matrix reflection).
-                    float nx, ny, nz;
-                    faceNormalFromVelocity(dx, dy, dz, nx, ny, nz);
-                    float rvx = dx, rvy = dy, rvz = dz;
-                    const auto& mp = materialProps(mat);
-                    ricochetVelocity(rvx, rvy, rvz, nx, ny, nz,
-                                     0.15f + mp.damping * 0.2f, 0.35f + mp.density * 0.02f);
-                    g_debris.ricochets++;
-                    // Small chip burst without destroying occupancy
-                    g_lastAoeScale = impactAoeScale(def) * 0.5f;
-                    g_debris.spawnFromVoxel(ix, iy, iz, mat, dx, dy, dz, e * 0.35f, VOXEL_SIZE, g_lastAoeScale);
-                    energy = e;
-                    break;
-                }
-            }
-        } else if (traveled > 0.05f) {
-            // Left the map after traveling — end ray.
-            break;
-        }
-
-        // Step to next voxel face.
-        if (tMaxX < tMaxY) {
-            if (tMaxX < tMaxZ) {
-                traveled = tMaxX;
-                tMaxX += tDeltaX;
-                ix += stepX;
-            } else {
-                traveled = tMaxZ;
-                tMaxZ += tDeltaZ;
-                iz += stepZ;
-            }
-        } else {
-            if (tMaxY < tMaxZ) {
-                traveled = tMaxY;
-                tMaxY += tDeltaY;
-                iy += stepY;
-            } else {
-                traveled = tMaxZ;
-                tMaxZ += tDeltaZ;
-                iz += stepZ;
-            }
-        }
-        if (traveled > maxDist) break;
-    }
-    // Remesh deferred to drawFrame after GPU fence.
-    return breaks;
-}
-
-static void spawnBallisticProjectile(const ProjectileDef& def, const Vec3& aimDir) {
-    Vec3 fwd = aimDir.normalized();
-    ProjectileRuntime p;
-    p.def = def;
-    // Spawn just ahead of camera; subunit-sized projectiles use def.radius.
-    const float muzzle = std::max(0.02f, def.radius * 40.0f);
-    p.px = g_camPos.x + fwd.x * muzzle;
-    p.py = g_camPos.y + fwd.y * muzzle;
-    p.pz = g_camPos.z + fwd.z * muzzle;
-    p.vx = fwd.x * def.speed;
-    p.vy = fwd.y * def.speed;
-    p.vz = fwd.z * def.speed;
-    p.energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f);
-    p.alive = true;
-    p.ownerIsPlayer = true; // never self-inflicted by the shooter's own bullet
-    g_projectiles.push_back(p);
-}
-
 // Spread aim direction within a cone (shotgun pellets).
 static Vec3 spreadAim(const Vec3& forward, float spreadDeg, int pelletIndex, int pelletCount) {
     if (spreadDeg <= 0.01f || pelletCount <= 1) return forward.normalized();
@@ -3286,7 +3082,7 @@ static void fireProjectile() {
         }
     }
     def = scaleProjectileForWeapon(def, fired);
-    g_lastAoeScale = impactAoeScale(def);
+    g_ballistics.last.aoeScale = impactAoeScale(def);
 
     bool useHitscan = fired.hitscan || def.hitscan || def.gravityScale <= 0.0f ||
                       fired.ammo.hitscan || fired.ammo.effect == "energy";
@@ -3305,7 +3101,8 @@ static void fireProjectile() {
     g_lastFireMode = fired.fireMode.empty() ? "semi" : fired.fireMode;
 
     if (useHitscan) {
-        fireHitscanRay(def, 1.0f, aim);
+        ballistics::fireHitscan(g_ballistics, *g_world, g_ballisticsHooks, def, 1.0f,
+                                g_camPos.x, g_camPos.y, g_camPos.z, aim.x, aim.y, aim.z);
         ++g_hitscanShots;
     } else {
         const int n = std::clamp(def.pellets, 1, 12);
@@ -3317,11 +3114,13 @@ static void fireProjectile() {
             const int spawnN = std::min(n, std::max(1, room));
             for (int i = 0; i < spawnN; ++i) {
                 Vec3 dir = spreadAim(aim, def.spreadDeg, i, spawnN);
-                spawnBallisticProjectile(def, dir);
+                ballistics::spawnProjectile(g_ballistics, def, g_camPos.x, g_camPos.y, g_camPos.z,
+                                            dir.x, dir.y, dir.z);
             }
             g_ballisticShots += spawnN;
         } else {
-            spawnBallisticProjectile(def, aim);
+            ballistics::spawnProjectile(g_ballistics, def, g_camPos.x, g_camPos.y, g_camPos.z,
+                                        aim.x, aim.y, aim.z);
             ++g_ballisticShots;
         }
     }
@@ -4671,83 +4470,7 @@ static InventorySmokeReport runInventorySmoke() {
 
 static void updateProjectiles(float dt) {
     if (!g_world) return;
-    for (auto& p : g_projectiles) {
-        if (!p.alive) continue;
-        // Gravity (matches Python WORLD_GRAVITY * gravity_scale)
-        p.vy -= kWorldGravity * p.def.gravityScale * dt;
-
-        const int steps = 4;
-        const float sdt = dt / static_cast<float>(steps);
-        const float radiusCells = std::max(0.5f, std::min(2.0f, p.def.radius / VOXEL_SIZE));
-        for (int s = 0; s < steps && p.alive; ++s) {
-            const float prevWx = p.px, prevWy = p.py, prevWz = p.pz;
-            p.px += p.vx * sdt;
-            p.py += p.vy * sdt;
-            p.pz += p.vz * sdt;
-
-            // Body sweep first, so a body is hit before the voxel it stands in.
-            // One bullet, one body (player::ownerIsPlayer excludes the shooter).
-            if (!p.ownerIsPlayer && health::kSelfFireDamage) {
-                const ArmorZone zone =
-                    projectileHitZone(prevWx, prevWy, prevWz, p.px, p.py, p.pz, radiusCells);
-                if (zone != ArmorZone::Count) {
-                    damagePlayerAtZone(p.energy, p.def.effect, zone);
-                    p.energy *= (1.0f - std::min(0.95f, p.def.penetration));
-                    if (p.energy < 0.05f) p.alive = false;
-                }
-            }
-
-            int ix = static_cast<int>(std::floor(p.px / VOXEL_SIZE));
-            int iy = static_cast<int>(std::floor(p.py / VOXEL_SIZE));
-            int iz = static_cast<int>(std::floor(p.pz / VOXEL_SIZE));
-            if (!worldInBounds(ix, iy, iz)) {
-                // allow mild overshoot above world; kill if far
-                if (p.py < -0.5f || p.py > 2.0f ||
-                    p.px < -0.5f || p.px > WORLD_W * VOXEL_SIZE + 0.5f ||
-                    p.pz < -0.5f || p.pz > WORLD_D * VOXEL_SIZE + 0.5f) {
-                    p.alive = false;
-                }
-                continue;
-            }
-
-            Block b = getWorldBlock(*g_world, ix, iy, iz);
-            MaterialId mat = blockMaterial(b);
-            if (mat == MaterialId::Air) continue;
-
-            float e = p.energy * effectMultiplier(p.def.effect, mat);
-            g_lastImpactDx = p.vx; g_lastImpactDy = p.vy; g_lastImpactDz = p.vz;
-            g_lastImpactEnergy = e;
-            if (resolveVoxelHit(mat, e, p.def.penetration)) {
-                destroyVoxelAt(ix, iy, iz);
-                applySplash(ix, iy, iz, p.def.splashRadius, p.energy, p.def);
-                p.energy = e;
-                if (p.def.effect == "explosive" || p.energy < 0.05f) p.alive = false;
-            } else {
-                // Matrix ricochet — bounce off without destroying occupancy.
-                float nx, ny, nz;
-                faceNormalFromVelocity(p.vx, p.vy, p.vz, nx, ny, nz);
-                const auto& mp = materialProps(mat);
-                ricochetVelocity(p.vx, p.vy, p.vz, nx, ny, nz,
-                                 0.20f + (1.0f - mp.fragility) * 0.25f,
-                                 0.30f + mp.damping * 0.3f);
-                p.energy = e * (1.0f - mp.damping * 0.5f);
-                g_debris.ricochets++;
-                g_lastAoeScale = impactAoeScale(p.def) * 0.55f;
-                g_debris.spawnFromVoxel(ix, iy, iz, mat, g_lastImpactDx, g_lastImpactDy, g_lastImpactDz,
-                                        e * 0.4f, VOXEL_SIZE, g_lastAoeScale);
-                // Nudge out of cell to avoid re-hit same voxel
-                p.px += nx * VOXEL_SIZE * 0.6f;
-                p.py += ny * VOXEL_SIZE * 0.6f;
-                p.pz += nz * VOXEL_SIZE * 0.6f;
-                if (p.energy < 0.08f || (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz) < 1e-5f)
-                    p.alive = false;
-            }
-        }
-    }
-    g_projectiles.erase(
-        std::remove_if(g_projectiles.begin(), g_projectiles.end(),
-                       [](const ProjectileRuntime& p) { return !p.alive; }),
-        g_projectiles.end());
+    ballistics::stepProjectiles(g_ballistics, *g_world, g_ballisticsHooks, dt);
     // Remesh deferred to drawFrame after GPU fence (see flushDirtyMesh).
 }
 
@@ -6008,6 +5731,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             // Taken before the self-tests below, which may poke player state.
             const uint64_t simPrint = simFingerprint();
             const bool jsonxOk = jsonxSelfTest();
+            const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
             g_simViewSmoke = runSimViewSmoke(world);
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
@@ -6016,6 +5740,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
 out << "ticks=" << g_tick << "\nframes=" << frames
+                << "\nsmoke_complete=" << (g_tick >= g_smokeTicks ? 1 : 0)
                 << "\nsim_hz=" << TICK_HZ
                 << "\nvertices=" << g_liveVertexCount
                 << "\nvertex_slots=" << g_vertexCount
@@ -6236,6 +5961,12 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nskirt_isolation_ok=" << (g_simViewSmoke.skirtIsolationOk ? 1 : 0)
                 << "\nview_smoothing_ok=" << ((g_simViewSmoke.cornerAoOk && g_simViewSmoke.normalSmoothingOk) ? 1 : 0)
                 << "\nao_corners_ok=" << (g_simViewSmoke.cornerAoOk ? 1 : 0)
+                << "\nballistics_hitscan_breaks_ok=" << (ballisticsRep.hitscanBreaksSoft ? 1 : 0)
+                << "\nballistics_ricochet_keeps_cell_ok=" << (ballisticsRep.ricochetKeepsCell ? 1 : 0)
+                << "\nballistics_one_bullet_one_body_ok=" << (ballisticsRep.oneBulletOneBody ? 1 : 0)
+                << "\nballistics_projectile_breaks_ok=" << (ballisticsRep.projectileBreaks ? 1 : 0)
+                << "\nballistics_shooter_not_swept_ok=" << (ballisticsRep.shooterNotSwept ? 1 : 0)
+                << "\nballistics_ok=" << (ballisticsRep.ok() ? 1 : 0)
                 << "\nmesh_workers_equiv_ok=" << (g_simViewSmoke.meshWorkersEquivOk ? 1 : 0)
                 << "\nmesh_workers_test_helpers=" << g_simViewSmoke.meshWorkersHelpers
                 << "\nmesh_workers_test_chunks=" << g_simViewSmoke.meshWorkersChunks
@@ -6322,8 +6053,14 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 if (!moveAllOk) { cleanup(); return 2; }
             }
             if (!jsonxOk) { cleanup(); return 3; }
+            // A run cut short (Esc, window closed) still writes its report, and
+            // every count in it is then too small but self-consistent. Refuse it
+            // rather than let an interrupted smoke read as a pass.
+            if (g_tick < g_smokeTicks) { cleanup(); return 7; }
             // Pooled meshing must be indistinguishable from serial meshing.
             if (!g_simViewSmoke.meshWorkersEquivOk) { cleanup(); return 5; }
+            // The ballistics module's own contract, independent of the map.
+            if (!ballisticsRep.ok()) { cleanup(); return 6; }
             // MAP loader gate (Phase 2b): the painter-exported fixture must
             // parse, restore counters, and stamp as unit cubes, and refusals
             // must refuse. Exit 4 lets CI triage the map contract separately.
