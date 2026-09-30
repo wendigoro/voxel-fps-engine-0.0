@@ -26,3 +26,21 @@ wiring needed to author and preview hitboxes.
 
 **Not ported.** Hitboxes are not a painter responsibility in the current design, so no part
 of this is in the current tree.
+
+## `movement_prototype_extras.patch`
+
+The six commits from the abandoned movement worktree (`4b71449`..`c3b1922`), as
+`git format-patch` output. The first commit, stance/gait/slide/wallrun/dash, is **superseded**
+by `src/movement.hpp` (see PR #4 for why it was ported rather than merged). The other five
+were **not ported**, and nothing like them is in the current tree:
+
+- `e40bace`: single exe with a fullscreen startup menu (`g_appState`, menu vertex buffer).
+- `3d93ccf`: cursor lock and ESC pause (`g_cursorLocked`, `g_paused`, `togglePause`).
+  Today ESC quits.
+- `cc23298`: a smoothed camera that follows the animated head (`g_cameraSmoothedPos`).
+- `f5397e7`: a stamina-driven idle animation and a camera clipping fix.
+- `c3b1922`: removes a collision border around water (`isSolidForPhysics`).
+
+Do not apply these as they stand. They write `g_camPos` directly, collide against the view's
+`g_chunks`, and poll input inside the update, which are all things `RULES.md` now forbids. Port
+the behaviour through `SimInput`, the authoritative grid, and view-side offsets instead.
