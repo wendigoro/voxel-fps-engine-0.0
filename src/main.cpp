@@ -5936,6 +5936,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
+            const bool jsonxOk = jsonxSelfTest();
             g_simViewSmoke = runSimViewSmoke(world);
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
@@ -5955,6 +5956,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nprojectiles_loaded=" << g_projDefs.size()
                 << "\nammo_loaded=" << g_ammoDefs.size()
                 << "\nweapons_loaded=" << g_weapons.size()
+                << "\njsonx_ok=" << (jsonxOk ? 1 : 0)
                 << "\nweapon_id=" << g_lastWeaponId
                 << "\ncaliber=" << g_lastCaliber
                 << "\nfire_mode=" << g_lastFireMode
@@ -6200,6 +6202,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 mvOut.close();
                 if (!moveAllOk) { cleanup(); return 2; }
             }
+            if (!jsonxOk) { cleanup(); return 3; }
         }
     } catch (const std::exception& e) {
         MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);

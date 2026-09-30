@@ -13,11 +13,10 @@
 
 #include "materials.hpp"
 #include "destruction.hpp"
+#include "jsonx.hpp"
 
 #include <algorithm>
 #include <cstdint>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -782,55 +781,7 @@ inline void initInventory(Inventory& inv, const ItemTable& table) {
 
 // ---- item JSON -----------------------------------------------------------
 
-// Collect every integer in the array body after "key". Handles both flat
-// arrays ([3,3,4]) and nested ones ([[0,0,0],[1,0,0]]) by flattening, which is
-// all our controlled exporter emits.
-inline std::vector<int> jsonExtractIntArray(const std::string& text, const char* key) {
-    const std::string body = jsonExtractArrayBody(text, key);
-    std::vector<int> out;
-    size_t i = 0;
-    while (i < body.size()) {
-        const char c = body[i];
-        if (c == '-' || (c >= '0' && c <= '9')) {
-            size_t j = i;
-            if (body[j] == '-') ++j;
-            while (j < body.size() && body[j] >= '0' && body[j] <= '9') ++j;
-            try {
-                out.push_back(std::stoi(body.substr(i, j - i)));
-            } catch (...) {
-            }
-            i = j;
-        } else {
-            ++i;
-        }
-    }
-    return out;
-}
-
-inline std::vector<float> jsonExtractFloatArray(const std::string& text, const char* key) {
-    const std::string body = jsonExtractArrayBody(text, key);
-    std::vector<float> out;
-    size_t i = 0;
-    while (i < body.size()) {
-        const char c = body[i];
-        if (c == '-' || c == '+' || c == '.' || (c >= '0' && c <= '9')) {
-            size_t j = i;
-            if (body[j] == '-' || body[j] == '+') ++j;
-            while (j < body.size() && (body[j] == '.' || body[j] == 'e' || body[j] == 'E' ||
-                                       (body[j] >= '0' && body[j] <= '9') || body[j] == '-' ||
-                                       body[j] == '+'))
-                ++j;
-            try {
-                out.push_back(std::stof(body.substr(i, j - i)));
-            } catch (...) {
-            }
-            i = j;
-        } else {
-            ++i;
-        }
-    }
-    return out;
-}
+// JSON flattening helpers live in jsonx.hpp (jsonExtractIntArray / jsonExtractFloatArray).
 
 inline ItemDef parseItemObject(const std::string& text) {
     ItemDef d;
@@ -891,15 +842,13 @@ inline ItemDef parseItemObject(const std::string& text) {
 }
 
 inline ItemDef loadItemDef(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) {
+    const std::string text = jsonReadText(path);
+    if (text.empty()) {
         ItemDef miss;
         miss.id.clear();
         return miss;
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    ItemDef d = parseItemObject(ss.str());
+    ItemDef d = parseItemObject(text);
     if (!itemGridValid(d)) {
         ItemDef bad;
         bad.id.clear();

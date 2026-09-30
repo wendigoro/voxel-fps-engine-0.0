@@ -3,12 +3,11 @@
 // Projectile type/effect tables are authored in Python and loaded from JSON.
 
 #include "materials.hpp"
+#include "jsonx.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -61,96 +60,8 @@ inline float kineticEnergy(float mass, float speed) {
     return 0.5f * mass * speed * speed * 100.0f; // scale for micro voxels
 }
 
-// Very small JSON helpers (schema is controlled by our Python exporter).
-inline std::string jsonExtractString(const std::string& obj, const char* key, const std::string& fallback = {}) {
-    const std::string pat = std::string("\"") + key + "\"";
-    size_t k = obj.find(pat);
-    if (k == std::string::npos) return fallback;
-    k = obj.find(':', k);
-    if (k == std::string::npos) return fallback;
-    k = obj.find('"', k);
-    if (k == std::string::npos) return fallback;
-    size_t e = obj.find('"', k + 1);
-    if (e == std::string::npos) return fallback;
-    return obj.substr(k + 1, e - k - 1);
-}
-
-inline float jsonExtractFloat(const std::string& obj, const char* key, float fallback) {
-    const std::string pat = std::string("\"") + key + "\"";
-    size_t k = obj.find(pat);
-    if (k == std::string::npos) return fallback;
-    k = obj.find(':', k);
-    if (k == std::string::npos) return fallback;
-    k++;
-    while (k < obj.size() && (obj[k] == ' ' || obj[k] == '\t')) k++;
-    try {
-        return std::stof(obj.substr(k));
-    } catch (...) {
-        return fallback;
-    }
-}
-
-inline bool jsonExtractBool(const std::string& obj, const char* key, bool fallback) {
-    const std::string pat = std::string("\"") + key + "\"";
-    size_t k = obj.find(pat);
-    if (k == std::string::npos) return fallback;
-    k = obj.find(':', k);
-    if (k == std::string::npos) return fallback;
-    k++;
-    while (k < obj.size() && (obj[k] == ' ' || obj[k] == '\t' || obj[k] == '\n' || obj[k] == '\r')) k++;
-    if (k >= obj.size()) return fallback;
-    // Accept true/false and numeric 0/1 (weapon export uses 0|1).
-    if (obj[k] == '1') return true;
-    if (obj[k] == '0') return false;
-    if (k + 4 <= obj.size() && obj.compare(k, 4, "true") == 0) return true;
-    if (k + 5 <= obj.size() && obj.compare(k, 5, "false") == 0) return false;
-    return fallback;
-}
-
-// Extract balanced {...} body immediately after "key": (empty if missing).
-inline std::string jsonExtractObjectBody(const std::string& text, const char* key) {
-    const std::string pat = std::string("\"") + key + "\"";
-    size_t k = text.find(pat);
-    if (k == std::string::npos) return {};
-    k = text.find('{', k);
-    if (k == std::string::npos) return {};
-    int depth = 0;
-    for (size_t i = k; i < text.size(); ++i) {
-        char c = text[i];
-        if (c == '{') depth++;
-        else if (c == '}') {
-            depth--;
-            if (depth == 0) return text.substr(k, i - k + 1);
-        }
-    }
-    return {};
-}
-
-// Extract first JSON array body after "key": [ ... ]
-inline std::string jsonExtractArrayBody(const std::string& text, const char* key) {
-    const std::string pat = std::string("\"") + key + "\"";
-    size_t k = text.find(pat);
-    if (k == std::string::npos) return {};
-    k = text.find('[', k);
-    if (k == std::string::npos) return {};
-    int depth = 0;
-    for (size_t i = k; i < text.size(); ++i) {
-        char c = text[i];
-        if (c == '[') depth++;
-        else if (c == ']') {
-            depth--;
-            if (depth == 0) return text.substr(k, i - k + 1);
-        }
-    }
-    return {};
-}
-
 inline std::vector<ProjectileDef> loadProjectileDefs(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) return {};
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    const std::string text = ss.str();
+    const std::string text = jsonReadText(path);
 
     std::vector<ProjectileDef> out;
     size_t pos = 0;
@@ -389,11 +300,7 @@ inline AmmoDef parseAmmoObject(const std::string& obj) {
 }
 
 inline std::vector<AmmoDef> loadAmmoDefs(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) return {};
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    const std::string text = ss.str();
+    const std::string text = jsonReadText(path);
 
     // Prefer the top-level "ammo" array so we don't confuse projectile objects.
     std::string arr = jsonExtractArrayBody(text, "ammo");
@@ -621,15 +528,13 @@ inline void bindWeaponAmmo(WeaponDef& w, const std::vector<AmmoDef>& ammoTable) 
 }
 
 inline WeaponDef loadWeaponDef(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) {
+    const std::string text = jsonReadText(path);
+    if (text.empty()) {
         WeaponDef miss;
         miss.id.clear();
         return miss;
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    WeaponDef w = parseWeaponObject(ss.str());
+    WeaponDef w = parseWeaponObject(text);
     if (w.id.empty()) w = defaultWeaponDef();
     return w;
 }
