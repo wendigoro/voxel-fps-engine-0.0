@@ -31,12 +31,19 @@
 #include "fisheye.hpp"
 #include "materials.hpp"
 #include "map_vox.hpp"
+#include "mesh_view.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// The view mesher keeps its own (deliberately sim-free) copy of the voxel
+// scale; this is the compile-time bridge proving it never drifts from the
+// authority. Same rule as the wire enum asserts in sim_world.hpp.
+static_assert(meshview::kVoxelSize == kVoxelSize,
+              "mesh_view mesh scale must agree with the sim's voxel scale");
 
 // ---- grid aliases ----
 // Block identity, scale, and the authoritative grid now live in sim_world.hpp.
@@ -664,22 +671,6 @@ static bool isSolidBlock(Block b) {
 // chunkIndex() addresses both; the two are never merged into a single struct,
 // because that merge is the coupling this split removes.
 
-static Vec3 blockColor(Block b) {
-    switch (b) {
-    case Block::Dirt:         return {0.28f, 0.20f, 0.12f};
-    case Block::Concrete:     return {0.40f, 0.40f, 0.42f};
-    case Block::SheetMetal:   return {0.48f, 0.50f, 0.52f};
-    case Block::Girder:       return {0.28f, 0.10f, 0.08f};
-    case Block::Wood:         return {0.34f, 0.22f, 0.12f};
-    case Block::WoodDark:     return {0.32f, 0.18f, 0.08f};
-    case Block::Water:        return {0.12f, 0.28f, 0.42f};
-    case Block::WaterCurrent: return {0.10f, 0.35f, 0.48f};
-    case Block::Moon:         return {0.75f, 0.80f, 0.90f};
-    case Block::LightBulb:    return {1.00f, 0.75f, 0.45f};
-    default:                  return {1, 0, 1};
-    }
-}
-
 static inline int localIndex(int lx, int ly, int lz) {
     return sim::World::localIndex(lx, ly, lz);
 }
@@ -961,242 +952,9 @@ static sim::World buildWarehouseMap() {
 
 // Skirt isolation tracking: assert that client-side meshing never attempts to
 // read outside the supplied visible skirt (RULES.md, "Visibility filtering").
-static uint64_t g_skirtAccessViolations = 0;
-
-// A block as read out of a sent snapshot. This is the ONLY way view-side code
-// learns occupancy — it has no other source.
-static Block sentBlockAt(const ViewChunk& vc, int lx, int ly, int lz) {
-    if (!view::SentCells::inSkirt(lx, ly, lz)) {
-        ++g_skirtAccessViolations;
-        return Block::Air;
-    }
-    // The wire enum and the sim enum are asserted equal in sim_world.hpp, so
-    // this is a checked reinterpretation, not a cast of convenience.
-    return static_cast<Block>(static_cast<uint8_t>(vc.sent.get(lx, ly, lz)));
-}
-
-static bool isVoxelSolidForAo(const ViewChunk& vc, int lx, int ly, int lz) {
-    const Block b = sentBlockAt(vc, lx, ly, lz);
-    return b != Block::Air && !isWaterBlock(b);
-}
-
-// Sharp vertex face emit: 6 unique verts/face (2 tris), hard face normals, no sharing.
-static void emitSharpFace(std::vector<ViewChunk::Vertex>& out, int ix, int iy, int iz,
-                          int face, const Vec3& color, float mat = 0.0f) {
-    // unit cube corners in voxel space, scaled to world by VOXEL_SIZE
-    static const float F[6][4][3] = {
-        {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
-        {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
-        {{0,1,0},{0,1,1},{1,1,1},{1,1,0}}, // +Y
-        {{0,0,1},{0,0,0},{1,0,0},{1,0,1}}, // -Y
-        {{1,0,1},{1,1,1},{0,1,1},{0,0,1}}, // +Z
-        {{0,0,0},{0,1,0},{1,1,0},{1,0,0}}, // -Z
-    };
-    static const float N[6][3] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
-    };
-    // CCW when viewed from outside, matching Vulkan front-face CCW + Y-flip proj
-    static const int IDX[6] = {0, 1, 2, 0, 2, 3};
-    static const float faceShade[6] = {0.82f, 0.68f, 1.0f, 0.52f, 0.90f, 0.74f};
-
-    const float ox = ix * VOXEL_SIZE;
-    const float oy = iy * VOXEL_SIZE;
-    const float oz = iz * VOXEL_SIZE;
-    Vec3 c = color * faceShade[face];
-
-    for (int i = 0; i < 6; ++i) {
-        const float* p = F[face][IDX[i]];
-        out.push_back(ViewChunk::Vertex{
-            ox + p[0] * VOXEL_SIZE,
-            oy + p[1] * VOXEL_SIZE,
-            oz + p[2] * VOXEL_SIZE,
-            N[face][0], N[face][1], N[face][2],
-            c.x, c.y, c.z,
-            mat
-        });
-    }
-}
-
-// Surface smoothing and Corner Ambient Occlusion (Milestone 4).
-// Computes Minecraft-style 3-neighbor corner AO and smooth vertex normals
-// from adjacent blocks in the 1-cell skirt, while occupancy remains strictly 1x1x1 cubes.
-static void emitSmoothedFace(ViewChunk& vc, int lx, int ly, int lz,
-                             int gx, int gy, int gz, int face,
-                             const Vec3& color, float mat = 0.0f) {
-    static const float F[6][4][3] = {
-        {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
-        {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
-        {{0,1,0},{0,1,1},{1,1,1},{1,1,0}}, // +Y
-        {{0,0,1},{0,0,0},{1,0,0},{1,0,1}}, // -Y
-        {{1,0,1},{1,1,1},{0,1,1},{0,0,1}}, // +Z
-        {{0,0,0},{0,1,0},{1,1,0},{1,0,0}}, // -Z
-    };
-    static const float N[6][3] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
-    };
-    static const float faceShade[6] = {0.82f, 0.68f, 1.0f, 0.52f, 0.90f, 0.74f};
-    static const float kAoCurve[4] = {0.58f, 0.72f, 0.86f, 1.0f};
-
-    const float ox = gx * VOXEL_SIZE;
-    const float oy = gy * VOXEL_SIZE;
-    const float oz = gz * VOXEL_SIZE;
-
-    const int nx = static_cast<int>(N[face][0]);
-    const int ny = static_cast<int>(N[face][1]);
-    const int nz = static_cast<int>(N[face][2]);
-    const int adjX = lx + nx;
-    const int adjY = ly + ny;
-    const int adjZ = lz + nz;
-
-    int aoVal[4] = {3, 3, 3, 3};
-    Vec3 cornerNorm[4];
-    Vec3 cornerCol[4];
-
-    for (int k = 0; k < 4; ++k) {
-        const float* p = F[face][k];
-        const int px = static_cast<int>(p[0]);
-        const int py = static_cast<int>(p[1]);
-        const int pz = static_cast<int>(p[2]);
-
-        const int dx = 2 * px - 1;
-        const int dy = 2 * py - 1;
-        const int dz = 2 * pz - 1;
-
-        int ux = 0, uy = 0, uz = 0;
-        int vx = 0, vy = 0, vz = 0;
-        if (nx != 0) {
-            uy = dy;
-            vz = dz;
-        } else if (ny != 0) {
-            ux = dx;
-            vz = dz;
-        } else {
-            ux = dx;
-            vy = dy;
-        }
-
-        // Corner Ambient Occlusion (Minecraft-style 3-neighbor test)
-        if (mat == 0.0f) {
-            bool s1 = isVoxelSolidForAo(vc, adjX + ux, adjY + uy, adjZ + uz);
-            bool s2 = isVoxelSolidForAo(vc, adjX + vx, adjY + vy, adjZ + vz);
-            bool sc = isVoxelSolidForAo(vc, adjX + ux + vx, adjY + uy + vy, adjZ + uz + vz);
-            aoVal[k] = (s1 && s2) ? 0 : 3 - (static_cast<int>(s1) + static_cast<int>(s2) + static_cast<int>(sc));
-        } else {
-            aoVal[k] = 3;
-        }
-        const float aoFactor = kAoCurve[aoVal[k]];
-        cornerCol[k] = color * faceShade[face] * aoFactor;
-
-        // Vertex normal smoothing: inspect 8 cubes around vertex in 1-cell skirt
-        if (mat == 0.0f) {
-            Vec3 vGrad(0.0f, 0.0f, 0.0f);
-            for (int dxi = 0; dxi < 2; ++dxi) {
-                int cdx = (dxi == 0) ? (px - 1) : px;
-                float offX = (cdx == px) ? 0.5f : -0.5f;
-                for (int dyi = 0; dyi < 2; ++dyi) {
-                    int cdy = (dyi == 0) ? (py - 1) : py;
-                    float offY = (cdy == py) ? 0.5f : -0.5f;
-                    for (int dzi = 0; dzi < 2; ++dzi) {
-                        int cdz = (dzi == 0) ? (pz - 1) : pz;
-                        float offZ = (cdz == pz) ? 0.5f : -0.5f;
-                        if (isVoxelSolidForAo(vc, lx + cdx, ly + cdy, lz + cdz)) {
-                            vGrad.x -= offX;
-                            vGrad.y -= offY;
-                            vGrad.z -= offZ;
-                        }
-                    }
-                }
-            }
-            if (vGrad.length() > 1e-4f) {
-                Vec3 vNorm = vGrad.normalized();
-                Vec3 fNorm(N[face][0], N[face][1], N[face][2]);
-                if (vNorm.dot(fNorm) > 0.15f) {
-                    cornerNorm[k] = (fNorm * 0.35f + vNorm * 0.65f).normalized();
-                } else {
-                    cornerNorm[k] = fNorm;
-                }
-            } else {
-                cornerNorm[k] = Vec3(N[face][0], N[face][1], N[face][2]);
-            }
-        } else {
-            cornerNorm[k] = Vec3(N[face][0], N[face][1], N[face][2]);
-        }
-    }
-
-    // Quad triangulation: flip diagonal if ao0 + ao2 > ao1 + ao3 to prevent anisotropic creasing
-    int indices[6];
-    if (aoVal[0] + aoVal[2] > aoVal[1] + aoVal[3]) {
-        indices[0] = 1; indices[1] = 2; indices[2] = 3;
-        indices[3] = 1; indices[4] = 3; indices[5] = 0;
-    } else {
-        indices[0] = 0; indices[1] = 1; indices[2] = 2;
-        indices[3] = 0; indices[4] = 2; indices[5] = 3;
-    }
-
-    for (int i = 0; i < 6; ++i) {
-        int ci = indices[i];
-        const float* p = F[face][ci];
-        vc.mesh.push_back(ViewChunk::Vertex{
-            ox + p[0] * VOXEL_SIZE,
-            oy + p[1] * VOXEL_SIZE,
-            oz + p[2] * VOXEL_SIZE,
-            cornerNorm[ci].x, cornerNorm[ci].y, cornerNorm[ci].z,
-            cornerCol[ci].x, cornerCol[ci].y, cornerCol[ci].z,
-            mat
-        });
-    }
-}
-
-// Build a chunk's mesh from the cells the sim SENT, and nothing else.
-//
-// Note the signature: there is no sim::World parameter. That absence is the
-// point. Every face-exposure question ("is my neighbour empty?") is answered
-// from the 1-cell skirt the sim included in the snapshot, so this function
-// physically cannot consult occupancy the client was not shown. A view client
-// given this struct and its SentCells can produce the identical mesh, and has
-// no path to anything else.
-static void meshChunk(ViewChunk& chunk) {
-    chunk.mesh.clear();
-    chunk.mesh.reserve(4096);
-
-    const int baseX = chunk.cx * CHUNK_SIZE;
-    const int baseY = chunk.cy * CHUNK_SIZE;
-    const int baseZ = chunk.cz * CHUNK_SIZE;
-
-    for (int ly = 0; ly < CHUNK_SIZE; ++ly) {
-        for (int lz = 0; lz < CHUNK_SIZE; ++lz) {
-            for (int lx = 0; lx < CHUNK_SIZE; ++lx) {
-                const Block b = sentBlockAt(chunk, lx, ly, lz);
-                if (b == Block::Air) continue;
-                const int x = baseX + lx, y = baseY + ly, z = baseZ + lz;
-                Vec3 col = blockColor(b);
-
-                for (int f = 0; f < 6; ++f) {
-                    // Read the neighbour out of the skirt. lx+1 == CHUNK_SIZE
-                    // is still inside the snapshot, so this never leaves the
-                    // data the sim sent.
-                    const Block nb = sentBlockAt(
-                        chunk, lx + sim::kFaceOX[f], ly + sim::kFaceOY[f], lz + sim::kFaceOZ[f]);
-                    // Unit-cube face exposed only against empty grid cells.
-                    bool expose = false;
-                    if (isWaterBlock(b)) {
-                        expose = (nb == Block::Air) || (!isWaterBlock(nb) && nb != Block::Air);
-                        // show water surface against air only for clearer tide paint
-                        expose = (nb == Block::Air);
-                    } else {
-                        expose = (nb == Block::Air) || isWaterBlock(nb);
-                    }
-                    if (!expose) continue;
-                    float mat = 0.0f;
-                    if (isWaterBlock(b)) mat = 1.0f;
-                    else if (b == Block::LightBulb) mat = 2.0f;
-                    else if (b == Block::Moon) mat = 3.0f;
-                    emitSmoothedFace(chunk, lx, ly, lz, x, y, z, f, col, mat);
-                }
-            }
-        }
-    }
-}
+// The view mesher now lives in mesh_view.hpp; this is its telemetry, shared by
+// every meshChunk call in this TU.
+static meshview::Stats g_meshStats;
 
 // ---- the send path: sim -> view ----
 // Everything the view will ever know about occupancy passes through here. This
@@ -1252,7 +1010,7 @@ static std::vector<ViewChunk*> remeshStaleChunks(const sim::World& world,
         // Refresh the snapshot first, then mesh from it. meshChunk has no access
         // to the world, so this ordering is what keeps the two in step.
         sendChunkSnapshot(world, c);
-        meshChunk(c);
+        meshview::meshChunk(c, g_meshStats);
         c.vertexCount = static_cast<uint32_t>(c.mesh.size());
         c.meshedVersion = sc.version;
         touched.push_back(&c);
@@ -4417,12 +4175,12 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
                 break;
             }
         }
-        meshChunk(testVc);
+        meshview::meshChunk(testVc, g_meshStats);
         const bool zeroVerts = testVc.mesh.empty();
 
         // When visible, non-air data is sent and faces are generated
         sendChunkSnapshot(world, testVc, true);
-        meshChunk(testVc);
+        meshview::meshChunk(testVc, g_meshStats);
         const bool hasVerts = !testVc.mesh.empty();
 
         rep.antiCheatGatingOk = allAir && zeroVerts && hasVerts;
@@ -4430,7 +4188,7 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
 
     // 3. Skirt isolation: no out-of-skirt access occurred during meshing
     {
-        rep.skirtIsolationOk = (g_skirtAccessViolations == 0);
+        rep.skirtIsolationOk = (g_meshStats.skirtAccessViolations == 0);
     }
 
     // 4. Corner Ambient Occlusion (AO): corner touching an adjacent solid block receives darker shade (Milestone 4)
@@ -4440,13 +4198,13 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
         // Create an inside corner: floor block at (5, 5, 5), wall block at (6, 6, 5)
         testAo.sent.set(5, 5, 5, wire::BlockId::Concrete);
         testAo.sent.set(6, 6, 5, wire::BlockId::Concrete);
-        meshChunk(testAo);
+        meshview::meshChunk(testAo, g_meshStats);
 
         bool foundAoDarkening = false;
         // Search vertices of floor block (5, 5, 5) on top face (+Y)
         for (const auto& v : testAo.mesh) {
             if (std::fabs(v.ny - 1.0f) < 0.2f && v.y > (5.0f * VOXEL_SIZE)) {
-                const float unoccludedR = blockColor(Block::Concrete).x * 1.0f; // faceShade[2] = 1.0
+                const float unoccludedR = meshview::blockColor(wire::BlockId::Concrete).x * 1.0f; // faceShade[2] = 1.0
                 if (v.r < unoccludedR * 0.95f) {
                     foundAoDarkening = true;
                     break;
@@ -4461,7 +4219,7 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
         ViewChunk testNorm;
         testNorm.sent.alloc();
         testNorm.sent.set(5, 5, 5, wire::BlockId::Concrete);
-        meshChunk(testNorm);
+        meshview::meshChunk(testNorm, g_meshStats);
 
         bool foundSmoothedNormal = false;
         for (const auto& v : testNorm.mesh) {
