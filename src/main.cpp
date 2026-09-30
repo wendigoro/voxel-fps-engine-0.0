@@ -473,7 +473,12 @@ static uint32_t g_vertexCount = 0;
 // Vertices currently occupied across all chunk slots. Kept separate from
 // g_vertexCount (buffer capacity in vertices) so telemetry reports real geometry.
 static uint32_t g_liveVertexCount = 0;
-static bool g_needsFullMeshRepack = false;
+// End of the last allocated chunk slot, in vertices. Everything past it is free,
+// so a chunk that outgrows its slot can move there without a full repack.
+static uint32_t g_slotCursor = 0;
+static int g_meshRelocateCount = 0;   // chunks moved to the tail instead of repacking
+static uint64_t g_meshTouchedSum = 0; // chunks remeshed per flush (batch size for the pool)
+static int g_meshTouchedMax = 0;
 static int g_meshRepackCount = 0;
 static double g_meshUploadUsMax = 0.0;
 static double g_meshUploadUsSum = 0.0;
@@ -548,7 +553,10 @@ enum SectionId {
     SEC_PROJECTILES,   // ballistic integration + impacts
     SEC_DEBRIS_SIM,    // debris particle physics (sim side)
     SEC_WAIT,          // vkWaitForFences (GPU backpressure)
-    SEC_MESH,          // flushDirtyMesh(): chunk remesh + upload
+    SEC_MESH,          // flushDirtyMesh(): chunk remesh + upload (the three below nest in it)
+    SEC_MESH_SNAPSHOT, //   sendChunkSnapshot for stale chunks (sim -> view copy)
+    SEC_MESH_BUILD,    //   meshChunk over the stale chunks (pure view work)
+    SEC_MESH_COPY,     //   memcpy into the mapped vertex buffer (incl. repack)
     SEC_UBO,           // per-frame UBO write
     SEC_SKY,           // moon/sky tile rebuild
     SEC_DEBRIS_MESH,   // debris + muzzle VBO write (view side)
@@ -559,7 +567,7 @@ enum SectionId {
 };
 static const char* kSectionName[SEC_COUNT] = {
     "health", "movement", "fire", "projectiles", "debris_sim",
-    "wait", "mesh", "ubo", "sky", "debris_mesh", "pickup", "inventory", "record"};
+    "wait", "mesh", "mesh_snapshot", "mesh_build", "mesh_copy", "ubo", "sky", "debris_mesh", "pickup", "inventory", "record"};
 static double g_secUsSum[SEC_COUNT] = {};
 static double g_secUsMax[SEC_COUNT] = {};
 static int g_secCount[SEC_COUNT] = {};
@@ -999,42 +1007,57 @@ static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc, bool isVis
 // buffer, so a remesh copies only the chunks whose voxels actually changed
 // instead of rebuilding and re-uploading the whole world every time.
 
-// Re-mesh only chunks whose occupancy changed. Returns the chunks that were
-// rebuilt, so the caller uploads exactly those and nothing else.
-static std::vector<ViewChunk*> remeshStaleChunks(const sim::World& world,
-                                                 std::vector<ViewChunk>& views) {
+// Re-meshing a changed chunk is two phases, and they are split on purpose.
+//
+// Phase 1 (sendStaleSnapshots) is the sim side: it reads sim::World and
+// refreshes the snapshot of every chunk whose version moved. It must run on
+// the thread that owns the world, between ticks.
+//
+// Phase 2 (buildChunkMeshes) is pure view work: it meshes each of those
+// chunks from its own snapshot and touches nothing else, so it can fan out
+// across the mesh workers. Running phase 1 to completion first is what
+// keeps the mesh in step with the world, since meshChunk cannot see the world.
+
+// Refresh the snapshot of every chunk whose occupancy changed. Returns those
+// chunks, so the caller meshes and uploads exactly those and nothing else.
+static std::vector<ViewChunk*> sendStaleSnapshots(const sim::World& world,
+                                                  std::vector<ViewChunk>& views) {
     std::vector<ViewChunk*> touched;
     for (auto& c : views) {
         const sim::Chunk& sc = world.chunks[sim::World::chunkIndex(c.cx, c.cy, c.cz)];
         if (!c.snapshotStale(sc.version)) continue;
-        // Refresh the snapshot first, then mesh from it. meshChunk has no access
-        // to the world, so this ordering is what keeps the two in step.
         sendChunkSnapshot(world, c);
-        meshview::meshChunk(c, g_meshStats);
-        c.vertexCount = static_cast<uint32_t>(c.mesh.size());
         c.meshedVersion = sc.version;
         touched.push_back(&c);
-        if (c.vertexCount > c.slotCapacity) {
-            // A chunk outgrew its reserved region: force a full repack so every
-            // chunk's offset is recomputed consistently before uploading.
-            g_needsFullMeshRepack = true;
-        }
     }
     return touched;
 }
+
+static meshview::Workers* g_meshWorkers = nullptr;
+static int g_meshWorkerHelpers = 0; // telemetry: size of the live pool
+
+// Mesh each touched chunk from its snapshot, then record its size.
+static void buildChunkMeshes(const std::vector<ViewChunk*>& touched) {
+    if (g_meshWorkers) g_meshWorkers->meshAll(touched, g_meshStats);
+    else for (ViewChunk* c : touched) meshview::meshChunk(*c, g_meshStats);
+    for (ViewChunk* c : touched) c->vertexCount = static_cast<uint32_t>(c->mesh.size());
+}
+
+// Slot size for a chunk mesh of `verts` vertices. The headroom means ordinary
+// destruction (which exposes new interior faces and grows the mesh) does not
+// immediately outgrow the slot. A chunk may still shrink freely.
+static uint32_t slotWant(uint32_t verts) { return verts + verts / 4 + 1024; }
 
 static void repackChunkSlots(std::vector<ViewChunk>& chunks) {
     uint32_t cursor = 0;
     for (auto& c : chunks) {
         c.firstVertex = cursor;
         c.vertexCount = static_cast<uint32_t>(c.mesh.size());
-        // Reserve headroom so ordinary destruction (which exposes new interior
-        // faces and grows the mesh) does not immediately force another repack.
-        // A chunk may still shrink freely; only growth past this cap repacks.
-        uint32_t want = c.vertexCount + c.vertexCount / 4 + 1024;
+        const uint32_t want = slotWant(c.vertexCount);
         if (c.slotCapacity < want) c.slotCapacity = want;
         cursor += c.slotCapacity;
     }
+    g_slotCursor = cursor;
     g_liveVertexCount = 0;
     for (const auto& c : chunks) g_liveVertexCount += c.vertexCount;
 }
@@ -2886,6 +2909,16 @@ static bool ensureVertexCapacity(uint32_t verts) {
     // Grow with headroom so a small repack rarely reallocates.
     VkDeviceSize need = size + size / 8;
     if (need < size) need = size;
+    // The caller only waited on THIS frame's fence. With MAX_FRAMES in flight the
+    // other frame's command buffer may still bind the old buffer, so drain every
+    // in-flight frame before freeing it. Growth is rare (headroom above), so
+    // this stall is too.
+    VkFence live[MAX_FRAMES];
+    uint32_t liveCount = 0;
+    for (int i = 0; i < MAX_FRAMES; ++i)
+        if (g_inFlight[i]) live[liveCount++] = g_inFlight[i];
+    if (g_vertexBuffer && liveCount > 0)
+        vkWaitForFences(g_device, liveCount, live, VK_TRUE, UINT64_MAX);
     destroyWorldMeshBuffer();
     createBuffer(need, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -3980,6 +4013,9 @@ struct SimViewSmokeReport {
     bool cornerAoOk = false;
     bool normalSmoothingOk = false;
     bool cubicPreservedOk = false;
+    bool meshWorkersEquivOk = false; // pooled meshing == serial meshing, byte for byte
+    int meshWorkersHelpers = 0;
+    int meshWorkersChunks = 0;
 };
 
 static SimViewSmokeReport g_simViewSmoke;
@@ -4234,6 +4270,46 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
     // 6. Cubic grid preservation (RULES.md): VOXEL_SIZE is strictly 0.001
     {
         rep.cubicPreservedOk = (std::fabs(VOXEL_SIZE - 0.001f) < 1e-7f);
+    }
+
+    // 7. Mesh workers: meshing every chunk through the pool must produce the
+    // same vertices as meshing them one by one, byte for byte, and the same
+    // skirt telemetry. The pool is forced to 3 helpers so the threaded path
+    // runs even on a machine where the live pool would be smaller, and the
+    // batch runs twice so a reused pool is covered, not just a fresh one.
+    {
+        const int n = sim::World::chunkCount();
+        std::vector<ViewChunk> serial(n), pooled(n);
+        for (int cy = 0; cy < CHUNKS_Y; ++cy)
+            for (int cz = 0; cz < CHUNKS_Z; ++cz)
+                for (int cx = 0; cx < CHUNKS_X; ++cx) {
+                    const int i = sim::World::chunkIndex(cx, cy, cz);
+                    for (ViewChunk* c : {&serial[i], &pooled[i]}) {
+                        c->cx = cx; c->cy = cy; c->cz = cz;
+                        sendChunkSnapshot(world, *c);
+                    }
+                }
+        meshview::Stats serialStats, pooledStats;
+        for (auto& c : serial) meshview::meshChunk(c, serialStats);
+
+        std::vector<ViewChunk*> batch;
+        for (auto& c : pooled) batch.push_back(&c);
+        meshview::Workers pool(3);
+        bool same = true;
+        for (int pass = 0; pass < 2 && same; ++pass) {
+            pooledStats = meshview::Stats{};
+            pool.meshAll(batch, pooledStats);
+            for (int i = 0; i < n && same; ++i) {
+                const auto& a = serial[i].mesh;
+                const auto& b = pooled[i].mesh;
+                same = a.size() == b.size() &&
+                       (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+            }
+            same = same && pooledStats.skirtAccessViolations == serialStats.skirtAccessViolations;
+        }
+        rep.meshWorkersEquivOk = same && pool.helpers() == 3;
+        rep.meshWorkersHelpers = static_cast<int>(pool.helpers());
+        rep.meshWorkersChunks = n;
     }
 
     return rep;
@@ -5249,42 +5325,51 @@ static void flushDirtyMesh() {
     QueryPerformanceCounter(&t0);
 
     // Push fresh snapshots for stale chunks, then mesh each one purely from the
-    // snapshot it was sent. This is the whole sim->view contract in one call.
-    auto touched = remeshStaleChunks(*g_world, *g_views);
+    // snapshot it was sent. This is the whole sim->view contract.
+    std::vector<ViewChunk*> touched;
+    {
+        ScopedSection s(SEC_MESH_SNAPSHOT);
+        touched = sendStaleSnapshots(*g_world, *g_views);
+    }
+    {
+        ScopedSection s(SEC_MESH_BUILD);
+        buildChunkMeshes(touched);
+    }
+    ScopedSection copySection(SEC_MESH_COPY);
+    g_meshTouchedSum += touched.size();
+    g_meshTouchedMax = std::max(g_meshTouchedMax, static_cast<int>(touched.size()));
 
-    // A chunk outgrew its slot, or the buffer was never sized: repack everything
-    // and re-upload. This is the rare path; normal impacts only touch their chunk.
-    uint32_t needed = 0;
-    for (const auto& c : *g_views) needed += c.slotCapacity;
-    const bool repack = g_needsFullMeshRepack || needed > (g_vertexCapacity / sizeof(Vertex));
-    g_needsFullMeshRepack = false;
-
+    // Copy each touched chunk into its slot. Slots are stable, so every other
+    // chunk's offset stays valid and is not copied.
+    //
+    // A chunk that outgrew its slot moves to fresh space past the last slot
+    // instead of forcing a full repack: chunks are drawn one by one from their
+    // own firstVertex, so nothing else has to move. Only that chunk is copied,
+    // and its old slot is left dead until the next repack reclaims it. Only
+    // when the free tail runs out does everything repack, which compacts the
+    // dead space and grows the buffer. That full copy is the one expensive
+    // path (tens of MB), so it should be rare.
+    const uint32_t capacityVerts = static_cast<uint32_t>(g_vertexCapacity / sizeof(Vertex));
+    bool repack = (g_vertexBuffer == VK_NULL_HANDLE);
+    for (ViewChunk* c : touched) {
+        if (repack) break;
+        if (c->vertexCount > c->slotCapacity) {
+            const uint32_t want = slotWant(c->vertexCount);
+            if (g_slotCursor + want > capacityVerts) { repack = true; break; }
+            c->firstVertex = g_slotCursor;
+            c->slotCapacity = want;
+            g_slotCursor += want;
+            ++g_meshRelocateCount;
+        }
+        if (!uploadChunkRange(*c)) repack = true;
+    }
     if (repack) {
         repackChunkSlots(*g_views);
-        uint32_t total = 0;
-        for (const auto& c : *g_views) total += c.slotCapacity;
-        if (!ensureVertexCapacity(total)) return;
+        if (!ensureVertexCapacity(g_slotCursor)) return;
         for (const auto& c : *g_views) uploadChunkRange(c);
-        g_vertexCount = total;
         ++g_meshRepackCount;
-    } else {
-        // Incremental: copy only the chunks whose occupancy changed. Slots are
-        // stable, so offsets recorded at the last repack remain valid.
-        bool ok = true;
-        for (const ViewChunk* c : touched) {
-            if (!uploadChunkRange(*c)) { ok = false; break; }
-        }
-        if (!ok) {
-            // Should not happen: ensureVertexCapacity sized the buffer above.
-            repackChunkSlots(*g_views);
-            uint32_t total = 0;
-            for (const auto& c : *g_views) total += c.slotCapacity;
-            if (!ensureVertexCapacity(total)) return;
-            for (const auto& c : *g_views) uploadChunkRange(c);
-            g_vertexCount = total;
-            ++g_meshRepackCount;
-        }
     }
+    g_vertexCount = g_slotCursor;
     g_liveVertexCount = 0;
     for (const auto& c : *g_views) g_liveVertexCount += c.vertexCount;
 
@@ -5704,6 +5789,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         g_smoke = true; // reuse headless quit path
         g_smokeTicks = 600; // longer soak
     }
+    // --mesh-helpers N overrides the mesh pool size (0 = serial), so the pooled
+    // and serial mesher can be timed back to back on the same machine state.
+    int meshHelpersOverride = -1;
+    {
+        const std::string flag = "--mesh-helpers";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos)
+            meshHelpersOverride = std::clamp(std::atoi(cmd.c_str() + at + flag.size()), 0, 15);
+    }
 
     try {
         g_exeDir = getExeDir();
@@ -5774,7 +5868,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         // Initial build: send every chunk's snapshot, mesh each one from that
         // snapshot, then lay out stable per-chunk slots so later impacts only
         // re-upload the chunk they damaged.
-        remeshStaleChunks(world, views);
+        // Mesh workers: helpers beside the main thread, capped so the pool never
+        // crowds out the OS on a small machine. They sleep between batches.
+        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned helpers = meshHelpersOverride >= 0
+            ? static_cast<unsigned>(meshHelpersOverride)
+            : (hw > 1 ? std::min(hw - 1, 3u) : 0u);
+        meshview::Workers meshWorkers(helpers);
+        g_meshWorkers = &meshWorkers;
+        g_meshWorkerHelpers = static_cast<int>(meshWorkers.helpers());
+        struct ClearMeshWorkers { ~ClearMeshWorkers() { g_meshWorkers = nullptr; } } clearMeshWorkers;
+
+        buildChunkMeshes(sendStaleSnapshots(world, views));
         repackChunkSlots(views);
         uint32_t slotTotal = 0;
         for (const auto& c : views) slotTotal += c.slotCapacity;
@@ -5873,6 +5978,9 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nvertices=" << g_liveVertexCount
                 << "\nvertex_slots=" << g_vertexCount
                 << "\nmesh_repacks=" << g_meshRepackCount
+                << "\nmesh_relocations=" << g_meshRelocateCount
+                << "\nmesh_touched_avg=" << (g_meshUploadSamples > 0 ? double(g_meshTouchedSum) / g_meshUploadSamples : 0.0)
+                << "\nmesh_touched_max=" << g_meshTouchedMax
                 << "\ncam=" << g_camPos.x << "," << g_camPos.y << "," << g_camPos.z
                 << "\nplayer=" << g_player.px << "," << g_player.py << "," << g_player.pz
                 << "\non_ground=" << (g_player.onGround ? 1 : 0)
@@ -5944,7 +6052,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 // the avg/max microseconds a subsystem took per sample plus the
                 // sample count; section sums nest under avg_frame_ms because the
                 // frame is serial. Reading these is the input to the Phase 2 split.
-                << "\nsections=health,movement,fire,projectiles,debris_sim,wait,mesh,ubo,sky,debris_mesh,pickup,inventory,record";
+                << "\nsections=";
+            for (int i = 0; i < SEC_COUNT; ++i) out << (i ? "," : "") << kSectionName[i];
             out << std::fixed << std::setprecision(2);
             for (int i = 0; i < SEC_COUNT; ++i) {
                 out << "\nsec_" << kSectionName[i] << "_us_avg="
@@ -6084,6 +6193,10 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nskirt_isolation_ok=" << (g_simViewSmoke.skirtIsolationOk ? 1 : 0)
                 << "\nview_smoothing_ok=" << ((g_simViewSmoke.cornerAoOk && g_simViewSmoke.normalSmoothingOk) ? 1 : 0)
                 << "\nao_corners_ok=" << (g_simViewSmoke.cornerAoOk ? 1 : 0)
+                << "\nmesh_workers_equiv_ok=" << (g_simViewSmoke.meshWorkersEquivOk ? 1 : 0)
+                << "\nmesh_workers_test_helpers=" << g_simViewSmoke.meshWorkersHelpers
+                << "\nmesh_workers_test_chunks=" << g_simViewSmoke.meshWorkersChunks
+                << "\nmesh_workers_live_helpers=" << g_meshWorkerHelpers
                 // MAP-mode loader (Phase 2b): fixture parse + field fidelity +
                 // counter restore + unit-cube stamp, all in one gate.
                 << "\nmap_file_found=" << (g_mapSmoke.fileFound ? 1 : 0)
@@ -6166,6 +6279,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 if (!moveAllOk) { cleanup(); return 2; }
             }
             if (!jsonxOk) { cleanup(); return 3; }
+            // Pooled meshing must be indistinguishable from serial meshing.
+            if (!g_simViewSmoke.meshWorkersEquivOk) { cleanup(); return 5; }
             // MAP loader gate (Phase 2b): the painter-exported fixture must
             // parse, restore counters, and stamp as unit cubes, and refusals
             // must refuse. Exit 4 lets CI triage the map contract separately.
