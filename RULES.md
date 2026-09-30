@@ -35,6 +35,18 @@ The engine is being split into an **authoritative simulation process** (physics,
 - A full-screen effect that shades the *world* (e.g. `applyFireOverlay` in `shaders/voxel.frag`) is a **world pass**, not a menu. Keep the two categories distinct: a world post effect runs inside the world pipeline over already-shaded geometry, whereas a menu is separate geometry in a separate pass. Do not implement a menu by extending the world fragment shader's output.
 - If an overlay ever needs information the client was not sent (another player's inventory, a cell behind a wall), that is a **contract violation**, not a rendering problem. Route it through the visibility filter like any other stream.
 
+### Player body, and the camera-offset contract (mandatory)
+
+The player's body position and velocity are **simulation state**. The camera is a **view output**. These are separate, and the separation is not negotiable.
+
+- **The simulation owns the body.** A player capsule's position, velocity, stance, gait, and collision all live in the simulation next to the player's other authoritative state (health, inventory). Nothing in the view may write them.
+- **Movement may not move the camera to move the player.** Writing a world position into the camera transform and letting the next frame's collision resolve from it is forbidden: it makes the camera the authority, makes the player's position a function of view state, and makes two clients with different render settings disagree about where the player is. Movement code integrates the body and then the camera *follows* it.
+- **The simulation emits a camera offset, the view applies it.** Anything that should make the eye feel different from the body's authoritative position — stance eye height, wallrun roll, slide lean, landing dip, view bob — is computed in the simulation and sent as an **offset** (and, where a direction is needed, the axis it is relative to). The view composes `eye = bodyEye + offset`. The offset is a *presentation* quantity: it is applied after the body has been simulated and it is never fed back into collision, health, or visibility.
+- **An offset may not become load-bearing.** If dropping the offset would change where the player lands, what they hit, or what they can see, the offset is wrong — move the body instead. Eye height above a prone body is a real body height, not an offset, and is simulated as such.
+- **Movement input arrives as intent, never as a device poll.** The simulation reads a `SimInput` struct, not `g_keys`, not `GetAsyncKeyState`, and not a `static bool prev` latch held across frames. A press/release edge is expressed as an edge in the intent struct. Polling the device inside simulation makes the outcome depend on how many frames were sampled and on whether a tap was caught, which is exactly the nondeterminism the fixed-step rule forbids.
+- **A held input is level, not an edge.** A key that stays down sets a level field each frame (`sprint`, `crouch`); a key that must fire once per press sets an edge field consumed and cleared by the simulation (`dash`, `stanceCycle`). Never infer a toggle from a level changing, and never infer an edge from a latch you kept yourself.
+- **The headless movement harness drives scripted intent, not a fake device.** Smoke tests produce a `SimInput` sequence through the same path the real input path uses, so the harness exercises the seam rather than bypassing it. A test that pokes `g_keys` directly is testing a build that cannot happen in production.
+
 ### Constants
 
 | Symbol | Value | Meaning |
@@ -93,6 +105,11 @@ This is a constraint on **occupancy and collision**, not on how the result is dr
 - Reading rendering state (camera matrices, per-chunk mesh data, shader-class ids) to decide a simulation outcome
 - Sending a client any cell, damage value, or entity it is not currently able to see
 - Applying a visual filter so it samples a cell the client was not sent
+- Moving a player by writing the camera transform instead of the body, or resolving player collision against the camera's position
+- Reading `g_keys`, `GetAsyncKeyState`, or a cross-frame `static` latch inside simulation code to derive intent
+- Treating a held input as an edge, or inferring a toggle from whether a level field changed since last frame
+- Applying a camera offset to collision, health, or visibility, so that dropping the offset would change where the player lands or what they can see
+- Driving the headless movement harness by writing `g_keys` rather than through the same intent path the real input uses
 
 ### Determinism (mandatory)
 

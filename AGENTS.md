@@ -29,6 +29,7 @@ When changing scale, materials, or launch flow, update:
 | Engine build | `.\launch.ps1 -Action Build` |
 | Engine run | `.\launch.ps1 -Action Engine` |
 | Engine smoke | `.\launch.ps1 -Action SmokeEngine` |
+| Movement smoke | `.\launch.ps1 -Action SmokeMovement` (`--smoke-movement`) |
 | Painter build/smoke | `.\launch.ps1 -Action Painter` or `SmokePainter` |
 | Painter UI | `.\launch.ps1 -Action Ui` (`scripts/run_painter_ui.ps1`) |
 | All smokes | `.\launch.ps1 -Action SmokeAll` |
@@ -54,6 +55,8 @@ When changing scale, materials, or launch flow, update:
 | World pass (meshing, chunk VB, draw) | `src/main.cpp` (`meshChunk`, `uploadMesh`, `recordCommandBuffer`) |
 | World full-screen effects | `shaders/voxel.frag` (`applyFireOverlay`) — **world pass, not a menu** |
 | Fisheye projection curve | `src/fisheye.hpp` (canonical), mirrored in `shaders/voxel.vert` |
+| Player movement (body) | `src/movement.hpp` — sim-side; intent in, `MoveIntent` + `CameraOffset` out |
+| Camera offset application | `syncCameraToPlayer()` in `src/main.cpp` (view pass; sim never reads it back) |
 | Sim/view boundary + overlay rules | `RULES.md` ("Authority and the view/sim split", "Menus, HUD and other view overlays") |
 
 Any new menu/HUD/debug overlay is a **separate view pass** — own scissor/viewport, depth test and depth write off, blending on, no world vertex buffer or world UBO bound. Do not add menus by extending the world fragment shader; see `RULES.md`.

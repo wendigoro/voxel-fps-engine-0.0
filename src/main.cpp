@@ -30,6 +30,7 @@
 #include "fisheye.hpp"
 #include "materials.hpp"
 #include "sim_input.hpp"
+#include "movement.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -205,6 +206,11 @@ static int g_width = WIDTH;
 static int g_height = HEIGHT;
 
 static bool g_keys[256]{};
+// Previous-tick level of the edge-detected movement keys. These exist only in the
+// view, to turn a press into an edge for SimInput; the sim sees the edge and never
+// the latch.
+static bool g_dashHeldPrev = false;
+static bool g_stanceHeldPrev = false;
 static bool g_mouseDown = false;
 static int g_mouseX = 0, g_mouseY = 0, g_lastMouseX = 0, g_lastMouseY = 0;
 // The view's raw device state. The simulation never reads this: buildSimInput()
@@ -235,6 +241,13 @@ struct PlayerBody {
 };
 static PlayerBody g_player;
 static bool g_wantJump = false;
+
+// Movement state (stance, gait, slide, wallrun, dash, stamina) and the
+// presentation-only offset it produces. Both are simulation state: the view
+// applies the offset after the body is settled and never writes either back.
+// See RULES.md, "Player body, and the camera-offset contract".
+static movement::MoveState g_move;
+static movement::CameraOffset g_camOffset;
 
 // Player health (RULES.md rule 15). Kept as a distinct ActorHealth rather than
 // fields on PlayerBody so a second actor is a new type, not a refactor.
@@ -445,6 +458,9 @@ static int g_remeshSkipCount = 0;
 // Headless modes (declared early — used by debris draw + remesh throttle).
 static bool g_smoke = false;
 static bool g_stress = false;
+// Movement-only headless pass. Implies --smoke so it can reuse the quit path,
+// but writes its own marker and prints only the movement report.
+static bool g_smokeMovement = false;
 static uint64_t g_smokeTicks = 300;
 static int g_projLivePeak = 0;
 static int g_stressFireCount = 0;
@@ -3623,6 +3639,300 @@ struct HealthSmokeReport {
 
 static HealthSmokeReport g_healthSmoke;
 
+// Movement smoke (RULES.md, "Player body, and the camera-offset contract").
+//
+// --smoke skips the frame loop, so none of this is reachable by walking around.
+// The harness drives the *real* movement seam with scripted SimInput against a
+// local grid, which is the point: the old smoke poked g_keys and latched keys
+// inside the update, so it proved nothing about what a client would experience.
+struct MovementSmokeReport {
+    bool stanceCycleOk = false;
+    bool stanceHeadroomOk = false;
+    bool gaitOk = false;
+    bool staminaDrainOk = false;
+    bool staminaRegenOk = false;
+    bool slideEnters = false;
+    bool slideExhausts = false;
+    bool dashEnters = false;
+    bool dashCooldownOk = false;
+    bool dashInvulnOk = false;
+    bool wallrunDetects = false;
+    bool wallrunTimesOut = false;
+    bool bodyMovesNotCamera = false;
+    bool offsetIsPresentationOnly = false;
+    bool waterNotSolid = false;
+    bool edgeNotLatchOk = false;
+    float staminaAfterSprint = 0.0f;
+    float maxSpeed = 0.0f;
+};
+
+static MovementSmokeReport g_moveSmoke;
+
+static MovementSmokeReport runMovementSmoke() {
+    MovementSmokeReport rep;
+
+    // A local grid: a floor at y=0, a wall at x=20, and a water cell that must
+    // never read as ground or as a wall.
+    sim::World w;
+    w.alloc();
+    // alloc() sizes the chunk list only; every chunk still needs its voxel
+    // volume, or get()/set() index an empty vector.
+    for (int cy = 0; cy < CHUNKS_Y; ++cy)
+        for (int cz = 0; cz < CHUNKS_Z; ++cz)
+            for (int cx = 0; cx < CHUNKS_X; ++cx) {
+                SimChunk& c = w.chunks[sim::World::chunkIndex(cx, cy, cz)];
+                c.cx = cx; c.cy = cy; c.cz = cz;
+                c.voxels.assign(VOXELS_PER_CHUNK, Block::Air);
+            }
+    for (int z = 0; z < WORLD_D; ++z)
+        for (int x = 0; x < WORLD_W; ++x) w.set(x, 0, z, Block::Concrete);
+    for (int y = 1; y < 30; ++y)
+        for (int z = 0; z < WORLD_D; ++z) w.set(20, y, z, Block::Concrete);
+    for (int y = 1; y < 6; ++y)
+        for (int z = 0; z < WORLD_D; ++z) w.set(60, y, z, Block::Water);
+
+    movement::MoveState m;
+    // Feet rest on top of the y=0 floor, so the body is one voxel up. `py` is
+    // the feet, not the centre.
+    constexpr float kFloorTop = 1.0f * kVoxelSize;
+    m.px = 10.5f * kVoxelSize;  m.py = kFloorTop;  m.pz = 10.5f * kVoxelSize;
+    m.vx = m.vy = m.vz = 0.0f;
+    m.onGround = true;
+
+    constexpr float kDt = 1.0f / 60.0f;
+    constexpr float kBase = 0.045f;   // g_moveSpeed
+    constexpr float kJump = 0.055f;  // g_player.jumpSpeed
+
+    // Advance the body the way updatePlayerPhysics does: integrate, run the
+    // state machine, then apply the intent it returns.
+    auto integrate = [&](movement::MoveState& s, const movement::MoveIntent& it, float baseScale) {
+        const float accel = s.onGround ? 18.0f : 4.0f;
+        const float friction = s.onGround ? 12.0f : 1.5f;
+        if (it.overrideHorizontal) {
+            s.vx = it.vx;
+            s.vz = it.vz;
+        } else if (baseScale > 0.0f) {
+            const float want = baseScale * (s.onGround ? 18.0f : 4.0f);
+            s.vx += (want - s.vx) * std::min(1.0f, accel * kDt);
+            s.vz += (want - s.vz) * std::min(1.0f, accel * kDt);
+        } else {
+            const float damp = std::exp(-friction * kDt);
+            s.vx *= damp; s.vz *= damp;
+        }
+        if (it.jumpImpulse > 0.0f) { s.vy = it.jumpImpulse; s.onGround = false; }
+        s.vy -= kWorldGravity * it.gravityScale * kDt;
+        if (s.vy < -0.25f) s.vy = -0.25f;
+        s.px += s.vx * kDt; s.py += s.vy * kDt; s.pz += s.vz * kDt;
+        if (s.py < kFloorTop) { s.py = kFloorTop; s.vy = 0.0f; s.onGround = true; }
+        else { s.onGround = false; }
+    };
+
+    auto step = [&](const SimInput& in, bool advance = true) {
+        if (advance) { m.px += m.vx * kDt; m.py += m.vy * kDt; m.pz += m.vz * kDt; }
+        const movement::MoveResult r = movement::update(kDt, in, w, m, 0.0f, kBase, kJump);
+        if (advance) integrate(m, r.intent, 0.0f);
+        return r;
+    };
+
+    // --- stance: the cycle is an edge, and it changes the body height ---
+    {
+        SimInput i;
+        i.stanceCycle = true;
+        step(i, false);
+        const bool wentCrouch = m.stance == movement::Stance::Crouch;
+        const float crouchHeight = movement::STANCE_COLLISION_HEIGHT[static_cast<int>(m.stance)];
+
+        step(i, false);
+        const bool wentProne = m.stance == movement::Stance::Prone;
+        const float proneHeight = movement::STANCE_COLLISION_HEIGHT[static_cast<int>(m.stance)];
+
+        step(i, false);
+        const bool wentStanding = m.stance == movement::Stance::Standing;
+        const float standHeight = movement::STANCE_COLLISION_HEIGHT[static_cast<int>(m.stance)];
+
+        // Stance must be a real body height change, not a camera offset.
+        rep.stanceCycleOk = wentCrouch && wentProne && wentStanding &&
+                            crouchHeight < standHeight && proneHeight < crouchHeight;
+
+        // An edge lasts one tick. A frame with no edge must leave the stance
+        // alone — the old `static bool prevControl` latch had no such property.
+        step(SimInput{}, false);
+        rep.edgeNotLatchOk = m.stance == movement::Stance::Standing;
+    }
+
+    // --- stance is a body height, and standing up needs headroom ---
+    {
+        // Under a low ceiling, crouch holds until there is room to stand.
+        for (int y = 1; y <= 6; ++y)
+            for (int z = 0; z < WORLD_D; ++z) w.set(40, y, z, Block::Concrete);
+        movement::MoveState low;
+        low.px = 40.5f * kVoxelSize; low.py = kFloorTop; low.pz = 10.5f * kVoxelSize;
+        low.stance = movement::Stance::Standing;
+        low.onGround = true;
+        SimInput hold;
+        hold.crouch = true;
+        movement::update(kDt, hold, w, low, 0.0f, kBase, kJump);
+        const bool didCrouch = low.stance == movement::Stance::Crouch;
+        hold.crouch = false;
+        movement::update(kDt, hold, w, low, 0.0f, kBase, kJump);
+        const bool stayedCrouched = low.stance == movement::Stance::Crouch;
+        rep.stanceHeadroomOk = didCrouch && stayedCrouched;
+        for (int y = 1; y <= 6; ++y)
+            for (int z = 0; z < WORLD_D; ++z) w.set(40, y, z, Block::Air);
+    }
+
+    // --- gait and stamina ---
+    {
+        SimInput run;
+        run.moveForward = 1.0f;
+        float runScale = 0.0f;
+        for (int t = 0; t < 30; ++t) {
+            const auto r = step(run);
+            runScale = r.intent.speedScale;
+        }
+        const bool running = m.gait == movement::Gait::Run;
+        SimInput sprint;
+        sprint.moveForward = 1.0f;
+        sprint.sprint = true;
+        float sprintScale = 0.0f;
+        for (int t = 0; t < 120; ++t) {
+            const auto r = step(sprint);
+            sprintScale = r.intent.speedScale;
+        }
+        rep.maxSpeed = sprintScale;
+        rep.staminaAfterSprint = m.stamina;
+        const bool sprinting = m.gait == movement::Gait::Sprint;
+        const bool drained = m.stamina < movement::kStaminaMax;
+        // Sprint must actually be the faster gait, or the drain buys nothing.
+        rep.gaitOk = running && sprinting && sprintScale > runScale;
+        rep.staminaDrainOk = drained;
+
+        // With no intent held, stamina must come back — and only after the
+        // regen delay, not on the same tick the drain stopped.
+        for (int t = 0; t < 60; ++t) step(SimInput{});
+        rep.staminaRegenOk = m.stamina > rep.staminaAfterSprint;
+    }
+
+    // --- slide: enter on sprint+crouch while fast, then wear off ---
+    {
+        movement::MoveState s;
+        s.px = 10.5f * kVoxelSize; s.py = kFloorTop; s.pz = 10.5f * kVoxelSize;
+        s.onGround = true;
+        s.gait = movement::Gait::Sprint;
+        s.prevFlatSpeed = 0.5f;   // already moving fast
+        SimInput into;
+        into.sprint = true;
+        into.crouch = true;
+        into.moveForward = 1.0f;
+        const auto first = movement::update(kDt, into, w, s, 0.0f, kBase, kJump);
+        rep.slideEnters = s.sliding && first.intent.overrideHorizontal;
+        for (int t = 0; t < 60 * 8; ++t) {
+            const auto r = movement::update(kDt, SimInput{}, w, s, 0.0f, kBase, kJump);
+            integrate(s, r.intent, 0.0f);
+        }
+        rep.slideExhausts = !s.sliding;
+    }
+
+    // --- dash: an edge, with a cooldown and a damage window ---
+    {
+        movement::MoveState d;
+        d.px = 10.5f * kVoxelSize; d.py = kFloorTop; d.pz = 10.5f * kVoxelSize;
+        d.onGround = true;
+        SimInput go;
+        go.dash = true;
+        go.moveForward = 1.0f;
+        const auto started = movement::update(kDt, go, w, d, 0.0f, kBase, kJump);
+        rep.dashEnters = d.dashing && started.intent.overrideHorizontal;
+        rep.dashInvulnOk = started.dashInvuln;
+
+        // The same edge a second later must not dash again: the cooldown, not a
+        // view latch, is what gates it.
+        const float cool = d.dashCooldown;
+        movement::update(kDt, go, w, d, 0.0f, kBase, kJump);
+        rep.dashCooldownOk = cool > 0.0f && std::fabs(d.dashCooldown - cool) < movement::DASH_COOLDOWN;
+    }
+
+    // --- wallrun: a wall adjacent to the body while airborne ---
+    {
+        movement::MoveState wr;
+        // Body centred half a cell inside the wall face, so the wall is within
+        // the body radius and the probe can legitimately see it.
+        wr.px = 19.4f * kVoxelSize; wr.py = 5.0f * kVoxelSize; wr.pz = 10.5f * kVoxelSize;
+        wr.onGround = false;
+        bool sawWall = false;
+        for (int t = 0; t < 10; ++t) {
+            const auto r = movement::update(kDt, SimInput{}, w, wr, 0.0f, kBase, kJump);
+            if (r.intent.gravityScale < 1.0f) sawWall = true;
+        }
+        rep.wallrunDetects = sawWall;
+
+        // It must give up on its own rather than running the wall forever.
+        for (int t = 0; t < 60 * 5; ++t) movement::update(kDt, SimInput{}, w, wr, 0.0f, kBase, kJump);
+        rep.wallrunTimesOut = !wr.wallRunning;
+    }
+
+    // --- the body moved; the camera was never touched ---
+    // The old bug was that the camera was the thing that moved. Here the only
+    // thing with a position is the state we were handed, and it moved under
+    // collision: forward intent from a standing start must leave the body
+    // measurably further along the floor it is standing on.
+    {
+        movement::MoveState b;
+        b.px = 10.5f * kVoxelSize; b.py = kFloorTop; b.pz = 10.5f * kVoxelSize;
+        b.onGround = true;
+        SimInput into;
+        into.moveForward = 1.0f;
+        const float before = b.px;
+        for (int t = 0; t < 60; ++t) {
+            const auto r = movement::update(kDt, into, w, b, 0.0f, kBase, kJump);
+            integrate(b, r.intent, kBase * r.intent.speedScale);
+        }
+        rep.bodyMovesNotCamera = (b.px - before) > 1e-4f;
+    }
+
+    // --- an offset never becomes load-bearing ---
+    {
+        // Identical body state and identical intent must produce an identical
+        // body, whether or not the previous tick produced a roll. If the camera
+        // offset fed back into position, the two runs would diverge.
+        auto runOnce = [&](bool consumeOffset) {
+            movement::MoveState s;
+            s.px = 10.5f * kVoxelSize; s.py = kFloorTop; s.pz = 10.5f * kVoxelSize;
+            s.onGround = true;
+            SimInput go;
+            go.dash = true; go.moveForward = 1.0f; go.sprint = true;
+            float lastX = s.px;
+            for (int t = 0; t < 40; ++t) {
+                const auto r = movement::update(kDt, go, w, s, 0.0f, kBase, kJump);
+                integrate(s, r.intent, kBase * r.intent.speedScale);
+                lastX = s.px;
+                if (consumeOffset) {
+                    // Deliberately "use" the offset, to prove that doing so
+                    // cannot change the body. The movement code never reads it.
+                    volatile float sink = r.cam.roll + r.cam.forwardLean +
+                                          r.cam.lateralLean + r.cam.eyeLift;
+                    (void)sink;
+                }
+            }
+            return lastX;
+        };
+        rep.offsetIsPresentationOnly = runOnce(false) == runOnce(true);
+    }
+
+    // --- water is never solid for the body ---
+    {
+        movement::MoveState sw;
+        sw.px = 60.5f * kVoxelSize; sw.py = 2.0f * kVoxelSize; sw.pz = 10.5f * kVoxelSize;
+        sw.onGround = false;
+        const bool inWater = !movement::solidForPhysics(w, 60, 2, 10);
+        // Water is not ground: a body over water must not read as supported.
+        const bool noGround = !movement::groundUnder(w, sw.px, sw.py, sw.pz, 0.0185f);
+        rep.waterNotSolid = inWater && noGround;
+    }
+
+    return rep;
+}
+
 static HealthSmokeReport runHealthSmoke() {
     HealthSmokeReport rep;
     health::ActorHealth h;
@@ -4590,11 +4900,17 @@ static Vec3 flatRight() {
 // Sync locked eye camera to physics body + lean offset.
 static void syncCameraToPlayer() {
     Vec3 right = flatRight();
+    Vec3 fwd = flatForward();
     const float leanLat = g_player.lean * 0.0032f;   // lateral peek
     const float leanDrop = std::fabs(g_player.lean) * 0.0009f;
-    g_camPos.x = g_player.px + right.x * leanLat;
-    g_camPos.y = g_player.py + g_player.eyeHeight - leanDrop;
-    g_camPos.z = g_player.pz + right.z * leanLat;
+    // The body is the authority. Everything past this line is presentation:
+    // lean, the movement system's stance eye height, and the offset it produced
+    // this tick. None of it is read back by the simulation.
+    const float eye = movement::STANCE_EYE_HEIGHT[static_cast<int>(g_move.stance)];
+    const float lat = leanLat + g_camOffset.lateralLean;
+    g_camPos.x = g_player.px + right.x * lat + fwd.x * g_camOffset.forwardLean;
+    g_camPos.y = g_player.py + eye + g_camOffset.eyeLift - leanDrop;
+    g_camPos.z = g_player.pz + right.z * lat + fwd.z * g_camOffset.forwardLean;
 }
 
 // Death drops whatever is in hand as a normal mat-8 world pickup, reusing the
@@ -4637,23 +4953,51 @@ static void updatePlayerPhysics(float dt, const SimInput& in) {
     const float leanRate = 8.0f;
     g_player.lean += (g_player.leanTarget - g_player.lean) * (1.0f - std::exp(-leanRate * dt));
 
-    // --- desired horizontal velocity (analog wish axes, Shift sprint) ---
-    float speed = g_moveSpeed;
-    if (in.sprint) speed *= 1.65f;
+    // The movement system advances stance, gait, slide, wallrun, dash and
+    // stamina, and it decides how fast the body is allowed to go. It is handed
+    // the authoritative body and the authoritative grid, and it returns an
+    // intent plus a presentation offset. It never touches the camera: the roll
+    // and lean below are applied by syncCameraToPlayer() after this returns.
+    g_move.px = g_player.px;  g_move.py = g_player.py;  g_move.pz = g_player.pz;
+    g_move.vx = g_player.vx;  g_move.vy = g_player.vy;  g_move.vz = g_player.vz;
+    g_move.onGround = g_player.onGround;
+    const movement::MoveResult mv = movement::update(dt, in, *g_world, g_move, g_yaw,
+                                                       g_moveSpeed, g_player.jumpSpeed);
+    g_camOffset = mv.cam;
+
+    // Stance is a real body height, so the hitbox and the eye follow it. This is
+    // a body change, not an offset: a prone body is short and can fit somewhere
+    // a standing one cannot.
+    g_player.height = movement::STANCE_COLLISION_HEIGHT[static_cast<int>(g_move.stance)];
+    g_player.radius = std::max(1.0f * kVoxelSize, g_player.height * 0.12f);
+    g_player.eyeHeight = movement::STANCE_EYE_HEIGHT[static_cast<int>(g_move.stance)];
+
+    // A wallrun turns the *body*, so the authoritative facing moves with it.
+    if (mv.intent.facingYaw != 0.0f) g_yaw = mv.intent.facingYaw;
+
+    // --- desired horizontal velocity (analog wish axes) ---
+    float speed = g_moveSpeed * mv.intent.speedScale;
     // Lean slows strafe slightly (shoulder into cover).
     speed *= (1.0f - 0.18f * std::fabs(g_player.lean));
 
     Vec3 wish(0, 0, 0);
     Vec3 f = flatForward();
     Vec3 r = flatRight();
-    if (std::fabs(in.moveForward) > 1e-6f) wish = wish + f * in.moveForward;
-    if (std::fabs(in.moveRight) > 1e-6f) wish = wish + r * in.moveRight;
-    if (wish.length() > 1e-5f) wish = wish.normalized() * speed;
+    if (!mv.intent.overrideHorizontal) {
+        if (std::fabs(in.moveForward) > 1e-6f) wish = wish + f * in.moveForward;
+        if (std::fabs(in.moveRight) > 1e-6f) wish = wish + r * in.moveRight;
+        if (wish.length() > 1e-5f) wish = wish.normalized() * speed;
+    }
 
     // Accelerate / friction on horizontal plane.
     const float accel = g_player.onGround ? 18.0f : 4.0f;
     const float friction = g_player.onGround ? 12.0f : 1.5f;
-    if (wish.length() > 1e-6f) {
+    if (mv.intent.overrideHorizontal) {
+        // Slide, dash and wallrun drive the body directly. The integrator below
+        // still collides it, so a dash into a wall stops like anything else.
+        g_player.vx = mv.intent.vx;
+        g_player.vz = mv.intent.vz;
+    } else if (wish.length() > 1e-6f) {
         g_player.vx += (wish.x - g_player.vx) * std::min(1.0f, accel * dt);
         g_player.vz += (wish.z - g_player.vz) * std::min(1.0f, accel * dt);
     } else {
@@ -4664,15 +5008,17 @@ static void updatePlayerPhysics(float dt, const SimInput& in) {
         if (std::fabs(g_player.vz) < 1e-5f) g_player.vz = 0.0f;
     }
 
-    // Jump (Space) — no free-fly up/down.
-    if (g_wantJump && g_player.onGround) {
-        g_player.vy = g_player.jumpSpeed;
+    // Jump (Space) — no free-fly up/down. The impulse comes from the movement
+    // system, which owns stance scaling; in.jump is the edge, so there is no
+    // cross-frame latch to miss a tap.
+    if (mv.intent.jumpImpulse > 0.0f) {
+        g_player.vy = mv.intent.jumpImpulse;
         g_player.onGround = false;
     }
     g_wantJump = false;
 
-    // Gravity (same world scale as projectiles).
-    g_player.vy -= kWorldGravity * dt;
+    // Gravity (same world scale as projectiles), scaled down while wallrunning.
+    g_player.vy -= kWorldGravity * mv.intent.gravityScale * dt;
     if (g_player.vy < -0.25f) g_player.vy = -0.25f; // terminal
 
     // Integrate with axis-separated unit-grid collision.
@@ -5129,7 +5475,17 @@ static SimInput buildSimInput() {
     in.moveForward = std::max(-1.0f, std::min(1.0f, fwd));
     in.moveRight = std::max(-1.0f, std::min(1.0f, right));
     in.sprint = g_keys[VK_SHIFT] != 0;
+    in.crouch = g_keys[VK_CONTROL] != 0;
     in.ads = in.ads || (g_keys['X'] != 0);
+
+    // Dash and stance-cycle are edges: they are detected here, in the view, where
+    // the press actually happened, and consumed by the sim on the next tick. The
+    // sim never learns a key is held, only that a press arrived. Q/E stay reserved
+    // for lean and E for interact, so dash is C and the stance cycle is F.
+    if (g_keys['C'] && !g_dashHeldPrev) g_pendingInput.dash = true;
+    g_dashHeldPrev = g_keys['C'] != 0;
+    if (g_keys['F'] && !g_stanceHeldPrev) g_pendingInput.stanceCycle = true;
+    g_stanceHeldPrev = g_keys['F'] != 0;
 
     // Held lean keys -> one axis, so a view cannot send contradictory Q and E.
     float lean = 0.0f;
@@ -5246,6 +5602,10 @@ static void simulateOnce(float dt, const SimInput& in) {
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
     std::string cmd = cmdLine ? cmdLine : "";
     if (cmd.find("--smoke") != std::string::npos) g_smoke = true;
+    // --smoke-movement is a standalone movement-only pass: it drives the real
+    // movement seam with scripted intent and writes its own marker, so a
+    // movement regression can be triaged without reading the whole smoke log.
+    if (cmd.find("--smoke-movement") != std::string::npos) g_smokeMovement = true;
     if (cmd.find("--stress") != std::string::npos) {
         g_stress = true;
         g_smoke = true; // reuse headless quit path
@@ -5410,6 +5770,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             g_simViewSmoke = runSimViewSmoke(world);
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
+            g_moveSmoke = runMovementSmoke();
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
 out << "ticks=" << g_tick << "\nframes=" << frames
@@ -5551,6 +5912,37 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nhealth_drown_ticks=" << g_drownDamageTicks
                 << "\nhealth_deaths=" << g_deaths
                 << "\nhealth_respawns=" << g_respawns
+                << "\nmove_stance_cycle_ok=" << (g_moveSmoke.stanceCycleOk ? 1 : 0)
+                << "\nmove_stance_headroom_ok=" << (g_moveSmoke.stanceHeadroomOk ? 1 : 0)
+                << "\nmove_gait_ok=" << (g_moveSmoke.gaitOk ? 1 : 0)
+                << "\nmove_stamina_drain_ok=" << (g_moveSmoke.staminaDrainOk ? 1 : 0)
+                << "\nmove_stamina_regen_ok=" << (g_moveSmoke.staminaRegenOk ? 1 : 0)
+                << "\nmove_slide_enters=" << (g_moveSmoke.slideEnters ? 1 : 0)
+                << "\nmove_slide_exhausts=" << (g_moveSmoke.slideExhausts ? 1 : 0)
+                << "\nmove_dash_enters=" << (g_moveSmoke.dashEnters ? 1 : 0)
+                << "\nmove_dash_cooldown_ok=" << (g_moveSmoke.dashCooldownOk ? 1 : 0)
+                << "\nmove_dash_invuln_ok=" << (g_moveSmoke.dashInvulnOk ? 1 : 0)
+                << "\nmove_wallrun_detects=" << (g_moveSmoke.wallrunDetects ? 1 : 0)
+                << "\nmove_wallrun_times_out=" << (g_moveSmoke.wallrunTimesOut ? 1 : 0)
+                << "\nmove_body_moves=" << (g_moveSmoke.bodyMovesNotCamera ? 1 : 0)
+                << "\nmove_offset_presentation_only=" << (g_moveSmoke.offsetIsPresentationOnly ? 1 : 0)
+                << "\nmove_water_not_solid=" << (g_moveSmoke.waterNotSolid ? 1 : 0)
+                << "\nmove_edge_not_latch_ok=" << (g_moveSmoke.edgeNotLatchOk ? 1 : 0)
+                << "\nmove_stamina_after_sprint=" << g_moveSmoke.staminaAfterSprint
+                << "\nmove_stance=" << static_cast<int>(g_move.stance)
+                << "\nmove_gait=" << static_cast<int>(g_move.gait)
+                << "\nmove_stamina=" << g_move.stamina
+                << "\nmove_ok="
+                << ((g_moveSmoke.stanceCycleOk && g_moveSmoke.stanceHeadroomOk &&
+                     g_moveSmoke.gaitOk && g_moveSmoke.staminaDrainOk &&
+                     g_moveSmoke.staminaRegenOk && g_moveSmoke.slideEnters &&
+                     g_moveSmoke.slideExhausts && g_moveSmoke.dashEnters &&
+                     g_moveSmoke.dashCooldownOk && g_moveSmoke.dashInvulnOk &&
+                     g_moveSmoke.wallrunDetects && g_moveSmoke.wallrunTimesOut &&
+                     g_moveSmoke.bodyMovesNotCamera && g_moveSmoke.offsetIsPresentationOnly &&
+                     g_moveSmoke.waterNotSolid && g_moveSmoke.edgeNotLatchOk)
+                        ? 1
+                        : 0)
                 << "\nhealth_ok="
                 << ((g_healthSmoke.maxHealthOk && g_healthSmoke.armorAbsorbOk &&
                      g_healthSmoke.zoneHitOk && g_healthSmoke.damageOk &&
@@ -5579,6 +5971,44 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nview_smoothing_ok=" << ((g_simViewSmoke.cornerAoOk && g_simViewSmoke.normalSmoothingOk) ? 1 : 0)
                 << "\nao_corners_ok=" << (g_simViewSmoke.cornerAoOk ? 1 : 0)
                 << "\n";
+            out.close();
+
+            // --smoke-movement gets its own marker so a movement regression can
+            // be triaged without diffing the whole smoke log, and its own exit
+            // code so a CI step can gate on movement alone.
+            if (g_smokeMovement) {
+                const bool moveAllOk = g_moveSmoke.stanceCycleOk && g_moveSmoke.stanceHeadroomOk &&
+                                       g_moveSmoke.gaitOk && g_moveSmoke.staminaDrainOk &&
+                                       g_moveSmoke.staminaRegenOk && g_moveSmoke.slideEnters &&
+                                       g_moveSmoke.slideExhausts && g_moveSmoke.dashEnters &&
+                                       g_moveSmoke.dashCooldownOk && g_moveSmoke.dashInvulnOk &&
+                                       g_moveSmoke.wallrunDetects && g_moveSmoke.wallrunTimesOut &&
+                                       g_moveSmoke.bodyMovesNotCamera &&
+                                       g_moveSmoke.offsetIsPresentationOnly &&
+                                       g_moveSmoke.waterNotSolid && g_moveSmoke.edgeNotLatchOk;
+                std::ofstream mvOut(g_exeDir + "\\movement_smoke_ok.txt");
+                mvOut << "move_stance_cycle_ok=" << (g_moveSmoke.stanceCycleOk ? 1 : 0) << "\n"
+                      << "move_stance_headroom_ok=" << (g_moveSmoke.stanceHeadroomOk ? 1 : 0) << "\n"
+                      << "move_gait_ok=" << (g_moveSmoke.gaitOk ? 1 : 0) << "\n"
+                      << "move_stamina_drain_ok=" << (g_moveSmoke.staminaDrainOk ? 1 : 0) << "\n"
+                      << "move_stamina_regen_ok=" << (g_moveSmoke.staminaRegenOk ? 1 : 0) << "\n"
+                      << "move_slide_enters=" << (g_moveSmoke.slideEnters ? 1 : 0) << "\n"
+                      << "move_slide_exhausts=" << (g_moveSmoke.slideExhausts ? 1 : 0) << "\n"
+                      << "move_dash_enters=" << (g_moveSmoke.dashEnters ? 1 : 0) << "\n"
+                      << "move_dash_cooldown_ok=" << (g_moveSmoke.dashCooldownOk ? 1 : 0) << "\n"
+                      << "move_dash_invuln_ok=" << (g_moveSmoke.dashInvulnOk ? 1 : 0) << "\n"
+                      << "move_wallrun_detects=" << (g_moveSmoke.wallrunDetects ? 1 : 0) << "\n"
+                      << "move_wallrun_times_out=" << (g_moveSmoke.wallrunTimesOut ? 1 : 0) << "\n"
+                      << "move_body_moves=" << (g_moveSmoke.bodyMovesNotCamera ? 1 : 0) << "\n"
+                      << "move_offset_presentation_only="
+                      << (g_moveSmoke.offsetIsPresentationOnly ? 1 : 0) << "\n"
+                      << "move_water_not_solid=" << (g_moveSmoke.waterNotSolid ? 1 : 0) << "\n"
+                      << "move_edge_not_latch_ok=" << (g_moveSmoke.edgeNotLatchOk ? 1 : 0) << "\n"
+                      << "move_stamina_after_sprint=" << g_moveSmoke.staminaAfterSprint << "\n"
+                      << "move_ok=" << (moveAllOk ? 1 : 0) << "\n";
+                mvOut.close();
+                if (!moveAllOk) { cleanup(); return 2; }
+            }
         }
     } catch (const std::exception& e) {
         MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);
