@@ -7,7 +7,10 @@
   when the classic scripts exist; otherwise prefer -Action.
 #>
 param(
-  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokePainter", "SmokeAll", "Ui", "")]
+  # Must stay a superset of scripts/launch_dev.ps1's own set: this root entry
+  # forwards -Action straight through, so a value missing here fails parameter
+  # binding before launch_dev.ps1 ever runs.
+  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokeMovement", "SmokePainter", "SmokeAll", "Stress", "Ui", "Help", "")]
   [string]$Action = "",
 
   # Legacy switches (engine-era root launch.ps1)

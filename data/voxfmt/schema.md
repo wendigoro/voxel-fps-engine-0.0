@@ -5,6 +5,7 @@ Cell extent on Z always equals X and Y (no non-cubic voxels).
 
 ```json
 {
+  "format_version": 1,
   "unit": 1,
   "voxel_size": 0.001,
   "mode": "model|sky|character|weapon|item|map",
@@ -43,6 +44,7 @@ omitted entirely when empty, so "no section" means "none authored", never "empty
 ```json
 {
   "mode": "map",
+  "id_counters": {"evt": 4, "npc": 3, "route": 2},
   "scripted_events": [
     {"x":10,"y":1,"z":10,"id":"evt_1","name":"Test \"Event\"","script":"open_door.ps1",
      "trigger":"on_signal","radius":2.000,"cooldown":20,"required_signal":"key_found",
@@ -74,6 +76,16 @@ omitted entirely when empty, so "no section" means "none authored", never "empty
 Entity `id`s are assigned per document in authoring order (`evt_1`, `npc_1`, `route_1`, …) so
 the same authoring order always produces the same ids. The writer escapes `"` and `\` in every
 string, and the reader unescapes them, so a quote in an event name survives a round trip.
+
+`id_counters` is the next id to issue for each family. It round-trips so reloading a map and
+placing one more entity never re-issues an id that already exists. On load the reader takes the
+maximum of the persisted counter and `max(numeric suffix of existing ids) + 1`, so a document
+written before counters existed, or one hand-edited to add a high-numbered entity, still cannot
+collide with an existing id.
+
+`format_version` is the document layout version. Omitted files default to `1`. Writers always
+emit the current version; readers refuse a `format_version` **greater** than the version they
+understand.
 
 Map mode currently has no engine consumer: it is an authoring and interchange format only.
 

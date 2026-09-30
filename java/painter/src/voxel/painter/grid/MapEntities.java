@@ -146,6 +146,13 @@ public final class MapEntities {
         // authoring sequence must always produce the same IDs so a document
         // round-trips identically. AGENTS.md forbids wall-clock and Math.random
         // as a source of identifiers.
+        //
+        // These are persisted. Before they were, a save/load reset every counter
+        // to 1, so reloading a map and placing one more NPC re-issued "npc_1" and
+        // silently shadowed the original. That is invisible for passive authoring
+        // and fatal the moment a mission holds a cross-reference, so the counters
+        // now round-trip. Monotonicity matters: deleting evt_3 must not let a
+        // later event reuse evt_3 while a mission still points at it.
         private int nextEvent = 1;
         private int nextNpc = 1;
         private int nextRoute = 1;
@@ -163,6 +170,44 @@ public final class MapEntities {
         /** Next patrol route ID for this document, e.g. "route_1". */
         public String nextRouteId() {
             return "route_" + nextRoute++;
+        }
+
+        /** Highest numeric suffix of every current id "<prefix>_<n>". */
+        private static int maxNumericSuffix(String prefix, java.util.Collection<String> ids) {
+            int max = 0;
+            for (String id : ids) {
+                if (id == null || !id.startsWith(prefix + "_")) continue;
+                try {
+                    max = Math.max(max, Integer.parseInt(id.substring(prefix.length() + 1)));
+                } catch (NumberFormatException ignored) {
+                    // A hand-edited non-numeric id does not move the counter; it
+                    // simply cannot be shadowed because it is not of the numeric form.
+                }
+            }
+            return max;
+        }
+
+        /**
+         * Restore persisted counters, then raise any counter that an existing
+         * entity's id already exceeds. Taking the maximum of the two means a
+         * document written before counters existed, or one hand-edited to add a
+         * high-numbered entity, still cannot issue a colliding id.
+         */
+        public void restoreCounters(int event, int npc, int route) {
+            List<String> eventIds = new ArrayList<>(events.size());
+            for (ScriptedEvent e : events) eventIds.add(e.id);
+            List<String> npcIds = new ArrayList<>(npcs.size());
+            for (Npc n : npcs) npcIds.add(n.id);
+            List<String> routeIds = new ArrayList<>(patrolRoutes.size());
+            for (PatrolRoute r : patrolRoutes) routeIds.add(r.id);
+            nextEvent = Math.max(event, maxNumericSuffix("evt", eventIds) + 1);
+            nextNpc = Math.max(npc, maxNumericSuffix("npc", npcIds) + 1);
+            nextRoute = Math.max(route, maxNumericSuffix("route", routeIds) + 1);
+        }
+
+        /** Current counter values, for the writer. */
+        public int[] counters() {
+            return new int[] { nextEvent, nextNpc, nextRoute };
         }
 
         public void addEvent(ScriptedEvent e) { events.add(e); }

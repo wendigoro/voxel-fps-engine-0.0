@@ -262,6 +262,10 @@ static int g_bodyHits = 0;
 static int g_deaths = 0;
 static int g_respawns = 0;
 static bool g_deathHandled = false;
+// Damage attempts refused because the player was inside the dash invulnerability
+// window. A non-zero value here is proof the window is actually consulted, which
+// the movement smoke's own assertion cannot establish on its own.
+static int g_dashInvulnBlocks = 0;
 
 // The two halves of the world, deliberately separate objects:
 //
@@ -322,10 +326,22 @@ static float equippedArmorPoints(ArmorZone zone) {
     return d ? d->armorPoints : 0.0f;
 }
 
+// Is the player inside the dash invulnerability window?
+//
+// movement::update owns the flag (movement.hpp sets dashInvuln on the dash edge
+// and clears it when DASH_INVULN_TIME expires); this is the single read point.
+// Every damage path funnels through here so a dash actually protects the player
+// rather than merely reporting that it could. Drowning is excluded on purpose:
+// health::updateBreath is not an impact and mutates health directly, and it
+// runs before movement::update in the tick, so it cannot be gated by a flag the
+// same tick has not set yet.
+static bool dashInvulnerable() { return g_move.dashInvuln; }
+
 // Convert an impact's voxel-destruction energy into HP loss on the player's body
 // and apply it at `zone`. Returns the HP actually removed.
 static float damagePlayerAtZone(float energy, const std::string& effect, ArmorZone zone) {
     if (g_health.dead) return 0.0f;
+    if (dashInvulnerable()) { ++g_dashInvulnBlocks; return 0.0f; }
     const float bio = health::biologicalDamage(energy, effect);
     if (bio <= 0.0f) return 0.0f;
     const health::DamageResult r =
@@ -3656,6 +3672,11 @@ struct MovementSmokeReport {
     bool dashEnters = false;
     bool dashCooldownOk = false;
     bool dashInvulnOk = false;
+    // The invulnerability window is only real if it (a) withholds damage while
+    // open, (b) expires on its own, and (c) stops withholding once expired.
+    // dashInvulnOk alone proves none of that -- it only reads one tick's flag.
+    bool dashBlocksDamageOk = false;
+    bool dashInvulnExpiresOk = false;
     bool wallrunDetects = false;
     bool wallrunTimesOut = false;
     bool bodyMovesNotCamera = false;
@@ -3850,6 +3871,59 @@ static MovementSmokeReport runMovementSmoke() {
         const float cool = d.dashCooldown;
         movement::update(kDt, go, w, d, 0.0f, kBase, kJump);
         rep.dashCooldownOk = cool > 0.0f && std::fabs(d.dashCooldown - cool) < movement::DASH_COOLDOWN;
+
+        // The window must withhold real damage, not merely report a flag. Drive
+        // the actual intake while the dash is open and assert HP does not move;
+        // then let the window lapse and assert the same hit now lands. Without
+        // the second half this would pass for a dash that is invulnerable
+        // forever, which is the bug this assertion exists to prevent.
+        //
+        // g_move/g_health are the production objects here on purpose: a local
+        // MoveState would only prove the flag reads back, never that the intake
+        // consults it. Both are restored so the rest of the smoke is unaffected.
+        movement::MoveState savedMove = g_move;
+        health::ActorHealth savedHealth = g_health;
+        const int savedBlocks = g_dashInvulnBlocks;
+        g_move = d;                      // adopt the already-dashing state
+        g_health = health::ActorHealth{}; // full HP, no armor
+        g_health.health = 100.0f; g_health.maxHealth = 100.0f;
+
+        SimInput idle;
+        idle.moveForward = 1.0f;
+        // The contract, stated per tick rather than as a hand-computed tick
+        // count: on every tick the window reports itself open, the same hit must
+        // land no HP. Counting "within DASH_INVULN_TIME/kDt" here would be
+        // fragile -- the adopted state has already spent ticks -- and would
+        // silently pass a window that expires early. Track the flag instead and
+        // require at least one protected tick.
+        int protectedTicks = 0;
+        bool blockedDuringWindow = true;
+        for (int t = 0; t < 240; ++t) {
+            const auto r = movement::update(kDt, idle, w, g_move, 0.0f, kBase, kJump);
+            const float hpBefore = g_health.health;
+            damagePlayerAtZone(500.0f, "kinetic", ArmorZone::Chest);
+            if (r.dashInvuln || g_move.dashInvuln) {
+                ++protectedTicks;
+                if (g_health.health < hpBefore) blockedDuringWindow = false;
+            }
+            if (!g_move.dashInvuln && protectedTicks > 0) break;
+        }
+        rep.dashBlocksDamageOk = blockedDuringWindow && protectedTicks > 0;
+
+        // Now outlast the window. The dash itself ends first, so keep ticking
+        // with no input; invulnerability must clear and the hit must then land.
+        bool cleared = false;
+        for (int t = 0; t < 240; ++t) {
+            movement::update(kDt, SimInput{}, w, g_move, 0.0f, kBase, kJump);
+            if (!g_move.dashInvuln) { cleared = true; break; }
+        }
+        const float hpBeforeHit = g_health.health;
+        damagePlayerAtZone(500.0f, "kinetic", ArmorZone::Chest);
+        rep.dashInvulnExpiresOk = cleared && g_health.health < hpBeforeHit;
+
+        g_move = savedMove;
+        g_health = savedHealth;
+        g_dashInvulnBlocks = savedBlocks;
     }
 
     // --- wallrun: a wall adjacent to the body while airborne ---
@@ -4822,7 +4896,9 @@ static void spawnPlayerOnMap(const sim::World& world) {
     const int sx = WORLD_W / 2;
     const int sz = WORLD_D - DIRT_MARGIN - 18;
     int gy = 1 + SLAB_THICK; // default slab top
-    for (int y = WORLD_H - 2; y >= 0; --y) {
+    // Stand on the concrete slab (or whatever solids remain under it) — looking
+    // for the first solid from the sky would spawn the player on the roof deck.
+    for (int y = 1 + SLAB_THICK; y >= 0; --y) {
         Block b = getWorldBlock(world, sx, y, sz);
         if (isSolidBlock(b)) { gy = y + 1; break; }
     }
@@ -5084,10 +5160,15 @@ const float prevVel = vel;
         const float dmg = health::fallDamageForImpactSpeed(g_fallPeakSpeed);
         if (dmg > 0.0f) {
             // Routed through the same intake as impacts, so leg armor absorbs
-            // it like any other energy.
-            health::applyDamage(g_health, dmg, ArmorZone::Legs,
-                                equippedArmorPoints(ArmorZone::Legs));
-            ++g_fallDamageEvents;
+            // it like any other energy, and so the dash invulnerability window
+            // withholds a landing exactly as it withholds a bullet.
+            if (dashInvulnerable()) {
+                ++g_dashInvulnBlocks;
+            } else {
+                health::applyDamage(g_health, dmg, ArmorZone::Legs,
+                                    equippedArmorPoints(ArmorZone::Legs));
+                ++g_fallDamageEvents;
+            }
         }
         g_fallPeakSpeed = 0.0f;
     }
@@ -5909,6 +5990,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nhealth_hud_built=" << (g_invSmoke.hudBuilt ? 1 : 0)
                 << "\nhealth_body_hits=" << g_bodyHits
                 << "\nhealth_fall_events=" << g_fallDamageEvents
+                << "\nhealth_dash_invuln_blocks=" << g_dashInvulnBlocks
                 << "\nhealth_drown_ticks=" << g_drownDamageTicks
                 << "\nhealth_deaths=" << g_deaths
                 << "\nhealth_respawns=" << g_respawns
@@ -5922,6 +6004,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nmove_dash_enters=" << (g_moveSmoke.dashEnters ? 1 : 0)
                 << "\nmove_dash_cooldown_ok=" << (g_moveSmoke.dashCooldownOk ? 1 : 0)
                 << "\nmove_dash_invuln_ok=" << (g_moveSmoke.dashInvulnOk ? 1 : 0)
+                << "\nmove_dash_blocks_damage_ok=" << (g_moveSmoke.dashBlocksDamageOk ? 1 : 0)
+                << "\nmove_dash_invuln_expires_ok=" << (g_moveSmoke.dashInvulnExpiresOk ? 1 : 0)
                 << "\nmove_wallrun_detects=" << (g_moveSmoke.wallrunDetects ? 1 : 0)
                 << "\nmove_wallrun_times_out=" << (g_moveSmoke.wallrunTimesOut ? 1 : 0)
                 << "\nmove_body_moves=" << (g_moveSmoke.bodyMovesNotCamera ? 1 : 0)
@@ -5938,6 +6022,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                      g_moveSmoke.staminaRegenOk && g_moveSmoke.slideEnters &&
                      g_moveSmoke.slideExhausts && g_moveSmoke.dashEnters &&
                      g_moveSmoke.dashCooldownOk && g_moveSmoke.dashInvulnOk &&
+                     g_moveSmoke.dashBlocksDamageOk && g_moveSmoke.dashInvulnExpiresOk &&
                      g_moveSmoke.wallrunDetects && g_moveSmoke.wallrunTimesOut &&
                      g_moveSmoke.bodyMovesNotCamera && g_moveSmoke.offsetIsPresentationOnly &&
                      g_moveSmoke.waterNotSolid && g_moveSmoke.edgeNotLatchOk)
@@ -5982,6 +6067,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                                        g_moveSmoke.staminaRegenOk && g_moveSmoke.slideEnters &&
                                        g_moveSmoke.slideExhausts && g_moveSmoke.dashEnters &&
                                        g_moveSmoke.dashCooldownOk && g_moveSmoke.dashInvulnOk &&
+                                       g_moveSmoke.dashBlocksDamageOk &&
+                                       g_moveSmoke.dashInvulnExpiresOk &&
                                        g_moveSmoke.wallrunDetects && g_moveSmoke.wallrunTimesOut &&
                                        g_moveSmoke.bodyMovesNotCamera &&
                                        g_moveSmoke.offsetIsPresentationOnly &&
@@ -5997,6 +6084,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                       << "move_dash_enters=" << (g_moveSmoke.dashEnters ? 1 : 0) << "\n"
                       << "move_dash_cooldown_ok=" << (g_moveSmoke.dashCooldownOk ? 1 : 0) << "\n"
                       << "move_dash_invuln_ok=" << (g_moveSmoke.dashInvulnOk ? 1 : 0) << "\n"
+                      << "move_dash_blocks_damage_ok=" << (g_moveSmoke.dashBlocksDamageOk ? 1 : 0) << "\n"
+                      << "move_dash_invuln_expires_ok=" << (g_moveSmoke.dashInvulnExpiresOk ? 1 : 0) << "\n"
                       << "move_wallrun_detects=" << (g_moveSmoke.wallrunDetects ? 1 : 0) << "\n"
                       << "move_wallrun_times_out=" << (g_moveSmoke.wallrunTimesOut ? 1 : 0) << "\n"
                       << "move_body_moves=" << (g_moveSmoke.bodyMovesNotCamera ? 1 : 0) << "\n"

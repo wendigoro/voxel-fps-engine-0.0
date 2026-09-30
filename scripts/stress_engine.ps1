@@ -12,7 +12,7 @@ if (-not $SkipBuild) {
 if (-not (Test-Path $Exe)) { throw "missing $Exe" }
 Remove-Item (Join-Path $Build "stress_ok.txt") -ErrorAction SilentlyContinue
 $cmdExe = Join-Path $env:SystemRoot "System32\cmd.exe"
-$line = "cd /d `"$Build`" && voxel_engine.exe --stress"
+$line = "`"$Exe`" --stress"
 Write-Host "stress_cmd=$line"
 & $cmdExe /d /c $line
 $code = $LASTEXITCODE
