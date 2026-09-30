@@ -30,6 +30,7 @@
 #include "inventory.hpp"
 #include "fisheye.hpp"
 #include "materials.hpp"
+#include "map_vox.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
 
@@ -4225,6 +4226,171 @@ struct SimViewSmokeReport {
 
 static SimViewSmokeReport g_simViewSmoke;
 
+// MAP-mode voxfmt loader smoke. --smoke skips the frame loop, so the loader is
+// exercised directly here: the painter-exported data/voxfmt fixture must parse
+// with every field intact (including escaped quotes), counters restore per the
+// id_counters contract, and the voxel grid stamps into a fresh all-Air world as
+// unit cubes. The refusal cases are crafted text, so they prove the reader
+// gates without depending on a second file on disk.
+struct MapVoxSmokeReport {
+    bool fileFound = false;
+    bool docOk = false;
+    bool formatOk = false;
+    bool modeOk = false;
+    bool unitOk = false;
+    bool voxelSizeOk = false;
+    bool dimsOk = false;
+    int events = 0, npcs = 0, routes = 0, voxels = 0, dropped = 0;
+    bool eventFieldOk = false;   // every scripted_event field, exact
+    bool npcFieldOk = false;     // every npc field, exact
+    bool routeFieldOk = false;   // every patrol_route/node field, exact
+    bool countersRestoredOk = false; // evt==2, npc==2, route==2 on the fixture
+    bool materialDropOk = false; // un-representable material is dropped, counted
+    bool stampOk = false;        // 1024 cells written, all concrete, no leftovers
+    bool refusalVersionOk = false; // format_version 2 + non-unit docs refuse
+    bool refusalUnitOk = false;
+    bool refusalVoxelSizeOk = false;
+    int stampWritten = 0;
+    int stampSkipped = 0;
+};
+
+static MapVoxSmokeReport g_mapSmoke;
+
+static MapVoxSmokeReport runMapVoxSmoke() {
+    MapVoxSmokeReport rep;
+
+    // The fixture lives in data/voxfmt in the repo and is copied to build/voxfmt
+    // by build.ps1, so probe the same g_exeDir ancestors the other loaders use.
+    const std::string mapCandidates[] = {
+        g_exeDir + "\\voxfmt\\smoke_map.vox.json",
+        g_exeDir + "\\..\\data\\voxfmt\\smoke_map.vox.json",
+        g_exeDir + "\\..\\..\\data\\voxfmt\\smoke_map.vox.json",
+    };
+    mapvox::Doc doc;
+    bool anyFound = false;
+    for (const auto& p : mapCandidates) {
+        mapvox::Doc cand;
+        mapvox::loadMapVox(p, cand);
+        if (cand.fileFound) {
+            anyFound = true;
+            doc = cand;        // last found candidate wins; parse status kept
+            break;
+        }
+    }
+    rep.fileFound = anyFound;
+
+    rep.formatOk = (doc.formatVersion == 1);
+    rep.modeOk = doc.modeMap;
+    rep.unitOk = doc.unitOk;
+    rep.voxelSizeOk = doc.voxelSizeOk;
+    rep.dimsOk = (doc.sx == 32 && doc.sy == 16 && doc.sz == 32);
+    rep.events = static_cast<int>(doc.events.size());
+    rep.npcs = static_cast<int>(doc.npcs.size());
+    rep.routes = static_cast<int>(doc.routes.size());
+    rep.voxels = static_cast<int>(doc.voxels.size());
+    rep.dropped = doc.dropped;
+    rep.docOk = doc.ok;
+
+    // Event fields: name/condition carry escaped quotes and a quote inside a
+    // string that must survive a round trip.
+    if (doc.events.size() == 1) {
+        const auto& e = doc.events[0];
+        rep.eventFieldOk =
+            e.x == 10 && e.y == 1 && e.z == 10 && e.id == "evt_1" &&
+            e.name == "Test \"Event\"" && e.script == "open_door.ps1" &&
+            e.trigger == "on_signal" && e.radius == 2.0f && e.cooldown == 20 &&
+            e.requiredSignal == "key_found" && e.emitSignal == "door_open" &&
+            e.condition == "count(\"kills\") > 0" && e.repeatSet &&
+            e.repeat == 3 && !e.enabled;
+    }
+
+    if (doc.npcs.size() == 1) {
+        const auto& n = doc.npcs[0];
+        rep.npcFieldOk =
+            n.x == 15 && n.y == 1 && n.z == 15 && n.id == "npc_1" &&
+            n.name == "Guard" && n.npcType == "guard" && n.aiProfile == "patrol" &&
+            n.patrolRoute == "route_1" && n.health == 120.0f &&
+            n.maxHealth == 150.0f && n.speed == 0.075f && n.viewDist == 24.5f &&
+            n.viewAngle == 110.0f && n.faction == "hostile" &&
+            n.dialogue == "guard_taunt" && n.inventory.empty() && n.isStatic &&
+            n.spawnTick == 120 && n.spawnCondition == "wave_2" && n.enabled;
+    }
+
+    if (doc.routes.size() == 1) {
+        const auto& r = doc.routes[0];
+        rep.routeFieldOk =
+            r.id == "route_1" && r.name == "Guard Patrol" && !r.loop &&
+            r.nodes.size() == 3 && r.nodes[0].x == 15 && r.nodes[0].y == 1 &&
+            r.nodes[0].z == 15 && r.nodes[0].wait == 2.0f &&
+            r.nodes[0].action == "idle" && r.nodes[1].x == 20 &&
+            r.nodes[1].y == 1 && r.nodes[1].z == 15 && r.nodes[1].wait == 1.0f &&
+            r.nodes[1].action == "look" && r.nodes[2].x == 20 &&
+            r.nodes[2].y == 1 && r.nodes[2].z == 20 && r.nodes[2].wait == 2.5f &&
+            r.nodes[2].action == "interact";
+    }
+
+    // id_counters: fixture persists {evt:2, npc:2, route:1} and ids end at _1,
+    // so restored is {evt:2, npc:2, route:max(1, 1+1)=2}.
+    rep.countersRestoredOk =
+        doc.restored.evt == 2 && doc.restored.npc == 2 && doc.restored.route == 2;
+
+    // Crafted refusals: readers must refuse what they don't understand and never
+    // load non-cubic grids.
+    {
+        mapvox::Doc d;
+        rep.refusalVersionOk = !mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+        rep.refusalUnitOk = !mapvox::parseMapVox(
+            "{\"format_version\":1,\"unit\":2,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+        rep.refusalVoxelSizeOk = !mapvox::parseMapVox(
+            "{\"format_version\":1,\"unit\":1,\"voxel_size\":0.004,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+    }
+
+    // Material drop: a voxel whose painter material has no sim::Block is
+    // removed and counted, never stamped as a wrong block. Craft a 2-cell doc:
+    // concrete (kept) + plexiglass (dropped).
+    {
+        mapvox::Doc d;
+        const bool parsed = mapvox::parseMapVox(
+            "{\"format_version\":1,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+            "\"dims\":[4,4,4],"
+            "\"voxels\":[{\"x\":0,\"y\":0,\"z\":0,\"mat\":\"concrete\",\"rgb\":6710891},"
+            "{\"x\":1,\"y\":0,\"z\":0,\"mat\":\"plexiglass\",\"rgb\":16777215}]}",
+            d);
+        rep.materialDropOk = parsed && d.ok && d.voxels.size() == 1 &&
+                             d.dropped == 1 &&
+                             d.voxels[0].block == sim::Block::Concrete;
+    }
+
+    // Stamp the whole fixture into a fresh all-Air world at origin (8,0,8). The
+    // fixture is a 32x32 concrete slab at y=0; the stamp must place 1024 unit
+    // cubes (no shrink, no offsets) and leave the rest Air.
+    if (rep.fileFound && doc.ok && rep.voxels == 1024) {
+        sim::World w;
+        w.alloc();
+        for (int cy = 0; cy < CHUNKS_Y; ++cy)
+            for (int cz = 0; cz < CHUNKS_Z; ++cz)
+                for (int cx = 0; cx < CHUNKS_X; ++cx) {
+                    SimChunk& c = w.chunks[sim::World::chunkIndex(cx, cy, cz)];
+                    c.cx = cx; c.cy = cy; c.cz = cz;
+                    c.voxels.assign(VOXELS_PER_CHUNK, Block::Air);
+                }
+        const mapvox::StampResult sr = mapvox::stampMapVox(doc, w, 8, 0, 8);
+        rep.stampWritten = sr.written;
+        rep.stampSkipped = sr.skipped;
+        int concrete = 0;
+        for (int z = 8; z < 40; ++z)
+            for (int x = 8; x < 40; ++x) {
+                if (w.get(x, 0, z) == Block::Concrete) ++concrete;
+            }
+        const bool allConcrete = (concrete == 1024);
+        const bool aboveClear = (w.get(8, 1, 8) == Block::Air && w.get(39, 20, 39) == Block::Air);
+        rep.stampOk = sr.written == 1024 && sr.skipped == 0 && allConcrete && aboveClear;
+    }
+
+    return rep;
+}
+
 static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
     SimViewSmokeReport rep;
 
@@ -5941,6 +6107,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
             g_moveSmoke = runMovementSmoke();
+            g_mapSmoke = runMapVoxSmoke();
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
 out << "ticks=" << g_tick << "\nframes=" << frames
@@ -6159,6 +6326,44 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nskirt_isolation_ok=" << (g_simViewSmoke.skirtIsolationOk ? 1 : 0)
                 << "\nview_smoothing_ok=" << ((g_simViewSmoke.cornerAoOk && g_simViewSmoke.normalSmoothingOk) ? 1 : 0)
                 << "\nao_corners_ok=" << (g_simViewSmoke.cornerAoOk ? 1 : 0)
+                // MAP-mode loader (Phase 2b): fixture parse + field fidelity +
+                // counter restore + unit-cube stamp, all in one gate.
+                << "\nmap_file_found=" << (g_mapSmoke.fileFound ? 1 : 0)
+                << "\nmap_doc_ok=" << (g_mapSmoke.docOk ? 1 : 0)
+                << "\nmap_format_ok=" << (g_mapSmoke.formatOk ? 1 : 0)
+                << "\nmap_mode_ok=" << (g_mapSmoke.modeOk ? 1 : 0)
+                << "\nmap_unit_ok=" << (g_mapSmoke.unitOk ? 1 : 0)
+                << "\nmap_voxel_size_ok=" << (g_mapSmoke.voxelSizeOk ? 1 : 0)
+                << "\nmap_dims_ok=" << (g_mapSmoke.dimsOk ? 1 : 0)
+                << "\nmap_events=" << g_mapSmoke.events
+                << "\nmap_npcs=" << g_mapSmoke.npcs
+                << "\nmap_routes=" << g_mapSmoke.routes
+                << "\nmap_voxels=" << g_mapSmoke.voxels
+                << "\nmap_dropped=" << g_mapSmoke.dropped
+                << "\nmap_event_fields_ok=" << (g_mapSmoke.eventFieldOk ? 1 : 0)
+                << "\nmap_npc_fields_ok=" << (g_mapSmoke.npcFieldOk ? 1 : 0)
+                << "\nmap_route_fields_ok=" << (g_mapSmoke.routeFieldOk ? 1 : 0)
+                << "\nmap_counters_restored_ok=" << (g_mapSmoke.countersRestoredOk ? 1 : 0)
+                << "\nmap_material_drop_ok=" << (g_mapSmoke.materialDropOk ? 1 : 0)
+                << "\nmap_stamp_ok=" << (g_mapSmoke.stampOk ? 1 : 0)
+                << "\nmap_stamp_written=" << g_mapSmoke.stampWritten
+                << "\nmap_stamp_skipped=" << g_mapSmoke.stampSkipped
+                << "\nmap_refusal_version_ok=" << (g_mapSmoke.refusalVersionOk ? 1 : 0)
+                << "\nmap_refusal_unit_ok=" << (g_mapSmoke.refusalUnitOk ? 1 : 0)
+                << "\nmap_refusal_voxel_size_ok=" << (g_mapSmoke.refusalVoxelSizeOk ? 1 : 0)
+                << "\nmap_ok="
+                << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
+                     g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
+                     g_mapSmoke.voxelSizeOk && g_mapSmoke.dimsOk &&
+                     g_mapSmoke.events == 1 && g_mapSmoke.npcs == 1 && g_mapSmoke.routes == 1 &&
+                     g_mapSmoke.voxels == 1024 && g_mapSmoke.dropped == 0 &&
+                     g_mapSmoke.eventFieldOk && g_mapSmoke.npcFieldOk &&
+                     g_mapSmoke.routeFieldOk && g_mapSmoke.countersRestoredOk &&
+                     g_mapSmoke.materialDropOk && g_mapSmoke.stampOk &&
+                     g_mapSmoke.refusalVersionOk && g_mapSmoke.refusalUnitOk &&
+                     g_mapSmoke.refusalVoxelSizeOk)
+                        ? 1
+                        : 0)
                 << "\n";
             out.close();
 
@@ -6203,6 +6408,21 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 if (!moveAllOk) { cleanup(); return 2; }
             }
             if (!jsonxOk) { cleanup(); return 3; }
+            // MAP loader gate (Phase 2b): the painter-exported fixture must
+            // parse, restore counters, and stamp as unit cubes, and refusals
+            // must refuse. Exit 4 lets CI triage the map contract separately.
+            if (!g_mapSmoke.fileFound || !g_mapSmoke.docOk || !g_mapSmoke.formatOk ||
+                !g_mapSmoke.modeOk || !g_mapSmoke.unitOk || !g_mapSmoke.voxelSizeOk ||
+                !g_mapSmoke.dimsOk || g_mapSmoke.events != 1 || g_mapSmoke.npcs != 1 ||
+                g_mapSmoke.routes != 1 || g_mapSmoke.voxels != 1024 ||
+                g_mapSmoke.dropped != 0 || !g_mapSmoke.eventFieldOk ||
+                !g_mapSmoke.npcFieldOk || !g_mapSmoke.routeFieldOk ||
+                !g_mapSmoke.countersRestoredOk || !g_mapSmoke.materialDropOk ||
+                !g_mapSmoke.stampOk || !g_mapSmoke.refusalVersionOk ||
+                !g_mapSmoke.refusalUnitOk || !g_mapSmoke.refusalVoxelSizeOk) {
+                cleanup();
+                return 4;
+            }
         }
     } catch (const std::exception& e) {
         MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);
