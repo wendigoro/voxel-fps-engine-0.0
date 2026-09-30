@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -524,6 +525,56 @@ static double g_frameMsMin = 1e9;
 static double g_frameMsMax = 0.0;
 static int g_frameMsCount = 0;
 static int g_framePaceHits = 0;
+
+// Per-subsystem latency breakdown (telemetry only).
+//
+// This is the Phase 1 audit instrument: which subsystem owns the frame cost is
+// the input to the Phase 2 split. Scope timers track every section once per
+// invocation and aggregate here; the report prints each as us avg/max/count.
+// QPC wall-clock is explicitly reserved for telemetry (AGENTS.md), and none of
+// these values can ever influence simulation state, so determinism is intact.
+enum SectionId {
+    SEC_HEALTH,        // health tick + respawn
+    SEC_MOVEMENT,      // player body / movement::update
+    SEC_FIRE,          // fireProjectile() (spawn, collision cast)
+    SEC_PROJECTILES,   // ballistic integration + impacts
+    SEC_DEBRIS_SIM,    // debris particle physics (sim side)
+    SEC_WAIT,          // vkWaitForFences (GPU backpressure)
+    SEC_MESH,          // flushDirtyMesh(): chunk remesh + upload
+    SEC_UBO,           // per-frame UBO write
+    SEC_SKY,           // moon/sky tile rebuild
+    SEC_DEBRIS_MESH,   // debris + muzzle VBO write (view side)
+    SEC_PICKUP,        // pickup hover mesh
+    SEC_INVENTORY,     // inventory overlay mesh + input drain
+    SEC_RECORD,        // recordCommandBuffer (build + submit)
+    SEC_COUNT
+};
+static const char* kSectionName[SEC_COUNT] = {
+    "health", "movement", "fire", "projectiles", "debris_sim",
+    "wait", "mesh", "ubo", "sky", "debris_mesh", "pickup", "inventory", "record"};
+static double g_secUsSum[SEC_COUNT] = {};
+static double g_secUsMax[SEC_COUNT] = {};
+static int g_secCount[SEC_COUNT] = {};
+static LARGE_INTEGER g_secStart[SEC_COUNT];
+
+// RAII scope marker for one section. QPC is for telemetry measurement only and
+// never feeds a gameplay branch, so sampling here cannot disturb the fixed-tick
+// simulation. Uses its own frequency handle so it stands alone (paceFrame120,
+// flushDirtyMesh and updateDebrisMesh each keep their local one).
+struct ScopedSection {
+    SectionId id;
+    ScopedSection(SectionId s) : id(s) { QueryPerformanceCounter(&g_secStart[s]); }
+    ~ScopedSection() {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        static LARGE_INTEGER freq{};
+        if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+        const double us = double(now.QuadPart - g_secStart[id].QuadPart) * 1e6 / double(freq.QuadPart);
+        g_secUsSum[id] += us;
+        if (us > g_secUsMax[id]) g_secUsMax[id] = us;
+        ++g_secCount[id];
+    }
+};
 
 static std::string g_exeDir;
 
@@ -5326,10 +5377,16 @@ static void drawFrame(float timeSec) {
     // reads simulation output, never the other way round.
 
     // Wait for this frame slot's prior GPU work before touching shared mesh buffers.
-    vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
+    {
+        ScopedSection s(SEC_WAIT);
+        vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
+    }
 
     // Safe to rebuild world VB now (no device-wide idle).
-    flushDirtyMesh();
+    {
+        ScopedSection s(SEC_MESH);
+        flushDirtyMesh();
+    }
 
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX,
@@ -5341,19 +5398,37 @@ static void drawFrame(float timeSec) {
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) fail("acquire failed");
 
     vkResetFences(g_device, 1, &g_inFlight[g_frame]);
-    updateUBO(static_cast<uint32_t>(g_frame), timeSec);
-    updateMoonSkyTile();
-    updateDebrisMesh();
+    {
+        ScopedSection s(SEC_UBO);
+        updateUBO(static_cast<uint32_t>(g_frame), timeSec);
+    }
+    {
+        ScopedSection s(SEC_SKY);
+        updateMoonSkyTile();
+    }
+    {
+        ScopedSection s(SEC_DEBRIS_MESH);
+        updateDebrisMesh();
+    }
     // Pickup hover drives a brightness tint, so the mesh follows the crosshair.
     const int prevHover = g_pickupHover;
     g_pickupHover = g_inventoryOpen ? -1 : pickupUnderCrosshair();
     if (prevHover != g_pickupHover) g_pickupMeshDirty = true;
-    updatePickupMesh();
+    {
+        ScopedSection s(SEC_PICKUP);
+        updatePickupMesh();
+    }
     // Resolve g_invHover first (it needs this frame's camera basis), then act on
     // it, so a click always lands on the cell that was under the cursor.
-    updateInventoryMesh();
-    drainInventoryInput();
-    recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
+    {
+        ScopedSection s(SEC_INVENTORY);
+        updateInventoryMesh();
+        drainInventoryInput();
+    }
+    {
+        ScopedSection s(SEC_RECORD);
+        recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
+    }
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -5579,12 +5654,15 @@ static SimInput buildSimInput() {
 static void simulateOnce(float dt, const SimInput& in) {
     // Health tick (RULES.md rule 15), ahead of input so a dead player is
     // frozen out of every control on the same frame.
-    if (health::updateActorHealth(g_health, dt)) {
-        ++g_respawns;
-        if (g_world) spawnPlayerOnMap(*g_world);
-        g_fallPeakSpeed = 0.0f;
-        g_wasOnGround = true;
-        g_deathHandled = false;
+    {
+        ScopedSection s(SEC_HEALTH);
+        if (health::updateActorHealth(g_health, dt)) {
+            ++g_respawns;
+            if (g_world) spawnPlayerOnMap(*g_world);
+            g_fallPeakSpeed = 0.0f;
+            g_wasOnGround = true;
+            g_deathHandled = false;
+        }
     }
     if (g_health.dead) {
         if (!g_deathHandled) {
@@ -5647,10 +5725,14 @@ static void simulateOnce(float dt, const SimInput& in) {
 
     updateRecoilRecovery(dt);
     // Player body physics + water weight, and lock the eye to the body.
-    updatePlayerAndEye(dt, in);
+    {
+        ScopedSection s(SEC_MOVEMENT);
+        updatePlayerAndEye(dt, in);
+    }
 
     // Fire modes: semi/bolt = edge; auto = held (RMB/F) with cooldown cadence.
     {
+        ScopedSection s(SEC_FIRE);
         WeaponDef wFire = activeWeaponOrDefault();
         const std::string mode = wFire.fireMode.empty() ? "semi" : wFire.fireMode;
         bool shouldFire = false;
@@ -5665,10 +5747,16 @@ static void simulateOnce(float dt, const SimInput& in) {
     }
 
     g_debris.beginFrame();
-    updateProjectiles(dt);
-    if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
-        g_projLivePeak = static_cast<int>(g_projectiles.size());
-    g_debris.update(dt, kWorldGravity);
+    {
+        ScopedSection s(SEC_PROJECTILES);
+        updateProjectiles(dt);
+        if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
+            g_projLivePeak = static_cast<int>(g_projectiles.size());
+    }
+    {
+        ScopedSection s(SEC_DEBRIS_SIM);
+        g_debris.update(dt, kWorldGravity);
+    }
     // Decay fire VFX (overlay + muzzle cubes).
     if (g_muzzleFlash > 0.0f || g_fireOverlay > 0.0f) {
         g_muzzleFlash = std::max(0.0f, g_muzzleFlash - dt * 6.5f);
@@ -5925,6 +6013,20 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nsteady_frames=" << (g_frameMsCount > 15 ? (g_frameMsCount - 15) : 0)
                 << "\ntarget_hz=" << TARGET_HZ
                 << "\nlock_ok=" << ((g_frameMsCount > 40) && ((g_frameMsSum / double(g_frameMsCount - 15)) <= 9.0) ? 1 : 0)
+                // Per-subsystem latency breakdown (Phase 1 audit). Each line is
+                // the avg/max microseconds a subsystem took per sample plus the
+                // sample count; section sums nest under avg_frame_ms because the
+                // frame is serial. Reading these is the input to the Phase 2 split.
+                << "\nsections=health,movement,fire,projectiles,debris_sim,wait,mesh,ubo,sky,debris_mesh,pickup,inventory,record";
+            out << std::fixed << std::setprecision(2);
+            for (int i = 0; i < SEC_COUNT; ++i) {
+                out << "\nsec_" << kSectionName[i] << "_us_avg="
+                    << (g_secCount[i] > 0 ? (g_secUsSum[i] / double(g_secCount[i])) : 0.0)
+                    << "\nsec_" << kSectionName[i] << "_us_max=" << g_secUsMax[i]
+                    << "\nsec_" << kSectionName[i] << "_count=" << g_secCount[i];
+            }
+            out << std::defaultfloat << std::setprecision(6);
+            out
                 << "\nsky_tiles=" << (SKY_SEG_U * SKY_SEG_V)
                 << "\nsky_verts=" << g_skyTileVertexCount
                 << "\nmoon_light=" << (g_isNight ? 1 : 0)
