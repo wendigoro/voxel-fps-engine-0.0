@@ -11,6 +11,7 @@ import voxel.painter.grid.VoxDocument;
 import voxel.painter.grid.VoxIO;
 import voxel.painter.grid.WeaponParts;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -276,6 +277,53 @@ public final class SmokeMain {
                 || !"interact".equals(r2.nodes.get(2).action))
             throw new IllegalStateException("patrol node data lost in round trip");
         mapBack.grid.assertCubicUnitInvariant();
+
+        // ID counters must survive the round trip: adding one more of each proves
+        // the reloaded document continues the sequence instead of re-issuing ids
+        // that already exist. shadowing here would be silent and fatal once a
+        // mission references evt_1 (MapData id counters, VoxIO id_counters).
+        // A document written before id_counters existed must also resume above
+        // its existing ids, never below one.
+        if (!mapBack.mapData.nextEventId().equals("evt_2"))
+            throw new IllegalStateException("event id counter lost in round trip: "
+                    + mapBack.mapData.nextEventId());
+        if (!mapBack.mapData.nextNpcId().equals("npc_2"))
+            throw new IllegalStateException("npc id counter lost in round trip: "
+                    + mapBack.mapData.nextNpcId());
+        if (!mapBack.mapData.nextRouteId().equals("route_2"))
+            throw new IllegalStateException("patrol route id counter lost in round trip: "
+                    + mapBack.mapData.nextRouteId());
+        Path legacyMap = Files.createTempFile("smoke_map_legacy", ".vox.json");
+        try {
+            String legacyText = Files.readString(mapVox);
+            legacyText = legacyText.replaceFirst("\"id_counters\": \\{[^}]*\\},\\s*\n", "");
+            Files.writeString(legacyMap, legacyText);
+            VoxDocument legacyBack = VoxIO.load(legacyMap);
+            if (!legacyBack.mapData.nextNpcId().equals("npc_2"))
+                throw new IllegalStateException("legacy map without id_counters must "
+                        + "resume above existing ids, got " + legacyBack.mapData.nextNpcId());
+        } finally {
+            Files.deleteIfExists(legacyMap);
+        }
+
+        // A future format_version is refused, not silently misparsed: the writer
+        // is forward-versioned, so a newer authoring tool must never be read as
+        // the current layout (VoxIO.FORMAT_VERSION, load()).
+        Path futureMap = Files.createTempFile("smoke_map_future", ".vox.json");
+        try {
+            String futureText = Files.readString(mapVox);
+            futureText = futureText.replaceFirst("\"format_version\": 1",
+                    "\"format_version\": " + (VoxIO.FORMAT_VERSION + 999));
+            Files.writeString(futureMap, futureText);
+            try {
+                VoxIO.load(futureMap);
+                throw new IllegalStateException("future format_version must be refused");
+            } catch (IOException expected) {
+                // correct: forward-layout documents are rejected
+            }
+        } finally {
+            Files.deleteIfExists(futureMap);
+        }
 
         // IDs must be reproducible: same authoring order, same IDs every run.
         VoxDocument map2 = new VoxDocument(VoxDocument.Mode.MAP, 8, 4, 8);

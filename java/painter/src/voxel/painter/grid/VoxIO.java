@@ -14,10 +14,14 @@ import java.util.regex.Pattern;
 public final class VoxIO {
     private VoxIO() {}
 
+    /** Current document format. Files without the key default to 1. */
+    public static final int FORMAT_VERSION = 1;
+
     public static void save(VoxDocument doc, Path path) throws IOException {
         doc.grid.assertCubicUnitInvariant();
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
+        sb.append("  \"format_version\": 1,\n");
         sb.append("  \"unit\": ").append(doc.unit).append(",\n");
         sb.append("  \"voxel_size\": ").append(doc.voxelSize).append(",\n");
         sb.append("  \"mode\": \"").append(doc.modeName()).append("\",\n");
@@ -47,6 +51,10 @@ if (doc.mode == VoxDocument.Mode.CHARACTER) {
                     .append(doc.packSY).append(", ").append(doc.packSZ).append("],\n");
         }
         if (doc.mode == VoxDocument.Mode.MAP) {
+            int[] counters = doc.mapData.counters();
+            sb.append("  \"id_counters\": {\"evt\": ").append(counters[0])
+                    .append(", \"npc\": ").append(counters[1])
+                    .append(", \"route\": ").append(counters[2]).append("},\n");
             saveMapEntities(sb, doc.mapData);
         }
         sb.append("  \"voxels\": [\n");
@@ -78,6 +86,11 @@ if (doc.mode == VoxDocument.Mode.CHARACTER) {
 
     public static VoxDocument load(Path path) throws IOException {
         String text = Files.readString(path, StandardCharsets.UTF_8);
+        int formatVersion = findInt(text, "format_version", 1);
+        if (formatVersion > FORMAT_VERSION) {
+            throw new IOException("unsupported voxfmt format_version " + formatVersion
+                    + " (this writer understands up to " + FORMAT_VERSION + ")");
+        }
         String mode = findString(text, "mode", "model");
         int[] dims = findIntArray(text, "dims", new int[]{16, 16, 16});
         VoxDocument doc = new VoxDocument(VoxDocument.parseMode(mode), dims[0], dims[1], dims[2]);
@@ -98,6 +111,10 @@ doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
         doc.packSX = pack[0]; doc.packSY = pack[1]; doc.packSZ = pack[2];
         if (doc.mode == VoxDocument.Mode.MAP) {
             loadMapEntities(text, doc.mapData);
+            int evt = findInt(text, "evt", 1);
+            int npc = findInt(text, "npc", 1);
+            int route = findInt(text, "route", 1);
+            doc.mapData.restoreCounters(evt, npc, route);
         }
 
         Matcher vm = Pattern.compile(

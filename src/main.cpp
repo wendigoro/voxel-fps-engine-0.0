@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,7 @@
 #include "inventory.hpp"
 #include "fisheye.hpp"
 #include "materials.hpp"
+#include "map_vox.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
 
@@ -262,6 +264,10 @@ static int g_bodyHits = 0;
 static int g_deaths = 0;
 static int g_respawns = 0;
 static bool g_deathHandled = false;
+// Damage attempts refused because the player was inside the dash invulnerability
+// window. A non-zero value here is proof the window is actually consulted, which
+// the movement smoke's own assertion cannot establish on its own.
+static int g_dashInvulnBlocks = 0;
 
 // The two halves of the world, deliberately separate objects:
 //
@@ -322,10 +328,22 @@ static float equippedArmorPoints(ArmorZone zone) {
     return d ? d->armorPoints : 0.0f;
 }
 
+// Is the player inside the dash invulnerability window?
+//
+// movement::update owns the flag (movement.hpp sets dashInvuln on the dash edge
+// and clears it when DASH_INVULN_TIME expires); this is the single read point.
+// Every damage path funnels through here so a dash actually protects the player
+// rather than merely reporting that it could. Drowning is excluded on purpose:
+// health::updateBreath is not an impact and mutates health directly, and it
+// runs before movement::update in the tick, so it cannot be gated by a flag the
+// same tick has not set yet.
+static bool dashInvulnerable() { return g_move.dashInvuln; }
+
 // Convert an impact's voxel-destruction energy into HP loss on the player's body
 // and apply it at `zone`. Returns the HP actually removed.
 static float damagePlayerAtZone(float energy, const std::string& effect, ArmorZone zone) {
     if (g_health.dead) return 0.0f;
+    if (dashInvulnerable()) { ++g_dashInvulnBlocks; return 0.0f; }
     const float bio = health::biologicalDamage(energy, effect);
     if (bio <= 0.0f) return 0.0f;
     const health::DamageResult r =
@@ -508,6 +526,56 @@ static double g_frameMsMin = 1e9;
 static double g_frameMsMax = 0.0;
 static int g_frameMsCount = 0;
 static int g_framePaceHits = 0;
+
+// Per-subsystem latency breakdown (telemetry only).
+//
+// This is the Phase 1 audit instrument: which subsystem owns the frame cost is
+// the input to the Phase 2 split. Scope timers track every section once per
+// invocation and aggregate here; the report prints each as us avg/max/count.
+// QPC wall-clock is explicitly reserved for telemetry (AGENTS.md), and none of
+// these values can ever influence simulation state, so determinism is intact.
+enum SectionId {
+    SEC_HEALTH,        // health tick + respawn
+    SEC_MOVEMENT,      // player body / movement::update
+    SEC_FIRE,          // fireProjectile() (spawn, collision cast)
+    SEC_PROJECTILES,   // ballistic integration + impacts
+    SEC_DEBRIS_SIM,    // debris particle physics (sim side)
+    SEC_WAIT,          // vkWaitForFences (GPU backpressure)
+    SEC_MESH,          // flushDirtyMesh(): chunk remesh + upload
+    SEC_UBO,           // per-frame UBO write
+    SEC_SKY,           // moon/sky tile rebuild
+    SEC_DEBRIS_MESH,   // debris + muzzle VBO write (view side)
+    SEC_PICKUP,        // pickup hover mesh
+    SEC_INVENTORY,     // inventory overlay mesh + input drain
+    SEC_RECORD,        // recordCommandBuffer (build + submit)
+    SEC_COUNT
+};
+static const char* kSectionName[SEC_COUNT] = {
+    "health", "movement", "fire", "projectiles", "debris_sim",
+    "wait", "mesh", "ubo", "sky", "debris_mesh", "pickup", "inventory", "record"};
+static double g_secUsSum[SEC_COUNT] = {};
+static double g_secUsMax[SEC_COUNT] = {};
+static int g_secCount[SEC_COUNT] = {};
+static LARGE_INTEGER g_secStart[SEC_COUNT];
+
+// RAII scope marker for one section. QPC is for telemetry measurement only and
+// never feeds a gameplay branch, so sampling here cannot disturb the fixed-tick
+// simulation. Uses its own frequency handle so it stands alone (paceFrame120,
+// flushDirtyMesh and updateDebrisMesh each keep their local one).
+struct ScopedSection {
+    SectionId id;
+    ScopedSection(SectionId s) : id(s) { QueryPerformanceCounter(&g_secStart[s]); }
+    ~ScopedSection() {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        static LARGE_INTEGER freq{};
+        if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+        const double us = double(now.QuadPart - g_secStart[id].QuadPart) * 1e6 / double(freq.QuadPart);
+        g_secUsSum[id] += us;
+        if (us > g_secUsMax[id]) g_secUsMax[id] = us;
+        ++g_secCount[id];
+    }
+};
 
 static std::string g_exeDir;
 
@@ -3656,6 +3724,11 @@ struct MovementSmokeReport {
     bool dashEnters = false;
     bool dashCooldownOk = false;
     bool dashInvulnOk = false;
+    // The invulnerability window is only real if it (a) withholds damage while
+    // open, (b) expires on its own, and (c) stops withholding once expired.
+    // dashInvulnOk alone proves none of that -- it only reads one tick's flag.
+    bool dashBlocksDamageOk = false;
+    bool dashInvulnExpiresOk = false;
     bool wallrunDetects = false;
     bool wallrunTimesOut = false;
     bool bodyMovesNotCamera = false;
@@ -3850,6 +3923,59 @@ static MovementSmokeReport runMovementSmoke() {
         const float cool = d.dashCooldown;
         movement::update(kDt, go, w, d, 0.0f, kBase, kJump);
         rep.dashCooldownOk = cool > 0.0f && std::fabs(d.dashCooldown - cool) < movement::DASH_COOLDOWN;
+
+        // The window must withhold real damage, not merely report a flag. Drive
+        // the actual intake while the dash is open and assert HP does not move;
+        // then let the window lapse and assert the same hit now lands. Without
+        // the second half this would pass for a dash that is invulnerable
+        // forever, which is the bug this assertion exists to prevent.
+        //
+        // g_move/g_health are the production objects here on purpose: a local
+        // MoveState would only prove the flag reads back, never that the intake
+        // consults it. Both are restored so the rest of the smoke is unaffected.
+        movement::MoveState savedMove = g_move;
+        health::ActorHealth savedHealth = g_health;
+        const int savedBlocks = g_dashInvulnBlocks;
+        g_move = d;                      // adopt the already-dashing state
+        g_health = health::ActorHealth{}; // full HP, no armor
+        g_health.health = 100.0f; g_health.maxHealth = 100.0f;
+
+        SimInput idle;
+        idle.moveForward = 1.0f;
+        // The contract, stated per tick rather than as a hand-computed tick
+        // count: on every tick the window reports itself open, the same hit must
+        // land no HP. Counting "within DASH_INVULN_TIME/kDt" here would be
+        // fragile -- the adopted state has already spent ticks -- and would
+        // silently pass a window that expires early. Track the flag instead and
+        // require at least one protected tick.
+        int protectedTicks = 0;
+        bool blockedDuringWindow = true;
+        for (int t = 0; t < 240; ++t) {
+            const auto r = movement::update(kDt, idle, w, g_move, 0.0f, kBase, kJump);
+            const float hpBefore = g_health.health;
+            damagePlayerAtZone(500.0f, "kinetic", ArmorZone::Chest);
+            if (r.dashInvuln || g_move.dashInvuln) {
+                ++protectedTicks;
+                if (g_health.health < hpBefore) blockedDuringWindow = false;
+            }
+            if (!g_move.dashInvuln && protectedTicks > 0) break;
+        }
+        rep.dashBlocksDamageOk = blockedDuringWindow && protectedTicks > 0;
+
+        // Now outlast the window. The dash itself ends first, so keep ticking
+        // with no input; invulnerability must clear and the hit must then land.
+        bool cleared = false;
+        for (int t = 0; t < 240; ++t) {
+            movement::update(kDt, SimInput{}, w, g_move, 0.0f, kBase, kJump);
+            if (!g_move.dashInvuln) { cleared = true; break; }
+        }
+        const float hpBeforeHit = g_health.health;
+        damagePlayerAtZone(500.0f, "kinetic", ArmorZone::Chest);
+        rep.dashInvulnExpiresOk = cleared && g_health.health < hpBeforeHit;
+
+        g_move = savedMove;
+        g_health = savedHealth;
+        g_dashInvulnBlocks = savedBlocks;
     }
 
     // --- wallrun: a wall adjacent to the body while airborne ---
@@ -4099,6 +4225,171 @@ struct SimViewSmokeReport {
 };
 
 static SimViewSmokeReport g_simViewSmoke;
+
+// MAP-mode voxfmt loader smoke. --smoke skips the frame loop, so the loader is
+// exercised directly here: the painter-exported data/voxfmt fixture must parse
+// with every field intact (including escaped quotes), counters restore per the
+// id_counters contract, and the voxel grid stamps into a fresh all-Air world as
+// unit cubes. The refusal cases are crafted text, so they prove the reader
+// gates without depending on a second file on disk.
+struct MapVoxSmokeReport {
+    bool fileFound = false;
+    bool docOk = false;
+    bool formatOk = false;
+    bool modeOk = false;
+    bool unitOk = false;
+    bool voxelSizeOk = false;
+    bool dimsOk = false;
+    int events = 0, npcs = 0, routes = 0, voxels = 0, dropped = 0;
+    bool eventFieldOk = false;   // every scripted_event field, exact
+    bool npcFieldOk = false;     // every npc field, exact
+    bool routeFieldOk = false;   // every patrol_route/node field, exact
+    bool countersRestoredOk = false; // evt==2, npc==2, route==2 on the fixture
+    bool materialDropOk = false; // un-representable material is dropped, counted
+    bool stampOk = false;        // 1024 cells written, all concrete, no leftovers
+    bool refusalVersionOk = false; // format_version 2 + non-unit docs refuse
+    bool refusalUnitOk = false;
+    bool refusalVoxelSizeOk = false;
+    int stampWritten = 0;
+    int stampSkipped = 0;
+};
+
+static MapVoxSmokeReport g_mapSmoke;
+
+static MapVoxSmokeReport runMapVoxSmoke() {
+    MapVoxSmokeReport rep;
+
+    // The fixture lives in data/voxfmt in the repo and is copied to build/voxfmt
+    // by build.ps1, so probe the same g_exeDir ancestors the other loaders use.
+    const std::string mapCandidates[] = {
+        g_exeDir + "\\voxfmt\\smoke_map.vox.json",
+        g_exeDir + "\\..\\data\\voxfmt\\smoke_map.vox.json",
+        g_exeDir + "\\..\\..\\data\\voxfmt\\smoke_map.vox.json",
+    };
+    mapvox::Doc doc;
+    bool anyFound = false;
+    for (const auto& p : mapCandidates) {
+        mapvox::Doc cand;
+        mapvox::loadMapVox(p, cand);
+        if (cand.fileFound) {
+            anyFound = true;
+            doc = cand;        // last found candidate wins; parse status kept
+            break;
+        }
+    }
+    rep.fileFound = anyFound;
+
+    rep.formatOk = (doc.formatVersion == 1);
+    rep.modeOk = doc.modeMap;
+    rep.unitOk = doc.unitOk;
+    rep.voxelSizeOk = doc.voxelSizeOk;
+    rep.dimsOk = (doc.sx == 32 && doc.sy == 16 && doc.sz == 32);
+    rep.events = static_cast<int>(doc.events.size());
+    rep.npcs = static_cast<int>(doc.npcs.size());
+    rep.routes = static_cast<int>(doc.routes.size());
+    rep.voxels = static_cast<int>(doc.voxels.size());
+    rep.dropped = doc.dropped;
+    rep.docOk = doc.ok;
+
+    // Event fields: name/condition carry escaped quotes and a quote inside a
+    // string that must survive a round trip.
+    if (doc.events.size() == 1) {
+        const auto& e = doc.events[0];
+        rep.eventFieldOk =
+            e.x == 10 && e.y == 1 && e.z == 10 && e.id == "evt_1" &&
+            e.name == "Test \"Event\"" && e.script == "open_door.ps1" &&
+            e.trigger == "on_signal" && e.radius == 2.0f && e.cooldown == 20 &&
+            e.requiredSignal == "key_found" && e.emitSignal == "door_open" &&
+            e.condition == "count(\"kills\") > 0" && e.repeatSet &&
+            e.repeat == 3 && !e.enabled;
+    }
+
+    if (doc.npcs.size() == 1) {
+        const auto& n = doc.npcs[0];
+        rep.npcFieldOk =
+            n.x == 15 && n.y == 1 && n.z == 15 && n.id == "npc_1" &&
+            n.name == "Guard" && n.npcType == "guard" && n.aiProfile == "patrol" &&
+            n.patrolRoute == "route_1" && n.health == 120.0f &&
+            n.maxHealth == 150.0f && n.speed == 0.075f && n.viewDist == 24.5f &&
+            n.viewAngle == 110.0f && n.faction == "hostile" &&
+            n.dialogue == "guard_taunt" && n.inventory.empty() && n.isStatic &&
+            n.spawnTick == 120 && n.spawnCondition == "wave_2" && n.enabled;
+    }
+
+    if (doc.routes.size() == 1) {
+        const auto& r = doc.routes[0];
+        rep.routeFieldOk =
+            r.id == "route_1" && r.name == "Guard Patrol" && !r.loop &&
+            r.nodes.size() == 3 && r.nodes[0].x == 15 && r.nodes[0].y == 1 &&
+            r.nodes[0].z == 15 && r.nodes[0].wait == 2.0f &&
+            r.nodes[0].action == "idle" && r.nodes[1].x == 20 &&
+            r.nodes[1].y == 1 && r.nodes[1].z == 15 && r.nodes[1].wait == 1.0f &&
+            r.nodes[1].action == "look" && r.nodes[2].x == 20 &&
+            r.nodes[2].y == 1 && r.nodes[2].z == 20 && r.nodes[2].wait == 2.5f &&
+            r.nodes[2].action == "interact";
+    }
+
+    // id_counters: fixture persists {evt:2, npc:2, route:1} and ids end at _1,
+    // so restored is {evt:2, npc:2, route:max(1, 1+1)=2}.
+    rep.countersRestoredOk =
+        doc.restored.evt == 2 && doc.restored.npc == 2 && doc.restored.route == 2;
+
+    // Crafted refusals: readers must refuse what they don't understand and never
+    // load non-cubic grids.
+    {
+        mapvox::Doc d;
+        rep.refusalVersionOk = !mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+        rep.refusalUnitOk = !mapvox::parseMapVox(
+            "{\"format_version\":1,\"unit\":2,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+        rep.refusalVoxelSizeOk = !mapvox::parseMapVox(
+            "{\"format_version\":1,\"unit\":1,\"voxel_size\":0.004,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+    }
+
+    // Material drop: a voxel whose painter material has no sim::Block is
+    // removed and counted, never stamped as a wrong block. Craft a 2-cell doc:
+    // concrete (kept) + plexiglass (dropped).
+    {
+        mapvox::Doc d;
+        const bool parsed = mapvox::parseMapVox(
+            "{\"format_version\":1,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+            "\"dims\":[4,4,4],"
+            "\"voxels\":[{\"x\":0,\"y\":0,\"z\":0,\"mat\":\"concrete\",\"rgb\":6710891},"
+            "{\"x\":1,\"y\":0,\"z\":0,\"mat\":\"plexiglass\",\"rgb\":16777215}]}",
+            d);
+        rep.materialDropOk = parsed && d.ok && d.voxels.size() == 1 &&
+                             d.dropped == 1 &&
+                             d.voxels[0].block == sim::Block::Concrete;
+    }
+
+    // Stamp the whole fixture into a fresh all-Air world at origin (8,0,8). The
+    // fixture is a 32x32 concrete slab at y=0; the stamp must place 1024 unit
+    // cubes (no shrink, no offsets) and leave the rest Air.
+    if (rep.fileFound && doc.ok && rep.voxels == 1024) {
+        sim::World w;
+        w.alloc();
+        for (int cy = 0; cy < CHUNKS_Y; ++cy)
+            for (int cz = 0; cz < CHUNKS_Z; ++cz)
+                for (int cx = 0; cx < CHUNKS_X; ++cx) {
+                    SimChunk& c = w.chunks[sim::World::chunkIndex(cx, cy, cz)];
+                    c.cx = cx; c.cy = cy; c.cz = cz;
+                    c.voxels.assign(VOXELS_PER_CHUNK, Block::Air);
+                }
+        const mapvox::StampResult sr = mapvox::stampMapVox(doc, w, 8, 0, 8);
+        rep.stampWritten = sr.written;
+        rep.stampSkipped = sr.skipped;
+        int concrete = 0;
+        for (int z = 8; z < 40; ++z)
+            for (int x = 8; x < 40; ++x) {
+                if (w.get(x, 0, z) == Block::Concrete) ++concrete;
+            }
+        const bool allConcrete = (concrete == 1024);
+        const bool aboveClear = (w.get(8, 1, 8) == Block::Air && w.get(39, 20, 39) == Block::Air);
+        rep.stampOk = sr.written == 1024 && sr.skipped == 0 && allConcrete && aboveClear;
+    }
+
+    return rep;
+}
 
 static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
     SimViewSmokeReport rep;
@@ -4822,7 +5113,9 @@ static void spawnPlayerOnMap(const sim::World& world) {
     const int sx = WORLD_W / 2;
     const int sz = WORLD_D - DIRT_MARGIN - 18;
     int gy = 1 + SLAB_THICK; // default slab top
-    for (int y = WORLD_H - 2; y >= 0; --y) {
+    // Stand on the concrete slab (or whatever solids remain under it) — looking
+    // for the first solid from the sky would spawn the player on the roof deck.
+    for (int y = 1 + SLAB_THICK; y >= 0; --y) {
         Block b = getWorldBlock(world, sx, y, sz);
         if (isSolidBlock(b)) { gy = y + 1; break; }
     }
@@ -5084,10 +5377,15 @@ const float prevVel = vel;
         const float dmg = health::fallDamageForImpactSpeed(g_fallPeakSpeed);
         if (dmg > 0.0f) {
             // Routed through the same intake as impacts, so leg armor absorbs
-            // it like any other energy.
-            health::applyDamage(g_health, dmg, ArmorZone::Legs,
-                                equippedArmorPoints(ArmorZone::Legs));
-            ++g_fallDamageEvents;
+            // it like any other energy, and so the dash invulnerability window
+            // withholds a landing exactly as it withholds a bullet.
+            if (dashInvulnerable()) {
+                ++g_dashInvulnBlocks;
+            } else {
+                health::applyDamage(g_health, dmg, ArmorZone::Legs,
+                                    equippedArmorPoints(ArmorZone::Legs));
+                ++g_fallDamageEvents;
+            }
         }
         g_fallPeakSpeed = 0.0f;
     }
@@ -5245,10 +5543,16 @@ static void drawFrame(float timeSec) {
     // reads simulation output, never the other way round.
 
     // Wait for this frame slot's prior GPU work before touching shared mesh buffers.
-    vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
+    {
+        ScopedSection s(SEC_WAIT);
+        vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
+    }
 
     // Safe to rebuild world VB now (no device-wide idle).
-    flushDirtyMesh();
+    {
+        ScopedSection s(SEC_MESH);
+        flushDirtyMesh();
+    }
 
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX,
@@ -5260,19 +5564,37 @@ static void drawFrame(float timeSec) {
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) fail("acquire failed");
 
     vkResetFences(g_device, 1, &g_inFlight[g_frame]);
-    updateUBO(static_cast<uint32_t>(g_frame), timeSec);
-    updateMoonSkyTile();
-    updateDebrisMesh();
+    {
+        ScopedSection s(SEC_UBO);
+        updateUBO(static_cast<uint32_t>(g_frame), timeSec);
+    }
+    {
+        ScopedSection s(SEC_SKY);
+        updateMoonSkyTile();
+    }
+    {
+        ScopedSection s(SEC_DEBRIS_MESH);
+        updateDebrisMesh();
+    }
     // Pickup hover drives a brightness tint, so the mesh follows the crosshair.
     const int prevHover = g_pickupHover;
     g_pickupHover = g_inventoryOpen ? -1 : pickupUnderCrosshair();
     if (prevHover != g_pickupHover) g_pickupMeshDirty = true;
-    updatePickupMesh();
+    {
+        ScopedSection s(SEC_PICKUP);
+        updatePickupMesh();
+    }
     // Resolve g_invHover first (it needs this frame's camera basis), then act on
     // it, so a click always lands on the cell that was under the cursor.
-    updateInventoryMesh();
-    drainInventoryInput();
-    recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
+    {
+        ScopedSection s(SEC_INVENTORY);
+        updateInventoryMesh();
+        drainInventoryInput();
+    }
+    {
+        ScopedSection s(SEC_RECORD);
+        recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
+    }
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -5498,12 +5820,15 @@ static SimInput buildSimInput() {
 static void simulateOnce(float dt, const SimInput& in) {
     // Health tick (RULES.md rule 15), ahead of input so a dead player is
     // frozen out of every control on the same frame.
-    if (health::updateActorHealth(g_health, dt)) {
-        ++g_respawns;
-        if (g_world) spawnPlayerOnMap(*g_world);
-        g_fallPeakSpeed = 0.0f;
-        g_wasOnGround = true;
-        g_deathHandled = false;
+    {
+        ScopedSection s(SEC_HEALTH);
+        if (health::updateActorHealth(g_health, dt)) {
+            ++g_respawns;
+            if (g_world) spawnPlayerOnMap(*g_world);
+            g_fallPeakSpeed = 0.0f;
+            g_wasOnGround = true;
+            g_deathHandled = false;
+        }
     }
     if (g_health.dead) {
         if (!g_deathHandled) {
@@ -5566,10 +5891,14 @@ static void simulateOnce(float dt, const SimInput& in) {
 
     updateRecoilRecovery(dt);
     // Player body physics + water weight, and lock the eye to the body.
-    updatePlayerAndEye(dt, in);
+    {
+        ScopedSection s(SEC_MOVEMENT);
+        updatePlayerAndEye(dt, in);
+    }
 
     // Fire modes: semi/bolt = edge; auto = held (RMB/F) with cooldown cadence.
     {
+        ScopedSection s(SEC_FIRE);
         WeaponDef wFire = activeWeaponOrDefault();
         const std::string mode = wFire.fireMode.empty() ? "semi" : wFire.fireMode;
         bool shouldFire = false;
@@ -5584,10 +5913,16 @@ static void simulateOnce(float dt, const SimInput& in) {
     }
 
     g_debris.beginFrame();
-    updateProjectiles(dt);
-    if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
-        g_projLivePeak = static_cast<int>(g_projectiles.size());
-    g_debris.update(dt, kWorldGravity);
+    {
+        ScopedSection s(SEC_PROJECTILES);
+        updateProjectiles(dt);
+        if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
+            g_projLivePeak = static_cast<int>(g_projectiles.size());
+    }
+    {
+        ScopedSection s(SEC_DEBRIS_SIM);
+        g_debris.update(dt, kWorldGravity);
+    }
     // Decay fire VFX (overlay + muzzle cubes).
     if (g_muzzleFlash > 0.0f || g_fireOverlay > 0.0f) {
         g_muzzleFlash = std::max(0.0f, g_muzzleFlash - dt * 6.5f);
@@ -5767,10 +6102,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
+            const bool jsonxOk = jsonxSelfTest();
             g_simViewSmoke = runSimViewSmoke(world);
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
             g_moveSmoke = runMovementSmoke();
+            g_mapSmoke = runMapVoxSmoke();
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
 out << "ticks=" << g_tick << "\nframes=" << frames
@@ -5786,6 +6123,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nprojectiles_loaded=" << g_projDefs.size()
                 << "\nammo_loaded=" << g_ammoDefs.size()
                 << "\nweapons_loaded=" << g_weapons.size()
+                << "\njsonx_ok=" << (jsonxOk ? 1 : 0)
                 << "\nweapon_id=" << g_lastWeaponId
                 << "\ncaliber=" << g_lastCaliber
                 << "\nfire_mode=" << g_lastFireMode
@@ -5844,6 +6182,20 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nsteady_frames=" << (g_frameMsCount > 15 ? (g_frameMsCount - 15) : 0)
                 << "\ntarget_hz=" << TARGET_HZ
                 << "\nlock_ok=" << ((g_frameMsCount > 40) && ((g_frameMsSum / double(g_frameMsCount - 15)) <= 9.0) ? 1 : 0)
+                // Per-subsystem latency breakdown (Phase 1 audit). Each line is
+                // the avg/max microseconds a subsystem took per sample plus the
+                // sample count; section sums nest under avg_frame_ms because the
+                // frame is serial. Reading these is the input to the Phase 2 split.
+                << "\nsections=health,movement,fire,projectiles,debris_sim,wait,mesh,ubo,sky,debris_mesh,pickup,inventory,record";
+            out << std::fixed << std::setprecision(2);
+            for (int i = 0; i < SEC_COUNT; ++i) {
+                out << "\nsec_" << kSectionName[i] << "_us_avg="
+                    << (g_secCount[i] > 0 ? (g_secUsSum[i] / double(g_secCount[i])) : 0.0)
+                    << "\nsec_" << kSectionName[i] << "_us_max=" << g_secUsMax[i]
+                    << "\nsec_" << kSectionName[i] << "_count=" << g_secCount[i];
+            }
+            out << std::defaultfloat << std::setprecision(6);
+            out
                 << "\nsky_tiles=" << (SKY_SEG_U * SKY_SEG_V)
                 << "\nsky_verts=" << g_skyTileVertexCount
                 << "\nmoon_light=" << (g_isNight ? 1 : 0)
@@ -5909,6 +6261,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nhealth_hud_built=" << (g_invSmoke.hudBuilt ? 1 : 0)
                 << "\nhealth_body_hits=" << g_bodyHits
                 << "\nhealth_fall_events=" << g_fallDamageEvents
+                << "\nhealth_dash_invuln_blocks=" << g_dashInvulnBlocks
                 << "\nhealth_drown_ticks=" << g_drownDamageTicks
                 << "\nhealth_deaths=" << g_deaths
                 << "\nhealth_respawns=" << g_respawns
@@ -5922,6 +6275,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nmove_dash_enters=" << (g_moveSmoke.dashEnters ? 1 : 0)
                 << "\nmove_dash_cooldown_ok=" << (g_moveSmoke.dashCooldownOk ? 1 : 0)
                 << "\nmove_dash_invuln_ok=" << (g_moveSmoke.dashInvulnOk ? 1 : 0)
+                << "\nmove_dash_blocks_damage_ok=" << (g_moveSmoke.dashBlocksDamageOk ? 1 : 0)
+                << "\nmove_dash_invuln_expires_ok=" << (g_moveSmoke.dashInvulnExpiresOk ? 1 : 0)
                 << "\nmove_wallrun_detects=" << (g_moveSmoke.wallrunDetects ? 1 : 0)
                 << "\nmove_wallrun_times_out=" << (g_moveSmoke.wallrunTimesOut ? 1 : 0)
                 << "\nmove_body_moves=" << (g_moveSmoke.bodyMovesNotCamera ? 1 : 0)
@@ -5938,6 +6293,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                      g_moveSmoke.staminaRegenOk && g_moveSmoke.slideEnters &&
                      g_moveSmoke.slideExhausts && g_moveSmoke.dashEnters &&
                      g_moveSmoke.dashCooldownOk && g_moveSmoke.dashInvulnOk &&
+                     g_moveSmoke.dashBlocksDamageOk && g_moveSmoke.dashInvulnExpiresOk &&
                      g_moveSmoke.wallrunDetects && g_moveSmoke.wallrunTimesOut &&
                      g_moveSmoke.bodyMovesNotCamera && g_moveSmoke.offsetIsPresentationOnly &&
                      g_moveSmoke.waterNotSolid && g_moveSmoke.edgeNotLatchOk)
@@ -5970,6 +6326,44 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nskirt_isolation_ok=" << (g_simViewSmoke.skirtIsolationOk ? 1 : 0)
                 << "\nview_smoothing_ok=" << ((g_simViewSmoke.cornerAoOk && g_simViewSmoke.normalSmoothingOk) ? 1 : 0)
                 << "\nao_corners_ok=" << (g_simViewSmoke.cornerAoOk ? 1 : 0)
+                // MAP-mode loader (Phase 2b): fixture parse + field fidelity +
+                // counter restore + unit-cube stamp, all in one gate.
+                << "\nmap_file_found=" << (g_mapSmoke.fileFound ? 1 : 0)
+                << "\nmap_doc_ok=" << (g_mapSmoke.docOk ? 1 : 0)
+                << "\nmap_format_ok=" << (g_mapSmoke.formatOk ? 1 : 0)
+                << "\nmap_mode_ok=" << (g_mapSmoke.modeOk ? 1 : 0)
+                << "\nmap_unit_ok=" << (g_mapSmoke.unitOk ? 1 : 0)
+                << "\nmap_voxel_size_ok=" << (g_mapSmoke.voxelSizeOk ? 1 : 0)
+                << "\nmap_dims_ok=" << (g_mapSmoke.dimsOk ? 1 : 0)
+                << "\nmap_events=" << g_mapSmoke.events
+                << "\nmap_npcs=" << g_mapSmoke.npcs
+                << "\nmap_routes=" << g_mapSmoke.routes
+                << "\nmap_voxels=" << g_mapSmoke.voxels
+                << "\nmap_dropped=" << g_mapSmoke.dropped
+                << "\nmap_event_fields_ok=" << (g_mapSmoke.eventFieldOk ? 1 : 0)
+                << "\nmap_npc_fields_ok=" << (g_mapSmoke.npcFieldOk ? 1 : 0)
+                << "\nmap_route_fields_ok=" << (g_mapSmoke.routeFieldOk ? 1 : 0)
+                << "\nmap_counters_restored_ok=" << (g_mapSmoke.countersRestoredOk ? 1 : 0)
+                << "\nmap_material_drop_ok=" << (g_mapSmoke.materialDropOk ? 1 : 0)
+                << "\nmap_stamp_ok=" << (g_mapSmoke.stampOk ? 1 : 0)
+                << "\nmap_stamp_written=" << g_mapSmoke.stampWritten
+                << "\nmap_stamp_skipped=" << g_mapSmoke.stampSkipped
+                << "\nmap_refusal_version_ok=" << (g_mapSmoke.refusalVersionOk ? 1 : 0)
+                << "\nmap_refusal_unit_ok=" << (g_mapSmoke.refusalUnitOk ? 1 : 0)
+                << "\nmap_refusal_voxel_size_ok=" << (g_mapSmoke.refusalVoxelSizeOk ? 1 : 0)
+                << "\nmap_ok="
+                << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
+                     g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
+                     g_mapSmoke.voxelSizeOk && g_mapSmoke.dimsOk &&
+                     g_mapSmoke.events == 1 && g_mapSmoke.npcs == 1 && g_mapSmoke.routes == 1 &&
+                     g_mapSmoke.voxels == 1024 && g_mapSmoke.dropped == 0 &&
+                     g_mapSmoke.eventFieldOk && g_mapSmoke.npcFieldOk &&
+                     g_mapSmoke.routeFieldOk && g_mapSmoke.countersRestoredOk &&
+                     g_mapSmoke.materialDropOk && g_mapSmoke.stampOk &&
+                     g_mapSmoke.refusalVersionOk && g_mapSmoke.refusalUnitOk &&
+                     g_mapSmoke.refusalVoxelSizeOk)
+                        ? 1
+                        : 0)
                 << "\n";
             out.close();
 
@@ -5982,6 +6376,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                                        g_moveSmoke.staminaRegenOk && g_moveSmoke.slideEnters &&
                                        g_moveSmoke.slideExhausts && g_moveSmoke.dashEnters &&
                                        g_moveSmoke.dashCooldownOk && g_moveSmoke.dashInvulnOk &&
+                                       g_moveSmoke.dashBlocksDamageOk &&
+                                       g_moveSmoke.dashInvulnExpiresOk &&
                                        g_moveSmoke.wallrunDetects && g_moveSmoke.wallrunTimesOut &&
                                        g_moveSmoke.bodyMovesNotCamera &&
                                        g_moveSmoke.offsetIsPresentationOnly &&
@@ -5997,6 +6393,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                       << "move_dash_enters=" << (g_moveSmoke.dashEnters ? 1 : 0) << "\n"
                       << "move_dash_cooldown_ok=" << (g_moveSmoke.dashCooldownOk ? 1 : 0) << "\n"
                       << "move_dash_invuln_ok=" << (g_moveSmoke.dashInvulnOk ? 1 : 0) << "\n"
+                      << "move_dash_blocks_damage_ok=" << (g_moveSmoke.dashBlocksDamageOk ? 1 : 0) << "\n"
+                      << "move_dash_invuln_expires_ok=" << (g_moveSmoke.dashInvulnExpiresOk ? 1 : 0) << "\n"
                       << "move_wallrun_detects=" << (g_moveSmoke.wallrunDetects ? 1 : 0) << "\n"
                       << "move_wallrun_times_out=" << (g_moveSmoke.wallrunTimesOut ? 1 : 0) << "\n"
                       << "move_body_moves=" << (g_moveSmoke.bodyMovesNotCamera ? 1 : 0) << "\n"
@@ -6008,6 +6406,22 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                       << "move_ok=" << (moveAllOk ? 1 : 0) << "\n";
                 mvOut.close();
                 if (!moveAllOk) { cleanup(); return 2; }
+            }
+            if (!jsonxOk) { cleanup(); return 3; }
+            // MAP loader gate (Phase 2b): the painter-exported fixture must
+            // parse, restore counters, and stamp as unit cubes, and refusals
+            // must refuse. Exit 4 lets CI triage the map contract separately.
+            if (!g_mapSmoke.fileFound || !g_mapSmoke.docOk || !g_mapSmoke.formatOk ||
+                !g_mapSmoke.modeOk || !g_mapSmoke.unitOk || !g_mapSmoke.voxelSizeOk ||
+                !g_mapSmoke.dimsOk || g_mapSmoke.events != 1 || g_mapSmoke.npcs != 1 ||
+                g_mapSmoke.routes != 1 || g_mapSmoke.voxels != 1024 ||
+                g_mapSmoke.dropped != 0 || !g_mapSmoke.eventFieldOk ||
+                !g_mapSmoke.npcFieldOk || !g_mapSmoke.routeFieldOk ||
+                !g_mapSmoke.countersRestoredOk || !g_mapSmoke.materialDropOk ||
+                !g_mapSmoke.stampOk || !g_mapSmoke.refusalVersionOk ||
+                !g_mapSmoke.refusalUnitOk || !g_mapSmoke.refusalVoxelSizeOk) {
+                cleanup();
+                return 4;
             }
         }
     } catch (const std::exception& e) {

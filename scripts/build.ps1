@@ -69,6 +69,13 @@ if (-not (Test-Path (Join-Path $Build "voxel_engine.exe"))) { throw "voxel_engin
 
 # Ensure runtime JSON sits beside exe
 Copy-Item (Join-Path $Root "data\projectiles.json") (Join-Path $Build "projectiles.json") -Force
+# voxfmt MAP fixtures (authored in painter map mode, loaded by map_vox.hpp)
+$voxfmtSrc = Join-Path $Root "data\voxfmt"
+$voxfmtDst = Join-Path $Build "voxfmt"
+if (Test-Path $voxfmtSrc) {
+  New-Item -ItemType Directory -Force -Path $voxfmtDst | Out-Null
+  Copy-Item (Join-Path $voxfmtSrc "*") $voxfmtDst -Force -Recurse
+}
 $weaponsSrc = Join-Path $Root "data\weapons"
 $weaponsDst = Join-Path $Build "weapons"
 if (Test-Path $weaponsSrc) {
