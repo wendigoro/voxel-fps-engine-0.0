@@ -30,17 +30,19 @@ of this is in the current tree.
 ## `movement_prototype_extras.patch`
 
 The six commits from the abandoned movement worktree (`4b71449`..`c3b1922`), as
-`git format-patch` output. The first commit, stance/gait/slide/wallrun/dash, is **superseded**
-by `src/movement.hpp` (see PR #4 for why it was ported rather than merged). The other five
-were **not ported**, and nothing like them is in the current tree:
+`git format-patch` output. Do not apply them: they write `g_camPos` directly, collide against
+the view's `g_chunks`, and poll input inside the update, which are all things `RULES.md` now
+forbids. Where their behaviour was wanted it has been re-ported instead:
 
-- `e40bace`: single exe with a fullscreen startup menu (`g_appState`, menu vertex buffer).
-- `3d93ccf`: cursor lock and ESC pause (`g_cursorLocked`, `g_paused`, `togglePause`).
-  Today ESC quits.
-- `cc23298`: a smoothed camera that follows the animated head (`g_cameraSmoothedPos`).
-- `f5397e7`: a stamina-driven idle animation and a camera clipping fix.
-- `c3b1922`: removes a collision border around water (`isSolidForPhysics`).
-
-Do not apply these as they stand. They write `g_camPos` directly, collide against the view's
-`g_chunks`, and poll input inside the update, which are all things `RULES.md` now forbids. Port
-the behaviour through `SimInput`, the authoritative grid, and view-side offsets instead.
+- `4b71449` stance, gait, slide, wallrun, dash: **superseded** by `src/movement.hpp` (PR #4).
+- `3d93ccf` cursor lock and ESC pause: **re-ported** view-side. Esc pauses the host loop (no
+  ticks run), Shift+Esc quits, and a click locks the mouse, with raw input feeding
+  `SimInput`. The original never actually locked (`g_cursorLocked` started `true`).
+- `cc23298` smoothed head-follow camera: **re-ported as its intent**. The rendered eye
+  interpolates between ticks instead of an exponential follow, which added about 66 ms of lag. The
+  animated head it followed does not exist in the current tree.
+- `c3b1922` water collision border: **superseded**. `isSolidBlock` already excludes water,
+  and `move_water_not_solid` gates it.
+- `e40bace` fullscreen startup menu: **not ported**.
+- `f5397e7` stamina-driven idle animation: **not ported**. It animated a character model that
+  the current tree does not render.
