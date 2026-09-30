@@ -258,6 +258,14 @@ static bool g_wantJump = false;
 // See RULES.md, "Player body, and the camera-offset contract".
 static movement::MoveState g_move;
 static movement::CameraOffset g_camOffset;
+// The sim eye as it stood before the most recent tick; renderEye() interpolates
+// from here to g_camPos. Written only by the host loop, read only by the view.
+static Vec3 g_camPosPrevTick;
+// Smoke pause probe (see the main loop).
+static bool g_smokePauseDone = false;
+static bool g_smokePauseFrozenOk = false;
+static uint64_t g_smokePauseTick = 0;
+static int g_smokePausedFrames = 0;
 
 // Player health (RULES.md rule 15). Kept as a distinct ActorHealth rather than
 // fields on PlayerBody so a second actor is a new type, not a refactor.
@@ -2009,6 +2017,64 @@ static void updateMoonSkyTile() {
 
 
 // ---- Win32 ----
+// ---- window-side pause and mouse lock ----
+// Both are host/view state, never simulation state. Pausing stops the main
+// loop scheduling ticks: the simulation is not told anything, it is simply not
+// advanced. The lock only changes where look deltas come from (raw mouse input
+// instead of a drag); they still reach the simulation as SimInput::lookDx/Dy.
+static bool g_paused = false;
+static bool g_cursorLocked = false;
+
+static void updateWindowTitle() {
+    std::string t =
+        "Voxel FPS 0.0 — WASD walk | Space jump | Q/E lean | RMB/F fire | X ADS | 1-4 cal | "
+        "R ammo | V weapon | B mode | Tab pack";
+    if (g_paused) t += "  —  PAUSED: Esc or click to resume, Shift+Esc quits";
+    else if (g_cursorLocked) t += "  —  Esc pause";
+    else t += "  —  click to look, Esc pause";
+    SetWindowTextA(g_hwnd, t.c_str());
+}
+
+// Confine the cursor to the client area. Re-run whenever the window moves or
+// resizes while locked, since the clip rect is in screen coordinates.
+static void clipCursorToClient() {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
+    ClientToScreen(g_hwnd, &tl);
+    ClientToScreen(g_hwnd, &br);
+    const RECT screen{tl.x, tl.y, br.x, br.y};
+    ClipCursor(&screen);
+}
+
+static void setCursorLock(bool lock) {
+    // Smoke and stress run on someone's desktop; they must never take the mouse.
+    if (g_smoke) lock = false;
+    if (lock == g_cursorLocked) return;
+    g_cursorLocked = lock;
+    if (lock) {
+        clipCursorToClient();
+        ShowCursor(FALSE); // ShowCursor is a counter: called once per state change
+    } else {
+        ClipCursor(nullptr);
+        ShowCursor(TRUE);
+    }
+    updateWindowTitle();
+}
+
+static void setPaused(bool paused) {
+    if (paused == g_paused) return;
+    g_paused = paused;
+    // Nothing pressed while paused may reach the first tick after resume: a
+    // fire tap during the pause must not shoot the moment play continues.
+    simInputClearEdges(g_pendingInput);
+    g_pendingInput.fireHeld = false;
+    g_mouseDown = false;
+    ReleaseCapture();
+    if (paused) setCursorLock(false);
+    updateWindowTitle();
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CLOSE:
@@ -2024,13 +2090,49 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_height = std::max(1, static_cast<int>(HIWORD(lParam)));
             g_resized = true;
         }
+        if (g_cursorLocked) clipCursorToClient();
         return 0;
+    case WM_MOVE:
+        if (g_cursorLocked) clipCursorToClient();
+        return 0;
+    case WM_KILLFOCUS:
+        // Alt-Tab away: pause, free the mouse, and forget held keys (their
+        // key-up goes to whichever window has focus, so it would never arrive).
+        std::memset(g_keys, 0, sizeof(g_keys));
+        if (!g_smoke) setPaused(true);
+        return 0;
+    case WM_INPUT: {
+        // Raw mouse motion drives look while locked: unaccelerated counts, and
+        // no dependence on where the cursor is, so it never hits a screen edge.
+        // Every path returns through DefWindowProc, which must see WM_INPUT to
+        // release the raw input buffer.
+        if (g_cursorLocked && !g_paused && !g_inventoryOpen) {
+            RAWINPUT raw{};
+            UINT size = sizeof(raw);
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size,
+                                sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+                raw.header.dwType == RIM_TYPEMOUSE &&
+                (raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                g_pendingInput.lookDx += static_cast<float>(raw.data.mouse.lLastX);
+                g_pendingInput.lookDy += static_cast<float>(raw.data.mouse.lLastY);
+            }
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
     case WM_KEYDOWN:
         if (wParam < 256) g_keys[wParam] = true;
         if (wParam == VK_ESCAPE) {
-            g_running = false;
-            PostQuitMessage(0);
+            // Esc pauses; Shift+Esc quits. Smoke/stress keep Esc = quit so a run
+            // can be aborted (it then fails with smoke_complete=0, exit 7).
+            if (g_smoke || (GetKeyState(VK_SHIFT) & 0x8000)) {
+                g_running = false;
+                PostQuitMessage(0);
+            } else if ((lParam & (1 << 30)) == 0) { // ignore auto-repeat
+                setPaused(!g_paused);
+            }
+            return 0;
         }
+        if (g_paused) return 0; // nothing else is a request while paused
         // Everything below is a *request* to the simulation. The view does not
         // decide the active caliber, weapon, ammo, or fire mode itself; it says
         // what the player asked for and sim::tick() validates it against the
@@ -2051,8 +2153,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_mouseDown = false;
                 stowHeld(g_inventory, g_itemDefs);
                 g_inventoryHandRot = 0;
+                setCursorLock(false);
             } else {
-                SetCapture(hwnd);
+                setCursorLock(true);
             }
         }
         // R: rotate the held item while the lattice is up; otherwise cycle ammo.
@@ -2078,6 +2181,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == 'F') g_pendingInput.fireHeld = false;
         return 0;
     case WM_LBUTTONDOWN:
+        // A click while paused only resumes; a click while unlocked only locks.
+        // Neither is also read as a look drag or an inventory pick.
+        if (g_paused) {
+            setPaused(false);
+            if (!g_inventoryOpen) setCursorLock(true);
+            return 0;
+        }
+        if (!g_cursorLocked && !g_inventoryOpen && !g_smoke) {
+            setCursorLock(true);
+            return 0;
+        }
         g_mouseDown = true;
         g_lastMouseX = static_cast<short>(LOWORD(lParam));
         g_lastMouseY = static_cast<short>(HIWORD(lParam));
@@ -2095,6 +2209,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
+        if (g_paused) return 0;
         if (g_inventoryOpen) {
             g_inventoryStow = true;
             return 0;
@@ -2110,7 +2225,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_mouseY = static_cast<short>(HIWORD(lParam));
         // While the inventory lattice is up, the cursor selects cells instead of
         // turning the camera, so the click is read as a pick/place, never a look.
-        if (g_mouseDown && !g_inventoryOpen) {
+        // Drag-look is the fallback when the mouse is not locked (raw input
+        // drives look while it is).
+        if (g_mouseDown && !g_inventoryOpen && !g_cursorLocked && !g_paused) {
             // Accumulate the raw pixel delta; sim::tick() applies it. Applying
             // yaw here instead would make aim depend on how often Windows
             // delivers WM_MOUSEMOVE, which is not reproducible across machines.
@@ -2148,11 +2265,19 @@ static void createWindow() {
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExA(
         0, wc.lpszClassName,
-"Voxel FPS 0.0 — WASD walk | Space jump | Q/E lean | LMB look | RMB/F fire | X ADS | 1-4 cal | R ammo | V weapon | B mode | Esc",
+"Voxel FPS 0.0",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
     if (!g_hwnd) fail("CreateWindowEx failed");
+    updateWindowTitle();
+    // Raw mouse input for locked look (HID generic desktop page, mouse usage).
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02;
+    rid.dwFlags = 0;
+    rid.hwndTarget = g_hwnd;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
 }
 
 // ---- Vulkan setup ----
@@ -4964,9 +5089,31 @@ static void updatePlayerAndEye(float dt, const SimInput& in) {
     }
 }
 
+// The eye as rendered, between the previous tick's eye and this tick's by how
+// far wall time has run into the next tick. The simulation runs at a fixed 120
+// Hz and the display at whatever it manages, so drawing the latest tick's eye
+// as-is judders whenever the two disagree. Interpolating costs under one tick
+// of positional lag; orientation is not interpolated, so aim stays immediate.
+//
+// View-only: g_camPos (the sim's eye, which is also the fire origin) is never
+// written here, so this cannot change what a shot hits.
+static constexpr float kEyeSnapDist = 0.02f; // world units per tick; beyond it is a teleport
+
+static Vec3 lerpEye(const Vec3& a, const Vec3& b, float t) {
+    const Vec3 d = b - a;
+    if (d.dot(d) > kEyeSnapDist * kEyeSnapDist) return b; // respawn/teleport: snap, never sweep
+    return a + d * t;
+}
+
+static Vec3 renderEye() {
+    if (g_paused) return g_camPos;
+    const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+    return lerpEye(g_camPosPrevTick, g_camPos, alpha);
+}
+
 static void updateUBO(uint32_t frameIndex, float timeSec) {
-    Vec3 eye = g_camPos;
-    Vec3 center = g_camPos + cameraForward();
+    const Vec3 eye = renderEye();
+    Vec3 center = eye + cameraForward();
     float aspect = g_extent.height > 0
                        ? static_cast<float>(g_extent.width) / static_cast<float>(g_extent.height)
                        : 1.0f;
@@ -5685,10 +5832,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             if (wall > 0.25) wall = 0.25; // cap catch-up after a long stall
             g_tickAccum += wall;
 
+            // Smoke pause probe: pause for a stretch mid-run. No tick may run
+            // while paused, and the end state must still match an unpaused run
+            // (sim_fingerprint), which is what proves pause is view-only.
+            if (g_smoke && !g_stress) {
+                if (!g_smokePauseDone && !g_paused && g_tick >= 150) {
+                    setPaused(true);
+                    g_smokePauseTick = g_tick;
+                }
+                if (g_paused && ++g_smokePausedFrames >= 30) {
+                    g_smokePauseFrozenOk = (g_tick == g_smokePauseTick);
+                    setPaused(false);
+                    g_smokePauseDone = true;
+                }
+            }
+            // Paused: the host schedules no ticks and banks no time to catch up.
+            if (g_paused) g_tickAccum = 0.0;
+
             int steps = 0;
             while (g_tickAccum >= TICK_DT && steps < MAX_TICKS_PER_FRAME) {
                 g_tickAccum -= TICK_DT;
                 ++g_tick;
+                g_camPosPrevTick = g_camPos;
                 ++g_ticksSinceRemesh;
                 // One tick of intent, produced by whichever client is driving:
                 // the local window, the scripted smoke harness, or (later) a
@@ -5732,6 +5897,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const uint64_t simPrint = simFingerprint();
             const bool jsonxOk = jsonxSelfTest();
             const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
+            // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
+            bool eyeInterpOk = false;
+            {
+                const Vec3 a(0.10f, 0.02f, 0.30f), b(0.1004f, 0.0203f, 0.2997f);
+                const Vec3 m = lerpEye(a, b, 0.5f), snapped = lerpEye(a, Vec3(0.5f, 0.02f, 0.3f), 0.25f);
+                const Vec3 e0 = lerpEye(a, b, 0.0f), e1 = lerpEye(a, b, 1.0f);
+                eyeInterpOk = e0.x == a.x && e0.y == a.y && e0.z == a.z &&
+                              std::fabs(e1.x - b.x) < 1e-7f && std::fabs(e1.y - b.y) < 1e-7f &&
+                              std::fabs(e1.z - b.z) < 1e-7f &&
+                              std::fabs(m.x - 0.1002f) < 1e-6f && snapped.x == 0.5f;
+            }
             g_simViewSmoke = runSimViewSmoke(world);
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
@@ -5967,6 +6143,10 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nballistics_projectile_breaks_ok=" << (ballisticsRep.projectileBreaks ? 1 : 0)
                 << "\nballistics_shooter_not_swept_ok=" << (ballisticsRep.shooterNotSwept ? 1 : 0)
                 << "\nballistics_ok=" << (ballisticsRep.ok() ? 1 : 0)
+                << "\npause_probe_done=" << (g_smokePauseDone ? 1 : 0)
+                << "\npause_frames=" << g_smokePausedFrames
+                << "\npause_ticks_frozen_ok=" << (g_smokePauseFrozenOk ? 1 : 0)
+                << "\neye_interp_ok=" << (eyeInterpOk ? 1 : 0)
                 << "\nmesh_workers_equiv_ok=" << (g_simViewSmoke.meshWorkersEquivOk ? 1 : 0)
                 << "\nmesh_workers_test_helpers=" << g_simViewSmoke.meshWorkersHelpers
                 << "\nmesh_workers_test_chunks=" << g_simViewSmoke.meshWorkersChunks
@@ -6061,6 +6241,9 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             if (!g_simViewSmoke.meshWorkersEquivOk) { cleanup(); return 5; }
             // The ballistics module's own contract, independent of the map.
             if (!ballisticsRep.ok()) { cleanup(); return 6; }
+            // View-side pause and camera: pause froze the ticks, interpolation holds.
+            const bool pauseOk = g_stress || (g_smokePauseDone && g_smokePauseFrozenOk);
+            if (!pauseOk || !eyeInterpOk) { cleanup(); return 8; }
             // MAP loader gate (Phase 2b): the painter-exported fixture must
             // parse, restore counters, and stamp as unit cubes, and refusals
             // must refuse. Exit 4 lets CI triage the map contract separately.
