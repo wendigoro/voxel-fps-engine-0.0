@@ -24,7 +24,19 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float healthTint;
     vec4 bulbPos[4];
     vec4 bulbColor[4];
+    float fisheyeScale; // visuals menu: lens curve multiplier (1 = original)
+    float banding;      // visuals menu: colour-step multiplier (1 = original, 0 = off)
+    float uboPad0;
+    float uboPad1;
 } ubo;
+
+// World colour banding, scaled by the visuals menu. banding = 1 gives the
+// original steps exactly; 0 turns stepping off; higher is coarser.
+vec3 bandq(vec3 c, float levels) {
+    if (ubo.banding <= 0.0) return c;
+    float l = levels / ubo.banding;
+    return floor(c * l + 0.5) / l;
+}
 
 layout(location = 0) out vec4 outColor;
 
@@ -151,7 +163,7 @@ void main() {
         float face = pow(max(abs(n.x), max(abs(n.y), abs(n.z))), 8.0);
         lit += base * face * 0.14;
         float levels = 20.0;
-        lit = floor(lit * levels + 0.5) / levels;
+        lit = bandq(lit, levels);
         applyFireOverlay(lit);
         outColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
         return;
@@ -163,7 +175,7 @@ void main() {
         float pulse = 0.85 + 0.15 * sin(ubo.time * 90.0);
         glow *= pulse;
         float levels = 20.0;
-        glow = floor(glow * levels + 0.5) / levels;
+        glow = bandq(glow, levels);
         vec3 outRgb = glow;
         applyFireOverlay(outRgb);
         outColor = vec4(outRgb, 1.0);
@@ -185,7 +197,7 @@ void main() {
         float r = length(fragNdc);
         lit *= 1.0 - smoothstep(0.55, 1.45, r) * 0.25;
         float levels = 18.0;
-        lit = floor(lit * levels + 0.5) / levels;
+        lit = bandq(lit, levels);
         applyFireOverlay(lit);
         outColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
         return;
@@ -220,7 +232,7 @@ void main() {
         sky *= 1.0 - smoothstep(0.55, 1.55, r) * 0.55;
 
         float levels = 14.0;
-        sky = floor(sky * levels + 0.5) / levels;
+        sky = bandq(sky, levels);
         applyFireOverlay(sky);
         outColor = vec4(sky, 1.0);
         return;
@@ -251,7 +263,7 @@ void main() {
         glow *= 1.0 - smoothstep(0.7, 1.5, r) * 0.25;
 
         float levels = 16.0;
-        glow = floor(glow * levels + 0.5) / levels;
+        glow = bandq(glow, levels);
         applyFireOverlay(glow);
         outColor = vec4(glow, clamp(crescent + halo * 0.65, 0.0, 1.0));
         return;
@@ -343,7 +355,7 @@ void main() {
     float luma = dot(lit, vec3(0.299, 0.587, 0.114));
     lit = mix(vec3(luma), lit, 0.72);
     float levels = 18.0;
-    lit = floor(lit * levels + 0.5) / levels;
+    lit = bandq(lit, levels);
     lit = pow(clamp(lit, 0.0, 1.0), vec3(1.12));
 
     applyFireOverlay(lit);

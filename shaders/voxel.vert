@@ -22,6 +22,10 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float healthTint;
     vec4 bulbPos[4];
     vec4 bulbColor[4];
+    float fisheyeScale; // visuals menu: lens curve multiplier (1 = original)
+    float banding;      // visuals menu: colour-step multiplier (1 = original, 0 = off)
+    float uboPad0;
+    float uboPad1;
 } ubo;
 
 layout(location = 0) out vec3 fragNormal;
@@ -57,6 +61,7 @@ void main() {
     if (rc != RC_INVENTORY_LATTICE) {
     float r = length(ndc);
     float strength = (rc == RC_MOON || rc == RC_SKY) ? 1.35 : 1.0;
+    strength *= ubo.fisheyeScale;
     float k1 = 0.55 * strength;
     float k2 = 0.22 * strength;
     float k3 = 0.08 * strength;
