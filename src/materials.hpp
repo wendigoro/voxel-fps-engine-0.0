@@ -25,6 +25,12 @@ enum class MaterialId : uint8_t {
     Plexiglass,   // optics — indestructible
     CarbonFiber,  // gun furnishings
     TreatedWood,  // gun furnishings
+    // Ground materials for generated terrain (src/terrain.hpp) and painted
+    // ground. Loose, light and soft compared with the built materials.
+    Sand,
+    Grass,
+    Snow,
+    Asphalt,
     Count
 };
 
@@ -56,6 +62,10 @@ inline const MaterialProps& materialProps(MaterialId id) {
         {"plexiglass",     1.20f,  0.40f,  0.00f,   9999.0f,    0.95f},
         {"carbon_fiber",   1.75f,  0.45f,  0.25f,     2.80f,    0.22f},
         {"treated_wood",   0.75f,  0.95f,  0.35f,     1.50f,    0.42f},
+        {"sand",           1.60f,  1.60f,  0.80f,     0.40f,    0.45f},
+        {"grass",          0.50f,  0.70f,  0.95f,     0.10f,    0.20f},
+        {"snow",           0.30f,  0.40f,  0.99f,     0.06f,    0.30f},
+        {"asphalt",        2.30f,  1.30f,  0.12f,     2.20f,    0.50f},
     };
     const auto idx = static_cast<uint8_t>(id);
     if (idx >= static_cast<uint8_t>(MaterialId::Count)) return kTable[0];
@@ -86,5 +96,9 @@ inline MaterialId materialFromName(const std::string& name) {
     if (name == "plexiglass") return MaterialId::Plexiglass;
     if (name == "carbon_fiber") return MaterialId::CarbonFiber;
     if (name == "treated_wood") return MaterialId::TreatedWood;
+    if (name == "sand") return MaterialId::Sand;
+    if (name == "grass") return MaterialId::Grass;
+    if (name == "snow") return MaterialId::Snow;
+    if (name == "asphalt") return MaterialId::Asphalt;
     return MaterialId::Air;
 }

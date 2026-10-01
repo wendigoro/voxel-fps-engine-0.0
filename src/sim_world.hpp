@@ -42,7 +42,11 @@ enum class Block : uint8_t {
     Water,        // still unit cubes; may occupy multi-cell clumps
     WaterCurrent, // moving water source (same visual, current sampling)
     Moon,         // cool emissive crescent grid
-    LightBulb     // warm emissive indoor bulbs
+    LightBulb,    // warm emissive indoor bulbs
+    Sand,         // ground: generated terrain and painted ground (src/terrain.hpp)
+    Grass,
+    Snow,
+    Asphalt
 };
 
 // Agreement with the wire is asserted, never assumed. A view reads
@@ -59,6 +63,10 @@ static_assert(static_cast<uint8_t>(Block::Water) == static_cast<uint8_t>(wire::B
 static_assert(static_cast<uint8_t>(Block::WaterCurrent) == static_cast<uint8_t>(wire::BlockId::WaterCurrent));
 static_assert(static_cast<uint8_t>(Block::Moon) == static_cast<uint8_t>(wire::BlockId::Moon));
 static_assert(static_cast<uint8_t>(Block::LightBulb) == static_cast<uint8_t>(wire::BlockId::LightBulb));
+static_assert(static_cast<uint8_t>(Block::Sand) == static_cast<uint8_t>(wire::BlockId::Sand));
+static_assert(static_cast<uint8_t>(Block::Grass) == static_cast<uint8_t>(wire::BlockId::Grass));
+static_assert(static_cast<uint8_t>(Block::Snow) == static_cast<uint8_t>(wire::BlockId::Snow));
+static_assert(static_cast<uint8_t>(Block::Asphalt) == static_cast<uint8_t>(wire::BlockId::Asphalt));
 
 // Unit cube. Every solid is 1x1x1 voxels on the impact grid; no stretched
 // planes. Scale comes from materials.hpp (kVoxelSize) — the single source of
@@ -204,6 +212,43 @@ struct World {
     Block& ref(int x, int y, int z) {
         return chunks[chunkIndex(x / kChunkSize, y / kChunkSize, z / kChunkSize)]
             .voxels[localIndex(x % kChunkSize, y % kChunkSize, z % kChunkSize)];
+    }
+
+    // Bulk column fill: the load-time generator's path (src/terrain.hpp).
+    //
+    // It writes exactly the same unit cubes `set` would, and the difference is
+    // only in bookkeeping: every chunk that can see a changed face is bumped
+    // ONCE for the whole range instead of once per cell. A 192x160 height field
+    // is ~900k cells, and bumping seven versions per cell would leave the
+    // snapshot layer with nothing but version churn to sift. Correctness is
+    // unchanged: the mesher only ever asks "is my version current".
+    void fillColumn(int x, int z, int y0, int y1, Block b) {
+        if (x < 0 || z < 0 || x >= kWorldW || z >= kWorldD) return;
+        const int lo = std::max(0, std::min(y0, y1));
+        const int hi = std::min(kWorldH - 1, std::max(y0, y1));
+        if (hi < lo) return;
+        // The 1-cell skirt of the written range, so a neighbour whose exposed
+        // faces change is dirtied too.
+        const int bx0 = std::max(0, x - 1), bx1 = std::min(kWorldW - 1, x + 1);
+        const int by0 = std::max(0, lo - 1), by1 = std::min(kWorldH - 1, hi + 1);
+        const int bz0 = std::max(0, z - 1), bz1 = std::min(kWorldD - 1, z + 1);
+        // clang++ with -O2 rejects .size() on a plain array in this expression
+        // context; use the named count explicitly.
+        const size_t tchCount = static_cast<size_t>(kChunksX) * kChunksY * kChunksZ;
+        bool touched[static_cast<size_t>(kChunksX) * kChunksY * kChunksZ] = {};
+        for (int cy = by0 / kChunkSize; cy <= by1 / kChunkSize; ++cy)
+            for (int cz = bz0 / kChunkSize; cz <= bz1 / kChunkSize; ++cz)
+                for (int cx = bx0 / kChunkSize; cx <= bx1 / kChunkSize; ++cx)
+                    touched[static_cast<size_t>(chunkIndex(cx, cy, cz))] = true;
+        for (int y = lo; y <= hi; ++y) {
+            Chunk& owner = chunks[chunkIndex(x / kChunkSize, y / kChunkSize, z / kChunkSize)];
+            const int li = localIndex(x % kChunkSize, y % kChunkSize, z % kChunkSize);
+            owner.voxels[li] = b;
+            // A cell's paint belongs to what was in it (see set()).
+            if (!owner.appear.empty()) owner.appear[li] = 0;
+        }
+        for (size_t i = 0; i < tchCount; ++i)
+            if (touched[i]) ++chunks[i].version;
     }
 };
 

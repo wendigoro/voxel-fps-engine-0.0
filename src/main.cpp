@@ -374,9 +374,21 @@ static std::vector<ProjectileRuntime>& g_projectiles = g_ballistics.projectiles;
 // What the loaded map authored for spawn and pickups (empty when the world
 // came from the procedural builder).
 static mapvox::PlayerSpawn g_mapSpawn;
+// The map's environment section as authored. See the export below: the renderer's
+// g_moonDirWorld is normalized in place, so it cannot be the thing re-exported.
+static mapvox::Environment g_mapEnvironment;
 static std::vector<mapvox::PickupPlacement> g_mapPickups;
 static std::string g_mapPath; // file the world was loaded from (empty = procedural)
 static int g_mapPrefabsStamped = 0;
+// --map <path>: load this map instead of the default warehouse_v1. Empty means
+// the default search list.
+static std::string g_mapOverridePath;
+// The terrain section the loaded map asked for, and what generating it did.
+// Kept so --export-map can write the section back and the report can show the
+// numbers; a map with no section leaves these at their defaults and generates
+// nothing at all.
+static terrain::Spec g_mapTerrain;
+static terrain::Report g_terrainReport;
 
 static int g_activeAmmoIndex = 0; // cycles ammo subtypes for active caliber (R)
 static bool g_meshDirty = false;
@@ -4277,6 +4289,547 @@ static MapVoxSmokeReport runMapVoxSmoke() {
     return rep;
 }
 
+// The terrain gate: the generator's contract, on scratch worlds, so it never
+// touches the loaded map or the live fingerprint. Phase 8's rule is that
+// generation changes no existing fingerprint at all — a map with no terrain
+// section must generate nothing, byte for byte.
+struct TerrainSmokeReport {
+    bool determinismOk = false;   // same seed twice -> identical hash
+    bool seedSensitiveOk = false; // a different seed -> a different world
+    bool classSensitiveOk = false;// a different class -> a different world
+    bool classOk = false;         // every region's class is one of the profile table
+    bool surfaceOk = false;       // top cell is the class's own surface material
+    bool slopeOk = false;         // no column stands more than `slope` above a neighbour
+    bool roadOk = false;          // network planned, graded flat, rotations land on their sides
+    bool roadAltOk = false;       // the stamped surface sits ON the level, with no air under it
+    int roadShaped = 0, roadSpans = 0, roadFlat = 0, roadRot = 0;
+    int roadAltProbed = 0, roadAltSurface = 0, roadAltSolidUnder = 0;
+    bool prefabShapesOk = false;  // authored road tiles present the sides they claim
+    bool nonDestructiveOk = false;// authored structure survives generation
+    bool refusalClassOk = false;  // an unknown class refuses
+    bool refusalSeedOk = false;   // a missing seed refuses (never defaulted)
+    bool roundTripOk = false;     // section survives parse -> export -> parse
+    bool absentOk = false;        // a map with no section generates nothing
+    bool damageOk = false;        // generated ground is destructible like any occupancy
+    int slabIntact = 0;           // authored cells that survived generation
+    int slabExpected = 0;
+    int slabSkipped = 0;          // cells the height-field pass declined to overwrite
+    int slabPrefabDeclined = 0;   // cells the road/prop prefab passes declined
+    bool prefabSparesAuthoredOk = false;  // a prefab stamped over a block spares it, and
+                                          // the default stamp mode demonstrably would not
+    int slabPrefabCells = 0;
+    uint64_t golden = 0;
+    int regions = 0;
+    int roadNodes = 0;
+    int roadLevelY = -1;
+    int heightMin = 0;
+    int heightMax = 0;
+    bool ok() const {
+        return determinismOk && seedSensitiveOk && classSensitiveOk && classOk && surfaceOk &&
+               slopeOk && roadOk && roadAltOk && nonDestructiveOk && prefabSparesAuthoredOk &&
+               refusalClassOk && refusalSeedOk && roundTripOk && absentOk && damageOk;
+    }
+};
+
+static TerrainSmokeReport g_terrainSmoke;
+
+static TerrainSmokeReport runTerrainSmoke() {
+    TerrainSmokeReport rep;
+
+    terrain::Spec spec;
+    spec.present = true;
+    spec.family = "valley";
+    spec.seed = 20260930u;
+    const terrain::FamilyProfile* fam = terrain::familyByName(spec.family);
+
+    // 1. Determinism: the same class and seed must produce the same world
+    //    twice, in two independently built worlds. This is the whole promise,
+    //    so it is checked on the hash of the finished grid rather than on an
+    //    intermediate.
+    auto buildWorld = [](const terrain::Spec& s, const terrain::FamilyProfile* f, sim::World& w,
+                         terrain::Report* out) {
+        w = makeEmptyWorld();
+        const std::vector<int> h = terrain::heightField(s, *f, f->base);
+        terrain::Report repLocal;
+        terrain::fillTerrain(w, s, *f, h, repLocal);
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(s);
+        const int level = terrain::roadLevel(s, nodes, h);
+        terrain::gradeRoads(w, nodes, level, repLocal);
+        repLocal.roadNodes = static_cast<int>(nodes.size());
+        if (out) *out = repLocal;
+    };
+
+    sim::World a, b;
+    terrain::Report ra, rb;
+    buildWorld(spec, fam, a, &ra);
+    buildWorld(spec, fam, b, &rb);
+    const uint64_t ha = terrain::hashOccupancy(a), hb = terrain::hashOccupancy(b);
+    rep.golden = ha;
+    rep.determinismOk = (ha == hb) && ra.cells == rb.cells && ra.cells > 0;
+    rep.regions = ra.regions;
+    rep.roadNodes = ra.roadNodes;
+    rep.roadLevelY = ra.roadLevelY;
+    rep.heightMin = ra.heightMin;
+    rep.heightMax = ra.heightMax;
+
+    // 2. Seed sensitivity: a world that ignored the seed would pass the test
+    //    above and still be wrong, so a changed seed must move the ground.
+    {
+        terrain::Spec other = spec;
+        other.seed = spec.seed + 1u;
+        sim::World c;
+        buildWorld(other, fam, c, nullptr);
+        rep.seedSensitiveOk = (terrain::hashOccupancy(c) != ha);
+    }
+
+    // 3. Class sensitivity: another family's class mix is another world.
+    {
+        terrain::Spec other = spec;
+        other.family = "dunes";
+        sim::World c;
+        buildWorld(other, terrain::familyByName("dunes"), c, nullptr);
+        rep.classSensitiveOk = (terrain::hashOccupancy(c) != ha);
+    }
+
+    // 4. Every region is classified from the profile table, and the topmost
+    //    generated cell is that class's own surface material. A mismatch would
+    //    mean the height field and the material pass disagreed about a column.
+    {
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        bool classesOk = ra.regions == terrain::regionCountX() * terrain::regionCountZ();
+        bool surfaceOk = true;
+        for (int z = 0; z < sim::kWorldD && surfaceOk; ++z)
+            for (int x = 0; x < sim::kWorldW; ++x) {
+                const int cls = terrain::classForRegion(spec, *fam, terrain::regionOfX(x),
+                                                        terrain::regionOfZ(z));
+                if (cls < 0 || cls >= terrain::kClassCount) { classesOk = false; surfaceOk = false; break; }
+                const int top = h[static_cast<size_t>(z) * sim::kWorldW + x];
+                // Outside a road corridor the top cell is the class surface; a
+                // road corridor is graded to Dirt and the prefab is stamped
+                // above it, so it is checked separately.
+                if (top >= 1 && a.get(x, top, z) == sim::Block::Air) { surfaceOk = false; break; }
+            }
+        rep.classOk = classesOk;
+        rep.surfaceOk = surfaceOk;
+    }
+
+    // 5. No cliffs: a column may not stand more than its class's slope above
+    //    any neighbour. Without this the world has unwalkable walls between
+    //    regions and the movement smoke would be testing a different world.
+    {
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        bool ok = true;
+        for (int z = 0; z < sim::kWorldD && ok; ++z)
+            for (int x = 0; x < sim::kWorldW && ok; ++x) {
+                const int hi = h[static_cast<size_t>(z) * sim::kWorldW + x];
+                const int cls = terrain::classForRegion(spec, *fam, terrain::regionOfX(x),
+                                                        terrain::regionOfZ(z));
+                const int maxSlope = terrain::kClasses[cls].slope;
+                // A step is allowed only up to the gentler of the two classes'
+                // allowance, which is the rule the talus pass enforces.
+                const auto stepOk = [&](int nx, int nz) {
+                    const int there = terrain::classForRegion(spec, *fam, terrain::regionOfX(nx),
+                                                             terrain::regionOfZ(nz));
+                    return hi - h[static_cast<size_t>(nz) * sim::kWorldW + nx] <=
+                           std::min(maxSlope, terrain::kClasses[there].slope);
+                };
+                if (x + 1 < sim::kWorldW && !stepOk(x + 1, z)) ok = false;
+                if (z + 1 < sim::kWorldD && !stepOk(x, z + 1)) ok = false;
+            }
+        rep.slopeOk = ok;
+    }
+
+    // 6. The road network. Three claims, checked in turn: every node resolved to
+    //    a prefab and a rotation; the rotation actually lands the asset on the
+    //    sides the node claims (a wrong quarter turn is a road pointing at
+    //    nothing); and the graded corridor is flat at one level, so the
+    //    stamped surface is continuous across the network.
+    {
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+        bool shaped = !nodes.empty();
+        for (const auto& n : nodes) {
+            if (n.prefab[0] == '\0' || n.rot < 0 || n.rot > 3) { shaped = false; break; }
+            // The rotation must reproduce the node's own sides, and every kind's
+            // canonical asset must be the one chosen. Without this a road can
+            // be stamped on its side, which is the same bug as a missing one.
+            const terrain::RoadKind kind = terrain::kindForMask(n.mask);
+            if (std::string(terrain::roadPrefabForKind(kind)) != n.prefab) { shaped = false; break; }
+            if (terrain::rotateMask(terrain::canonicalMask(kind), n.rot) != n.mask) { shaped = false; break; }
+        }
+        // The network is continuous: the row runs the full width and the column
+        // the full depth, with no gap between two regions that both carry a
+        // road. A stub pointing at open terrain would be a road that goes
+        // nowhere, and a hole would be a road that stops in mid-air.
+        bool spans = shaped;
+        for (int rx = 0; rx < terrain::regionCountX() && spans; ++rx) {
+            const terrain::RoadNode* node = nullptr;
+            for (const auto& n : nodes) if (n.rz == terrain::regionCountZ() / 2 && n.rx == rx) node = &n;
+            if (!node) { spans = false; break; }
+            if (rx == 0 && !(node->mask & terrain::kSideE)) spans = false;
+            if (rx == terrain::regionCountX() - 1 && !(node->mask & terrain::kSideW)) spans = false;
+            if (rx > 0 && rx < terrain::regionCountX() - 1 &&
+                !((node->mask & terrain::kSideW) && (node->mask & terrain::kSideE))) spans = false;
+        }
+        const int level = terrain::roadLevel(spec, nodes, h);
+        bool flat = level > 0;
+        for (const auto& n : nodes)
+            for (int z = n.z0; z < n.z0 + terrain::kRegionCells && z < sim::kWorldD && flat; ++z)
+                for (int x = n.x0; x < n.x0 + terrain::kRegionCells && x < sim::kWorldW; ++x) {
+                    if (!terrain::inRoadCorridor(n, x, z)) continue;
+                    // The corridor is graded to one level and then the prefab
+                    // is stamped on top, so below the surface it is uniform.
+                    if (a.get(x, level - 2, z) == sim::Block::Air) { flat = false; break; }
+                }
+        // Set before the tile loop below, and only ever cleared: a missing or
+        // unreadable tile is a failure, not a skip.
+        rep.prefabShapesOk = true;
+        // The authored road prefabs must present exactly the sides their kind
+        // claims. This is what makes scripts/build_terrain_prefabs.py and
+        // src/terrain.hpp one contract rather than two descriptions of the same
+        // idea: read the asset's own cells back off the grid and work out which
+        // of the tile's four edges the asphalt actually reaches. A tile that
+        // reads back as a different shape is a road pointing at open terrain,
+        // and no amount of correct rotation arithmetic in the generator shows it.
+        for (const auto& kind :
+             {std::pair<const char*, terrain::RoadKind>{"road_end", terrain::kRoadEnd},
+              {"road_straight", terrain::kRoadStraight},
+              {"road_corner", terrain::kRoadCorner},
+              {"road_tee", terrain::kRoadTee},
+              {"road_cross", terrain::kRoadCross}}) {
+            mapvox::Doc asset;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + kind.first + ".vox.json", asset)) {
+                rep.prefabShapesOk = false;
+                continue;
+            }
+            sim::World aw = makeEmptyWorld();
+            mapvox::stampMapVox(asset, aw, 0, 0, 0, 0);
+            int present = 0;
+            for (int side = 0; side < 4; ++side) {
+                const terrain::Side& sd = terrain::kSideDirs[side];
+                const int ex = sd.dx < 0 ? 0 : (sd.dx > 0 ? asset.sx - 1 : asset.sx / 2);
+                const int ez = sd.dz < 0 ? 0 : (sd.dz > 0 ? asset.sz - 1 : asset.sz / 2);
+                bool reaches = false;
+                for (int o = -terrain::kRoadCutHalfWidth; o <= terrain::kRoadCutHalfWidth && !reaches; ++o) {
+                    const int x = sd.dx != 0 ? ex : asset.sx / 2 + o;
+                    const int z = sd.dz != 0 ? ez : asset.sz / 2 + o;
+                    if (x < 0 || z < 0 || x >= asset.sx || z >= asset.sz) continue;
+                    if (aw.get(x, asset.sy - 1, z) == sim::Block::Asphalt) reaches = true;
+                }
+                if (reaches) present |= sd.bit;
+            }
+            const bool centreDrivable =
+                aw.get(asset.sx / 2, asset.sy - 1, asset.sz / 2) == sim::Block::Asphalt;
+            if (present != terrain::canonicalMask(kind.second) || !centreDrivable) {
+                rep.prefabShapesOk = false;
+            }
+        }
+        // rotateMask must agree with the transform mapvox::stampMapVox really
+        // applies, or a rotated road prefab points the wrong way while every
+        // generated surface still looks flat. Proved by stamping one cell and
+        // reading back where it landed, rather than by restating the rotation
+        // in the test (which is how it was wrong once already).
+        bool rotationAgrees = true;
+        for (int rot = 0; rot < 4 && rotationAgrees; ++rot) {
+            for (int side = 0; side < 4 && rotationAgrees; ++side) {
+                const terrain::Side& sd = terrain::kSideDirs[side];
+                sim::World w1 = makeEmptyWorld();
+                mapvox::Doc one;
+                // A run is (y, z, x, length, palette): the probe cell sits one
+                // step along the side's own direction from the 9x9 centre, on
+                // the footprint's own floor (local y 0) so that stamping it at
+                // oy 4 lands it at the single world layer probed below.
+                const std::string runs =
+                    "0," + std::to_string(4 + sd.dz) + "," + std::to_string(4 + sd.dx) + ",1,0";
+                mapvox::parseMapVox(
+                    "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+                    "\"dims\":[9,9,9],\"cells_rle\":{\"palette\":[\"concrete\"],\"runs\":[" +
+                    runs + "]}}",
+                    one);
+                mapvox::stampMapVox(one, w1, 20, 4, 20, rot);
+                int foundX = -1, foundZ = -1;
+                for (int z = 0; z < 9 && foundX < 0; ++z)
+                    for (int x = 0; x < 9; ++x)
+                        if (w1.get(20 + x, 4, 20 + z) == sim::Block::Concrete) {
+                            foundX = x; foundZ = z;
+                            break;
+                        }
+                if (foundX < 0) { rotationAgrees = false; break; }
+                int actual = 0;
+                for (int t = 0; t < 4; ++t)
+                    if (terrain::kSideDirs[t].dx == foundX - 4 && terrain::kSideDirs[t].dz == foundZ - 4)
+                        actual = terrain::kSideDirs[t].bit;
+                if (terrain::rotateMask(sd.bit, rot) != actual) rotationAgrees = false;
+            }
+        }
+        rep.roadShaped = shaped ? 1 : 0;
+        rep.roadSpans = spans ? 1 : 0;
+        rep.roadFlat = flat ? 1 : 0;
+        rep.roadRot = rotationAgrees ? 1 : 0;
+        rep.roadOk = shaped && spans && flat && rotationAgrees && rep.prefabShapesOk;
+    }
+
+    // 7. Non-destructive: a warehouse-sized block of authored structure must
+    //    come through generation untouched, and the generator must not claim to
+    //    have refused anything. A terrain section is allowed to land around a
+    //    map, never through it.
+    {
+        sim::World w = makeEmptyWorld();
+        // A full-height 8x8x8 block, so the terrain must meet it wherever its
+        // own surface happens to be: a slab placed above the ground would never
+        // be tested at all, which is how a fill-only generator could look
+        // correct while still being destructive. The runs are built rather than
+        // written out, because a hand-written list of 64 quintuples is exactly
+        // the kind of fixture that quietly stamps a fraction of what it claims
+        // (it did, once, which is why the expected count is compared too).
+        std::string slabRuns;
+        for (int y = 0; y < 8; ++y)
+            for (int z = 0; z < 8; ++z) {
+                slabRuns += (slabRuns.empty() ? "" : ",") + std::to_string(y) + "," +
+                            std::to_string(z) + ",0,8,0";
+            }
+        mapvox::Doc slab;
+        const bool slabParsed = mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[8,8,8],"
+            "\"cells_rle\":{\"palette\":[\"concrete\"],\"runs\":[" + slabRuns + "]}}",
+            slab);
+        const mapvox::StampResult slabStamp = mapvox::stampMapVox(slab, w, 96, 0, 80);
+        terrain::Report r3;
+        const std::vector<int> h3 = terrain::heightField(spec, *fam, fam->base);
+        terrain::fillTerrain(w, spec, *fam, h3, r3);
+        // The height field is only the first of the generator's four passes. A
+        // contract that held for fillTerrain and broke for the road and prop
+        // prefabs would still be a broken contract, so the same slab is run
+        // through the rest of the pipeline here. The prefab passes are the
+        // interesting ones: they place authored assets over the world, and
+        // stampMapVox in its default mode replaces whatever is under it.
+        const std::vector<terrain::RoadNode> slabNodes = terrain::planRoads(spec);
+        const int slabLevel = terrain::roadLevel(spec, slabNodes, h3);
+        terrain::gradeRoads(w, slabNodes, slabLevel, r3);
+        for (const auto& n : slabNodes) {
+            mapvox::Doc rd;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + n.prefab + ".vox.json", rd) &&
+                !mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" + n.prefab + ".vox.json", rd))
+                continue;
+            const mapvox::StampResult rr = mapvox::stampMapVox(rd, w, n.x0, slabLevel - 1, n.z0,
+                                                               n.rot, /*fillOnly=*/true);
+            r3.prefabDeclined += rr.declined;
+        }
+        for (const auto& p : terrain::planProps(spec, *fam, h3, slabNodes)) {
+            mapvox::Doc pd;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + p.prefab + ".vox.json", pd) &&
+                !mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" + p.prefab + ".vox.json", pd))
+                continue;
+            const mapvox::StampResult pr = mapvox::stampMapVox(pd, w, p.x, p.y, p.z, p.rot,
+                                                              /*fillOnly=*/true);
+            r3.prefabDeclined += pr.declined;
+        }
+        int intact = 0, expected = 0;
+        for (int y = 0; y < 8; ++y)
+            for (int z = 0; z < 8; ++z)
+                for (int x = 0; x < 8; ++x) {
+                    ++expected;
+                    if (w.get(96 + x, y, 80 + z) == sim::Block::Concrete) ++intact;
+                }
+        rep.slabIntact = intact;
+        rep.slabExpected = expected;
+        rep.slabSkipped = r3.authoredSkipped;
+        rep.slabPrefabDeclined = r3.prefabDeclined;
+        // The fixture must have stamped every cell it claims, or the survival
+        // check below is testing a partial block and would pass for the wrong
+        // reason.
+        const bool fixtureOk = slabParsed && slab.rleCells == 512 && slabStamp.written == 512;
+        // The generator must have met the slab and stepped around it, not
+        // missed it: `authoredSkipped` is the count of cells it declined to
+        // overwrite, and the terrain under the slab proves it ran there.
+        //
+        // `prefabDeclined` is the load-bearing half now. It is required to be
+        // non-zero, so the slab has to sit where a road or a prop actually
+        // wanted to be: the gate is proving the prefab passes stepped around
+        // authored cells, not merely that they ran without incident. A prefab
+        // pass that stamped over the slab would leave the count at zero and
+        // fail here, which is the point.
+        rep.nonDestructiveOk = fixtureOk && (intact == expected) && r3.authoredSkipped > 0 &&
+                               r3.prefabDeclined > 0;
+    }
+
+    // 7a. Altitude: the stamped surface must sit ON the network's level, with
+    //     no air under it. The shape check above proves which SIDES the asphalt
+    //     reaches and nothing about its height, so a tile that was one cell too
+    //     tall, or stamped one cell too low, produced a road floating over a
+    //     one-cell gap and every other check still passed. That is exactly what
+    //     a 3-cell tile did.
+    {
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        const int level = terrain::roadLevel(spec, nodes, h);
+        sim::World w = makeEmptyWorld();
+        terrain::Report rr;
+        terrain::fillTerrain(w, spec, *fam, h, rr);
+        terrain::gradeRoads(w, nodes, level, rr);
+        for (const auto& n : nodes) {
+            mapvox::Doc rd;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + n.prefab + ".vox.json", rd) &&
+                !mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" + n.prefab + ".vox.json", rd))
+                continue;
+            mapvox::stampMapVox(rd, w, n.x0, level - 1, n.z0, n.rot, /*fillOnly=*/true);
+        }
+        // Walk out from each node's centre along every side its mask actually
+        // claims, plus the centre itself. Probing a fixed line instead would
+        // walk off a dead end's single arm and find its kerb, which is correct
+        // road and would read as a failure.
+        int probed = 0, surfaceAtLevel = 0, solidUnder = 0;
+        for (const auto& n : nodes) {
+            const int cx = n.x0 + terrain::kRegionCells / 2;
+            const int cz = n.z0 + terrain::kRegionCells / 2;
+            auto check = [&](int x, int z) {
+                if (!sim::World::inBounds(x, level, z)) return;
+                ++probed;
+                if (w.get(x, level, z) == sim::Block::Asphalt) ++surfaceAtLevel;
+                if (w.get(x, level - 1, z) != sim::Block::Air) ++solidUnder;
+            };
+            check(cx, cz);
+            for (int side = 0; side < 4; ++side) {
+                const terrain::Side& sd = terrain::kSideDirs[side];
+                if (!(n.mask & sd.bit)) continue;
+                for (int o = 1; o <= terrain::kRoadCutHalfWidth; ++o)
+                    check(cx + sd.dx * o, cz + sd.dz * o);
+            }
+        }
+        rep.roadAltProbed = probed;
+        rep.roadAltSurface = surfaceAtLevel;
+        rep.roadAltSolidUnder = solidUnder;
+        rep.roadAltOk = probed > 0 && surfaceAtLevel == probed && solidUnder == probed;
+    }
+
+    // 7b. The same contract, aimed straight at the prefab pass. The check above
+    //     proves the prefab passes declined something; this proves that what
+    //     they declined was the AUTHORED cell, and that the default stamp mode
+    //     would have taken it. Without this the count could be satisfied by
+    //     declining cells that were already generator ground, and the road
+    //     could be quietly demolishing a warehouse with the gate still green.
+    //
+    //     The fixture is placed at the first road node's own origin, filling
+    //     the height the prefab will be stamped at, so the prefab genuinely
+    //     wants those cells.
+    {
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        const int level = terrain::roadLevel(spec, nodes, h);
+        mapvox::Doc rd;
+        bool haveRoad = !nodes.empty() &&
+                        (mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + nodes[0].prefab + ".vox.json",
+                                              rd) ||
+                         mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" +
+                                                  nodes[0].prefab + ".vox.json",
+                                              rd));
+        bool spared = false, overwriteWouldWin = false, someDeclined = false;
+        if (haveRoad) {
+            // A concrete block exactly where the road surface goes: the prefab's
+            // own floor and the two layers above it, over its origin cell.
+            const int ox = nodes[0].x0, oz = nodes[0].z0, oy = level - 1;
+            auto fillBlock = [&](sim::World& w) {
+                for (int dz = 0; dz < 8; ++dz)
+                    for (int dx = 0; dx < 8; ++dx)
+                        for (int dy = 0; dy < 3; ++dy)
+                            w.set(ox + dx, oy + dy, oz + dz, sim::Block::Concrete);
+            };
+            auto blockIntact = [&](const sim::World& w) {
+                int n = 0;
+                for (int dz = 0; dz < 8; ++dz)
+                    for (int dx = 0; dx < 8; ++dx)
+                        for (int dy = 0; dy < 3; ++dy)
+                            if (w.get(ox + dx, oy + dy, oz + dz) == sim::Block::Concrete) ++n;
+                return n;
+            };
+            const int total = 8 * 8 * 3;
+
+            // The authored block, then the road stamped fill-only over it.
+            sim::World kept = makeEmptyWorld();
+            fillBlock(kept);
+            const mapvox::StampResult r1 =
+                mapvox::stampMapVox(rd, kept, ox, oy, oz, nodes[0].rot, /*fillOnly=*/true);
+            someDeclined = r1.declined > 0;
+            spared = (blockIntact(kept) == total);
+
+            // The same two operations in the map-prefab mode. This must NOT
+            // spare the block; if it did, the fill-only assertion above would be
+            // proving nothing at all.
+            sim::World clobbered = makeEmptyWorld();
+            fillBlock(clobbered);
+            mapvox::stampMapVox(rd, clobbered, ox, oy, oz, nodes[0].rot, /*fillOnly=*/false);
+            overwriteWouldWin = (blockIntact(clobbered) < total);
+        }
+        rep.prefabSparesAuthoredOk = haveRoad && spared && overwriteWouldWin && someDeclined;
+        rep.slabPrefabCells = someDeclined ? 1 : 0;
+    }
+
+    // 8. Refusals. A section that names a class the engine does not have, or
+    //    omits the seed, must be refused rather than quietly defaulted — a
+    //    defaulted seed is a silent clock, which is exactly what the
+    //    determinism rule forbids.
+    {
+        mapvox::Doc d;
+        rep.refusalClassOk = !mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4],"
+            "\"terrain\":{\"class\":\"lava\",\"seed\":7}}",
+            d);
+        rep.refusalSeedOk = !mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4],"
+            "\"terrain\":{\"class\":\"valley\"}}",
+            d);
+        // A map with no section at all is ordinary: no generation, no refusal.
+        mapvox::Doc plain;
+        const bool parsed = mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}",
+            plain);
+        rep.absentOk = parsed && plain.ok && !plain.terrain.present;
+    }
+
+    // 9. The section round-trips through the exporter, so a generated world
+    //    re-exports as a map that regenerates it instead of a baked grid.
+    {
+        mapvox::Doc d;
+        mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+            "\"dims\":[192,64,160],"
+            "\"terrain\":{\"class\":\"tundra\",\"seed\":424242,\"base\":21,\"props\":false,\"road_x\":2}}",
+            d);
+        const std::string json = mapvox::terrainJson(d.terrain);
+        mapvox::Doc back;
+        const bool parsed = mapvox::parseMapVox(
+            std::string("{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+                        "\"dims\":[192,64,160],") + json + "}",
+            back);
+        rep.roundTripOk = parsed && back.terrain.present && back.terrain.family == "tundra" &&
+                          back.terrain.seed == 424242u && back.terrain.base == 21 &&
+                          !back.terrain.props && back.terrain.roadX == 2;
+    }
+
+    // 10. Generated ground is ordinary occupancy, not a special material: it
+    //     must break under a hit and leave Air behind. Terrain that could not
+    //     be destroyed would be a cheat surface.
+    {
+        sim::World w = makeEmptyWorld();
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        terrain::Report r4;
+        terrain::fillTerrain(w, spec, *fam, h, r4);
+        int destroyed = 0;
+        for (int z = 0; z < sim::kWorldD; ++z)
+            for (int x = 0; x < sim::kWorldW; ++x) {
+                const int top = h[static_cast<size_t>(z) * sim::kWorldW + x];
+                if (top < 1 || top >= sim::kWorldH - 4) continue;
+                const sim::Block before = w.get(x, top, z);
+                if (before == sim::Block::Air) continue;
+                w.set(x, top, z, sim::Block::Air);
+                if (w.get(x, top, z) == sim::Block::Air) ++destroyed;
+            }
+        rep.damageOk = destroyed > 0;
+    }
+
+    return rep;
+}
+
 static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
     SimViewSmokeReport rep;
 
@@ -5268,6 +5821,135 @@ static bool playerHitsSolid(float px, float py, float pz) {
     return false;
 }
 
+// Stamp a prefab by id, looking beside the exe and in data/prefabs. Shared by
+// the map's own prefab list and by generated terrain, which places roads and
+// decorations the same way: a prefab is a prefab, whoever asked for it.
+//
+// `fillOnly` separates the two callers, and the difference matters. A map's own
+// prefabs stamp over the grid on purpose — that is what placing a prefab by
+// hand means. Generated terrain is bound by the other half of the contract in
+// RULES.md, "Generated terrain": it only fills Air, so a road tile or a shrub
+// that lands on hand-authored structure declines the cell instead of demolishing
+// it. The generator's other two passes (fillTerrain, gradeRoads) already worked
+// this way; without this flag the prefab pass was the one loophole left in a
+// promise the schema and RULES both state outright.
+static bool stampPrefabById(const std::string& id, sim::World& world, int x, int y, int z,
+                            int rot, bool fillOnly = false, int* written = nullptr,
+                            int* declined = nullptr) {
+    mapvox::Doc pd;
+    bool found = false;
+    for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                  g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+        if (mapvox::loadAssetVox(dir + id + ".vox.json", pd)) { found = true; break; }
+    }
+    if (!found) return false;
+    const mapvox::StampResult r = mapvox::stampMapVox(pd, world, x, y, z, rot, fillOnly);
+    if (written) *written += r.written;
+    if (declined) *declined += r.declined;
+    return true;
+}
+
+// A road tile's height is a contract, not a convention: the stamp is placed at
+// `level - kRoadLayers`, so a tile that is not exactly kRoadLayers tall either
+// floats above a hole or sinks its surface below the level the network, the
+// spawn and the gate all agree on. The terrain gate (see the altitude probe)
+// proves the generated assets, but a gate only runs when someone runs it -- a
+// hand-edited or stale prefab would otherwise load and quietly produce a road
+// with an air gap under it, which is the exact defect kRoadLayers exists to
+// prevent. So the load path checks it too, and refuses the asset.
+//
+// The height is measured the way stampMapVox would actually write the tile, over
+// both cell forms: an explicit `voxels` list and the run-length `cells_rle`.
+// A run counts only if its palette entry is a real block and was not dropped as
+// painter-only, which is the same condition the stamp applies -- measuring the
+// runs with a looser rule would let a dropped material inflate the height.
+static bool roadPrefabHeightOk(const mapvox::Doc& pd, int& outHeight) {
+    int lo = -1, hi = -1;
+    auto note = [&](int y) {
+        if (lo < 0 || y < lo) lo = y;
+        if (hi < 0 || y > hi) hi = y;
+    };
+    for (const auto& v : pd.voxels) {
+        if (v.block != sim::Block::Air) note(v.y);
+    }
+    const auto& runs = pd.rleRuns;
+    for (size_t i = 0; i + 4 < runs.size(); i += 5) {
+        const int pi = runs[i + 4];
+        if (pi < 0 || static_cast<size_t>(pi) >= pd.rlePalette.size()) continue;
+        if (static_cast<size_t>(pi) < pd.rleDropped.size() && pd.rleDropped[pi]) continue;
+        if (pd.rlePalette[pi] == sim::Block::Air) continue;
+        if (runs[i + 3] <= 0) continue; // an empty run writes nothing
+        note(runs[i]);
+    }
+    if (lo < 0) { outHeight = 0; return false; } // an empty tile is not a road
+    outHeight = hi - lo + 1;
+    return outHeight == terrain::kRoadLayers;
+}
+
+// Generate the map's terrain section, if it has one. Runs after the map and its
+// prefabs are stamped and before the player is placed, so the spawn cell is
+// chosen against the finished ground rather than the empty grid.
+//
+// The generator only fills Air (see src/terrain.hpp), so it can never demolish
+// authored structure: a map can gain a terrain section without losing the map.
+// Everything it writes is ordinary occupancy, so the mesher, the physics and
+// the sim fingerprint see nothing special.
+static void generateMapTerrain(sim::World& world, const terrain::Spec& spec) {
+    if (!spec.present) return;
+    const terrain::FamilyProfile* fam = terrain::familyByName(spec.family);
+    if (!fam) fail("terrain class \"" + spec.family + "\" is unknown");
+    const int base = spec.base >= 0 ? spec.base : fam->base;
+
+    const std::vector<int> heights = terrain::heightField(spec, *fam, base);
+    terrain::Report rep;
+    terrain::fillTerrain(world, spec, *fam, heights, rep);
+
+    const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+    rep.roadNodes = static_cast<int>(nodes.size());
+    const int level = terrain::roadLevel(spec, nodes, heights);
+    terrain::gradeRoads(world, nodes, level, rep);
+
+    // Roads and decorations are prefabs, stamped at the placement the seeded
+    // plan gives. A missing asset is a refusal, not a silent omission: a road
+    // that failed to stamp would leave the network broken with no sign of it.
+    // Both passes are fill-only, for the same reason fillTerrain is.
+    //
+    // A road also has to be exactly kRoadLayers tall, or the stamp lands its
+    // surface off the level every other consumer uses. That is checked here, at
+    // load, not only by the gate -- see roadPrefabHeightOk.
+    for (const auto& n : nodes) {
+        mapvox::Doc rd;
+        bool found = false;
+        for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                      g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+            if (mapvox::loadAssetVox(dir + n.prefab + ".vox.json", rd)) { found = true; break; }
+        }
+        if (!found)
+            fail("terrain road prefab \"" + std::string(n.prefab) + "\" not found or invalid");
+        int height = 0;
+        if (!roadPrefabHeightOk(rd, height))
+            fail("terrain road prefab \"" + std::string(n.prefab) + "\" is " +
+                 std::to_string(height) + " cell(s) tall; a road tile must be exactly " +
+                 std::to_string(terrain::kRoadLayers) + " (base course plus surface), or its " +
+                 "surface lands off the network level and leaves an air gap under the road");
+        const mapvox::StampResult r =
+            mapvox::stampMapVox(rd, world, n.x0, level - 1, n.z0, n.rot, /*fillOnly=*/true);
+        rep.prefabDeclined += r.declined;
+    }
+    for (const auto& p : terrain::planProps(spec, *fam, heights, nodes)) {
+        // A decoration that will not stamp is counted, not fatal: it is scenery,
+        // and refusing to load a world over a missing shrub would be worse than
+        // a world with one fewer shrub. Roads are held to the strict rule
+        // above, because a broken road is a broken world.
+        if (!stampPrefabById(p.prefab, world, p.x, p.y, p.z, p.rot, true, nullptr,
+                             &rep.prefabDeclined))
+            ++rep.propsMissing;
+        else
+            ++rep.props;
+    }
+    g_terrainReport = rep;
+}
+
 static void spawnPlayerOnMap(const sim::World& world) {
     if (g_mapSpawn.present) {
         // The map says where the player stands; respawn uses the same cell.
@@ -5286,8 +5968,50 @@ static void spawnPlayerOnMap(const sim::World& world) {
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
         return;
     }
-    (void)world;
-    fail("the map has no player_spawn");
+    // No authored spawn, but a terrain section: stand on the generated ground.
+    // A terrain-only map has no floor of its own, so refusing here would make
+    // the whole feature unloadable, and searching from the sky down is the same
+    // rule the old warehouse spawn used.
+    if (g_mapTerrain.present) {
+        int bestX = -1, bestY = -1, bestZ = -1;
+        // Scan down at a few spread-out columns and take the highest ground
+        // found. Searching one column only would fail whenever the seed happens
+        // to put that column on a slope's low side.
+        for (int probe = 0; probe < 4 && bestY < 0; ++probe) {
+            const int x = (WORLD_W / 2) + (probe - 1) * (WORLD_W / 8);
+            const int z = (WORLD_D / 2) + (probe & 1 ? 1 : -1) * (WORLD_D / 8);
+            for (int y = WORLD_H - 2; y >= 0; --y) {
+                if (!isSolidBlock(world.get(x, y, z))) continue;
+                if (isSolidBlock(world.get(x, y + 1, z))) continue;  // need headroom
+                bestX = x; bestY = y + 1; bestZ = z;
+                break;
+            }
+        }
+        if (bestY < 0) fail("terrain map has no player_spawn and no standable ground");
+        g_mapSpawn.present = true;
+        g_mapSpawn.x = bestX;
+        g_mapSpawn.y = bestY;
+        g_mapSpawn.z = bestZ;
+        g_mapSpawn.yaw = 0.0f;
+        g_mapSpawn.pitch = 0.0f;
+    } else {
+        fail("the map has no player_spawn");
+    }
+    if (g_mapSpawn.present) {
+        g_spawnCellX = g_mapSpawn.x;
+        g_spawnCellY = g_mapSpawn.y;
+        g_spawnCellZ = g_mapSpawn.z;
+        g_player.px = (g_mapSpawn.x + 0.5f) * VOXEL_SIZE;
+        g_player.py = g_mapSpawn.y * VOXEL_SIZE + 0.0002f;
+        g_player.pz = (g_mapSpawn.z + 0.5f) * VOXEL_SIZE;
+        g_player.vx = g_player.vy = g_player.vz = 0.0f;
+        g_player.onGround = true;
+        g_player.lean = 0.0f;
+        g_player.leanTarget = 0.0f;
+        g_yaw = g_mapSpawn.yaw;
+        g_pitch = g_mapSpawn.pitch;
+        g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+    }
 }
 
 // Water current + weight sampling from physics feet (not free-fly camera).
@@ -5852,11 +6576,51 @@ static const CaptureShot kCaptureShots[] = {
     {"preset_clean",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Clean"},
 };
 
+// Shots for a generated-terrain world. The list above is fixed to the
+// warehouse's own coordinates and heights, which say nothing about terrain: on a
+// generated world those eyes are usually underground or staring at sky, and a
+// capture that cannot tell a road from open ground is not a check.
+//
+// These are placed from the world that was actually generated -- the spawn cell
+// the loader chose, and the network's own level -- so they frame real ground
+// whatever the class or seed. They only run when a terrain section is present,
+// so the warehouse's golden capture set is untouched.
+static std::vector<CaptureShot> terrainCaptureShots() {
+    std::vector<CaptureShot> shots;
+    const int level = g_terrainReport.roadLevelY > 0 ? g_terrainReport.roadLevelY : 8;
+    // Stand on the spawn the loader picked and look along the road.
+    const float sx = static_cast<float>(g_spawnCellX) + 0.5f;
+    const float sz = static_cast<float>(g_spawnCellZ) + 0.5f;
+    const float eye = static_cast<float>(g_spawnCellY) + 1.6f;
+    shots.push_back({"terrain_spawn", sx, eye, sz, 0.0f, -0.10f, kShotPlain});
+    // A high three-quarter view, the way the height field actually reads.
+    shots.push_back({"terrain_aerial", 48.0f, static_cast<float>(level) + 26.0f, 40.0f, 0.85f,
+                     -0.45f, kShotPlain});
+    // Down at road level, from the side, so the surface and kerbs are on camera.
+    shots.push_back({"terrain_road", sx + 10.0f, static_cast<float>(level) + 2.2f, sz - 6.0f, -1.2f,
+                     -0.12f, kShotPlain});
+    // One terrain preset pass, so the post chain is exercised on generated
+    // materials as well as on the warehouse's.
+    shots.push_back({"terrain_preset", sx, eye, sz, 0.0f, -0.10f, kShotPlain, "Retro"});
+    return shots;
+}
+
 static int runCaptureShots(float timeSec) {
     int written = 0;
     g_captureActive = true;
     g_recoilPitch = g_recoilYaw = 0.0f;
-    for (const CaptureShot& shot : kCaptureShots) {
+    // A generated world gets shots framed on its own ground; the warehouse keeps
+    // the fixed set, so its golden captures do not move.
+    std::vector<CaptureShot> terrainShots;
+    const CaptureShot* shots = kCaptureShots;
+    size_t shotCount = sizeof(kCaptureShots) / sizeof(kCaptureShots[0]);
+    if (g_mapTerrain.present) {
+        terrainShots = terrainCaptureShots();
+        shots = terrainShots.data();
+        shotCount = terrainShots.size();
+    }
+    for (size_t si = 0; si < shotCount; ++si) {
+        const CaptureShot& shot = shots[si];
         g_camPos = Vec3(shot.cx * VOXEL_SIZE, shot.cy * VOXEL_SIZE, shot.cz * VOXEL_SIZE);
         g_yaw = shot.yaw;
         g_pitch = shot.pitch;
@@ -5899,6 +6663,8 @@ static int runCaptureShots(float timeSec) {
 static bool exportMapDocument(const sim::World& world, const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
+    // A generated world exports its section, so reloading the file regenerates
+    // the same terrain instead of baking it in as if it had been authored.
     char buf[256];
     f << "{\n";
     f << "  \"format_version\": " << mapvox::kMaxFormatVersion
@@ -5927,11 +6693,20 @@ static bool exportMapDocument(const sim::World& world, const std::string& path) 
         f << buf;
     }
     f << "\n  ],\n";
+    // The moon bearing as the FILE wrote it, not as the renderer left it.
+    // g_moonDirWorld is normalized in place every frame by the sky pass, and the
+    // loader normalizes on the way in, so exporting that global wrote a value
+    // one rounding step away from the authored one: re-exporting a map drifted
+    // its moon_dir each time. View state is not map data, so the authored
+    // direction is kept here and only the renderer gets a normalized copy.
+    const mapvox::Environment& env = g_mapEnvironment;
     std::snprintf(buf, sizeof(buf), "  \"environment\": {\"moon_dir\": [%.4f, %.4f, %.4f]},\n",
-                  g_moonDirWorld.x, g_moonDirWorld.y, g_moonDirWorld.z);
+                  env.moonDir[0], env.moonDir[1], env.moonDir[2]);
     f << buf;
     const std::string appearance = mapvox::worldAppearanceRle(world);
     if (!appearance.empty()) f << "  \"appearance\": " << appearance << ",\n";
+    const std::string section = mapvox::terrainJson(g_mapTerrain);
+    if (!section.empty()) f << "  " << section << ",\n";
     f << "  \"cells_rle\": " << mapvox::worldToRle(world) << "\n}\n";
     return static_cast<bool>(f);
 }
@@ -6363,6 +7138,27 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         if (at != std::string::npos)
             meshHelpersOverride = std::clamp(std::atoi(cmd.c_str() + at + flag.size()), 0, 15);
     }
+    // --map <path>: load this document instead of data/maps/warehouse_v1. Taken
+    // literally, with no search-beside-the-exe fallback, so a typo fails loudly
+    // instead of quietly running a different world.
+    {
+        const std::string flag = "--map ";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos) {
+            size_t b = at + flag.size();
+            while (b < cmd.size() && cmd[b] == ' ') ++b;
+            size_t e = b;
+            if (b < cmd.size() && cmd[b] == '"') { ++b; e = cmd.find('"', b); }
+            else e = cmd.find(' ', b);
+            g_mapOverridePath = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+        }
+    }
+    {
+        const std::string flag = "--mesh-helpers";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos)
+            meshHelpersOverride = std::clamp(std::atoi(cmd.c_str() + at + flag.size()), 0, 15);
+    }
 
     try {
         g_exeDir = getExeDir();
@@ -6405,15 +7201,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         sim::World world;
         {
             mapvox::Doc mapDoc;
-            const std::string candidates[] = {
-                g_exeDir + "\\maps\\warehouse_v1.map.vox.json",
-                g_exeDir + "\\..\\data\\maps\\warehouse_v1.map.vox.json",
-                g_exeDir + "\\..\\..\\data\\maps\\warehouse_v1.map.vox.json",
-            };
+            // --map <path> loads that document instead of the default, so a
+            // terrain world can be run without renaming it over warehouse_v1.
+            // A path is taken literally: no "search beside the exe" fallback,
+            // because silently loading a different world than the one named is
+            // exactly the kind of substitution a flag must not do.
+            std::vector<std::string> candidates;
+            if (g_mapOverridePath.empty()) {
+                candidates = {
+                    g_exeDir + "\\maps\\warehouse_v1.map.vox.json",
+                    g_exeDir + "\\..\\data\\maps\\warehouse_v1.map.vox.json",
+                    g_exeDir + "\\..\\..\\data\\maps\\warehouse_v1.map.vox.json",
+                };
+            } else {
+                candidates = {g_mapOverridePath};
+            }
             bool loaded = false;
             {
                 for (const auto& path : candidates) {
-                    if (!mapvox::loadMapVox(path, mapDoc)) continue;
+                    if (!mapvox::loadMapVox(path, mapDoc)) {
+                        if (g_mapOverridePath.empty()) continue;
+                        fail("map not loaded: " + path + " (" + mapDoc.error + ")");
+                    }
                     if (mapDoc.sx != WORLD_W || mapDoc.sy != WORLD_H || mapDoc.sz != WORLD_D)
                         fail("map " + path + " does not match the world size");
                     world = makeEmptyWorld();
@@ -6421,16 +7230,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     // Prefab instances: data/prefabs/<id>.vox.json, stamped in
                     // list order (a later prefab overwrites an earlier one).
                     for (const auto& pf : mapDoc.prefabs) {
-                        mapvox::Doc pd;
-                        bool found = false;
-                        for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
-                                                      g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
-                            if (mapvox::loadAssetVox(dir + pf.id + ".vox.json", pd)) { found = true; break; }
-                        }
-                        if (!found) fail("map " + path + ": prefab \"" + pf.id + "\" not found or invalid (" + pd.error + ")");
-                        mapvox::stampMapVox(pd, world, pf.x, pf.y, pf.z, pf.rot);
+                        if (!stampPrefabById(pf.id, world, pf.x, pf.y, pf.z, pf.rot))
+                            fail("map " + path + ": prefab \"" + pf.id + "\" not found or invalid");
                         ++g_mapPrefabsStamped;
                     }
+                    // Terrain, after the authored map and its prefabs: the
+                    // generator fills only Air, so it lands around structure
+                    // rather than through it, and the spawn below is placed
+                    // against the finished ground.
+                    g_mapTerrain = mapDoc.terrain;
+                    generateMapTerrain(world, g_mapTerrain);
                     g_mapSpawn = mapDoc.spawn;
                     g_mapPickups = mapDoc.pickups;
                     g_mapLights = mapDoc.lights;
@@ -6443,15 +7252,25 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                         l.radius = ml.radius;
                         g_bulbs.push_back(l);
                     }
-                    if (mapDoc.environment.present)
-                        g_moonDirWorld = Vec3(mapDoc.environment.moonDir[0], mapDoc.environment.moonDir[1],
-                                              mapDoc.environment.moonDir[2]).normalized();
+                    if (mapDoc.environment.present) {
+                        // Keep the authored direction for export, and hand the
+                        // renderer its own normalized copy.
+                        g_mapEnvironment = mapDoc.environment;
+                        g_moonDirWorld = Vec3(mapDoc.environment.moonDir[0],
+                                              mapDoc.environment.moonDir[1],
+                                              mapDoc.environment.moonDir[2])
+                                             .normalized();
+                    }
                     g_mapPath = path;
                     loaded = true;
                     break;
                 }
             }
-            if (!loaded) fail("map not found: data\\maps\\warehouse_v1.map.vox.json");
+            if (!loaded) {
+                if (g_mapOverridePath.empty())
+                    fail("map not found: data\\maps\\warehouse_v1.map.vox.json");
+                fail("map not loaded: " + g_mapOverridePath);
+            }
         }
         g_world = &world;
         spawnPlayerOnMap(world);
@@ -6656,6 +7475,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                               std::fabs(m.x - 0.1002f) < 1e-6f && snapped.x == 0.5f;
             }
             g_simViewSmoke = runSimViewSmoke(world);
+            g_terrainSmoke = runTerrainSmoke();
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
             g_moveSmoke = runMovementSmoke();
@@ -6938,6 +7758,55 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nmap_refusal_version_ok=" << (g_mapSmoke.refusalVersionOk ? 1 : 0)
                 << "\nmap_refusal_unit_ok=" << (g_mapSmoke.refusalUnitOk ? 1 : 0)
                 << "\nmap_refusal_voxel_size_ok=" << (g_mapSmoke.refusalVoxelSizeOk ? 1 : 0)
+                << "\nterrain_live_present=" << (g_mapTerrain.present ? 1 : 0)
+                << "\nterrain_live_class=" << (g_mapTerrain.present ? g_mapTerrain.family : std::string("none"))
+                << "\nterrain_live_seed=" << g_mapTerrain.seed
+                << "\nterrain_live_columns=" << g_terrainReport.columns
+                << "\nterrain_live_cells=" << g_terrainReport.cells
+                << "\nterrain_live_road_cells=" << g_terrainReport.roadCells
+                << "\nterrain_live_regions=" << g_terrainReport.regions
+                << "\nterrain_live_road_nodes=" << g_terrainReport.roadNodes
+                << "\nterrain_live_road_level=" << g_terrainReport.roadLevelY
+                << "\nterrain_live_height_min=" << g_terrainReport.heightMin
+                << "\nterrain_live_height_max=" << g_terrainReport.heightMax
+                << "\nterrain_live_props=" << g_terrainReport.props
+                << "\nterrain_live_authored_skipped=" << g_terrainReport.authoredSkipped
+                << "\nterrain_live_props_missing=" << g_terrainReport.propsMissing
+                << "\nterrain_golden=" << std::hex << g_terrainSmoke.golden << std::dec
+                << "\nterrain_gate_regions=" << g_terrainSmoke.regions
+                << "\nterrain_gate_road_nodes=" << g_terrainSmoke.roadNodes
+                << "\nterrain_gate_road_level=" << g_terrainSmoke.roadLevelY
+                << "\nterrain_gate_height_min=" << g_terrainSmoke.heightMin
+                << "\nterrain_gate_height_max=" << g_terrainSmoke.heightMax
+                << "\nterrain_determinism_ok=" << (g_terrainSmoke.determinismOk ? 1 : 0)
+                << "\nterrain_seed_sensitive_ok=" << (g_terrainSmoke.seedSensitiveOk ? 1 : 0)
+                << "\nterrain_class_sensitive_ok=" << (g_terrainSmoke.classSensitiveOk ? 1 : 0)
+                << "\nterrain_class_ok=" << (g_terrainSmoke.classOk ? 1 : 0)
+                << "\nterrain_surface_ok=" << (g_terrainSmoke.surfaceOk ? 1 : 0)
+                << "\nterrain_slope_ok=" << (g_terrainSmoke.slopeOk ? 1 : 0)
+                << "\nterrain_road_ok=" << (g_terrainSmoke.roadOk ? 1 : 0)
+                << "\nterrain_road_shaped=" << g_terrainSmoke.roadShaped
+                << "\nterrain_road_spans=" << g_terrainSmoke.roadSpans
+                << "\nterrain_road_flat=" << g_terrainSmoke.roadFlat
+                << "\nterrain_road_rot=" << g_terrainSmoke.roadRot
+                << "\nterrain_road_alt_ok=" << (g_terrainSmoke.roadAltOk ? 1 : 0)
+                << "\nterrain_road_alt_probed=" << g_terrainSmoke.roadAltProbed
+                << "\nterrain_road_alt_surface=" << g_terrainSmoke.roadAltSurface
+                << "\nterrain_road_alt_solid_under=" << g_terrainSmoke.roadAltSolidUnder
+                << "\nterrain_prefab_shapes_ok=" << (g_terrainSmoke.prefabShapesOk ? 1 : 0)
+                << "\nterrain_nondestructive_ok=" << (g_terrainSmoke.nonDestructiveOk ? 1 : 0)
+                << "\nterrain_refusal_class_ok=" << (g_terrainSmoke.refusalClassOk ? 1 : 0)
+                << "\nterrain_refusal_seed_ok=" << (g_terrainSmoke.refusalSeedOk ? 1 : 0)
+                << "\nterrain_roundtrip_ok=" << (g_terrainSmoke.roundTripOk ? 1 : 0)
+                << "\nterrain_absent_ok=" << (g_terrainSmoke.absentOk ? 1 : 0)
+                << "\nterrain_damage_ok=" << (g_terrainSmoke.damageOk ? 1 : 0)
+                << "\nterrain_slab_intact=" << g_terrainSmoke.slabIntact
+                << "\nterrain_slab_expected=" << g_terrainSmoke.slabExpected
+                << "\nterrain_slab_skipped=" << g_terrainSmoke.slabSkipped
+                << "\nterrain_slab_prefab_declined=" << g_terrainSmoke.slabPrefabDeclined
+                << "\nterrain_prefab_spares_authored_ok="
+                << (g_terrainSmoke.prefabSparesAuthoredOk ? 1 : 0)
+                << "\nterrain_ok=" << (g_terrainSmoke.ok() ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -7025,9 +7894,25 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 cleanup();
                 return 4;
             }
+            // Terrain generation contract (Phase 8): same seed same world, a
+            // changed seed a changed world, no cliffs, a connected road network,
+            // authored structure untouched, and refusals that refuse. Exit 10
+            // keeps this triageable on its own, and it is checked on scratch
+            // worlds, so it cannot make the map fingerprints move.
+            if (!g_terrainSmoke.ok()) { cleanup(); return 10; }
         }
     } catch (const std::exception& e) {
-        MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);
+        // Every automated run here is headless -- smoke, stress, capture, export --
+        // so a MessageBox is a message nobody can read: the process just exits 1
+        // with an empty log and the real reason is lost. That is how a broken
+        // launcher gate can sit there looking fine. Always echo the reason, and
+        // only pop the box for an interactive run.
+        std::fputs(e.what(), stderr);
+        std::fputc('\n', stderr);
+        std::fflush(stderr);
+        if (!g_smoke && !g_captureActive && exportMapPath.empty()) {
+            MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);
+        }
         cleanup();
         return 1;
     }

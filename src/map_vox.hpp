@@ -31,6 +31,7 @@
 #include "jsonx.hpp"
 #include "materials.hpp"
 #include "sim_world.hpp"
+#include "terrain.hpp"
 
 namespace mapvox {
 
@@ -143,6 +144,7 @@ struct Doc {
     Environment environment;               // "environment" (optional)
     std::vector<PickupPlacement> pickups;  // "pickups" (optional)
     std::vector<PrefabPlacement> prefabs;  // "prefabs" (optional)
+    terrain::Spec terrain;                 // "terrain" (optional; generated at load)
     std::string mode;                      // "map", "model", "character", ...
     // "cells_rle": run-length occupancy for whole maps. A palette of block
     // names, then runs as flat [y, z, x0, length, paletteIndex] quintuples
@@ -174,6 +176,10 @@ inline const char* blockName(sim::Block b) {
     case sim::Block::WaterCurrent: return "water_current";
     case sim::Block::Moon: return "moon";
     case sim::Block::LightBulb: return "light_bulb";
+    case sim::Block::Sand: return "sand";
+    case sim::Block::Grass: return "grass";
+    case sim::Block::Snow: return "snow";
+    case sim::Block::Asphalt: return "asphalt";
     }
     return "air";
 }
@@ -192,6 +198,10 @@ inline bool blockFromMaterialName(const std::string& name, sim::Block& mapped) {
     if (name == "water_current") { mapped = sim::Block::WaterCurrent; return true; }
     if (name == "light_bulb") { mapped = sim::Block::LightBulb; return true; }
     if (name == "moon") { mapped = sim::Block::Moon; return true; }
+    if (name == "sand") { mapped = sim::Block::Sand; return true; }
+    if (name == "grass") { mapped = sim::Block::Grass; return true; }
+    if (name == "snow") { mapped = sim::Block::Snow; return true; }
+    if (name == "asphalt") { mapped = sim::Block::Asphalt; return true; }
     return false; // bush_leaves / plexiglass / carbon_fiber / treated_wood / custom
 }
 
@@ -419,6 +429,45 @@ inline bool parseVox(const std::string& text, Doc& doc, bool requireMap) {
         }
     }
 
+    // terrain: the class/seed the loader generates the height field from. A map
+    // without the section is generated not at all, which is what keeps every
+    // hand-authored map byte-for-byte what it was.
+    {
+        const std::string o = jsonExtractObjectBody(text, "terrain");
+        if (!o.empty()) {
+            doc.terrain.present = true;
+            doc.terrain.family = jsonExtractString(o, "class", "valley");
+            if (!terrain::familyByName(doc.terrain.family)) {
+                doc.error = "terrain class \"" + doc.terrain.family + "\" is not one of " +
+                            std::to_string(terrain::kFamilyCount) + " known classes";
+                return false;
+            }
+            // The seed is an explicit integer in the file. Nothing in the
+            // generator may substitute a clock, a random source, or a hash of
+            // anything else (RULES.md, "Determinism (mandatory)"), so a missing
+            // seed is a refusal rather than a convenient default.
+            if (!jsonxHasKey(o, "seed")) {
+                doc.error = "terrain requires an explicit integer seed";
+                return false;
+            }
+            doc.terrain.seed = static_cast<uint32_t>(jsonInt(o, "seed"));
+            // -1 means "not authored", which is not the same as 0: jsonInt
+            // returns 0 for an absent key, so reading it unconditionally would
+            // pin every default-base class to a base of 0 and, on export,
+            // write back a value the file never had.
+            doc.terrain.base = jsonxHasKey(o, "base") ? jsonInt(o, "base") : -1;
+            doc.terrain.props = jsonExtractBool(o, "props", true);
+            doc.terrain.roads = jsonExtractBool(o, "roads", true);
+            // Same reasoning as base: an absent road_x must stay -1 ("derive
+            // the column from the seed"), not collapse to column 0.
+            doc.terrain.roadX = jsonxHasKey(o, "road_x") ? jsonInt(o, "road_x") : -1;
+            if (doc.terrain.base >= sim::kWorldH - 8) {
+                doc.error = "terrain base must leave headroom under kWorldH";
+                return false;
+            }
+        }
+    }
+
     // prefabs
     {
         const std::string arr = jsonExtractArrayBody(text, "prefabs");
@@ -559,6 +608,7 @@ struct StampResult {
     int written = 0;  // cells stamped into the world
     int skipped = 0;  // cells dropped: out of world bounds
     int painted = 0;  // cells given an appearance (palette colour)
+    int declined = 0;  // fillOnly: cells left alone because the world was not Air
 };
 
 // Stamp a parsed document's cells and paint into a sim::World with its local
@@ -566,9 +616,25 @@ struct StampResult {
 // footprint (dims). Every cell stays a unit cube on the authoritative grid: a
 // quarter turn permutes cells, it never resamples them. Cells outside the
 // world are skipped and counted.
-inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy, int oz, int rot = 0) {
+//
+// `fillOnly` is the terrain generator's mode: a cell is written only where the
+// world is Air, so a generated prefab lands around authored structure instead of
+// demolishing it (RULES.md, "Generated terrain"). A map's OWN prefabs stamp the
+// default way, because overriding is the point of placing a prefab by hand.
+inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy, int oz, int rot = 0,
+                               bool fillOnly = false) {
     StampResult r;
     rot &= 3;
+    // One rule for both cell loops, so "generated terrain never clears" cannot
+    // hold for the `voxels` form and quietly fail for the run-length form.
+    auto claim = [&](int wx, int wy, int wz, sim::Block b) {
+        if (fillOnly && world.get(wx, wy, wz) != sim::Block::Air) {
+            ++r.declined;
+            return false;
+        }
+        world.set(wx, wy, wz, b);
+        return true;
+    };
     // Local (x, z) -> rotated local (x, z) inside the turned footprint.
     auto place = [&](int lx, int lz, int& rx, int& rz) {
         switch (rot) {
@@ -588,7 +654,7 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
             ++r.skipped;
             continue;
         }
-        world.set(wx, wy, wz, v.block);
+        if (!claim(wx, wy, wz, v.block)) continue;
         ++r.written;
         // Painter colour -> appearance layer. 0 means "no colour authored".
         if (v.rgb != 0 && v.block != sim::Block::Air) {
@@ -605,7 +671,7 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
             place(runs[i + 2] + k, runs[i + 1], rx, rz);
             const int wx = ox + rx, wy = oy + runs[i], wz = oz + rz;
             if (!sim::World::inBounds(wx, wy, wz)) { ++r.skipped; continue; }
-            world.set(wx, wy, wz, b);
+            if (!claim(wx, wy, wz, b)) continue;
             ++r.written;
         }
     }
@@ -621,6 +687,11 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
                 place(ar[i + 2] + k, ar[i + 1], rx, rz);
                 const int wx = ox + rx, wy = oy + ar[i], wz = oz + rz;
                 if (!sim::World::inBounds(wx, wy, wz)) continue;
+                // Paint follows the block it belongs to. A generated prefab is
+                // grid material, not authored art, so it carries no appearance
+                // at all; declining it here keeps the generator from tinting
+                // whatever authored cell it declined to overwrite.
+                if (fillOnly) continue;
                 world.setAppearance(wx, wy, wz, remap[ar[i + 4]]);
                 ++r.painted;
             }
@@ -682,13 +753,33 @@ inline std::string worldToRle(const sim::World& world) {
             }
         }
     // The palette is every block in enum order, so a run's index is its Block.
+    // The bound must be the LAST block: a run naming Sand with no palette entry
+    // would export a map the loader then drops.
     std::string pal;
-    for (int i = 0; i <= static_cast<int>(sim::Block::LightBulb); ++i) {
+    for (int i = 0; i <= static_cast<int>(sim::Block::Asphalt); ++i) {
         pal += (i ? ", \"" : "\"");
         pal += blockName(static_cast<sim::Block>(i));
         pal += "\"";
     }
     return "{\"palette\": [" + pal + "], \"runs\": [" + runs + "]}";
+}
+
+// The "terrain" section as JSON, for --export-map. Only written when the loaded
+// world was generated, so a hand-authored map round-trips without gaining a
+// section it never had. `seed` is always written: the parser refuses a section
+// without one, and re-exporting a generated world with a defaulted seed would
+// produce a document that generates something else on reload.
+inline std::string terrainJson(const terrain::Spec& spec) {
+    if (!spec.present) return "";
+    std::string s = "\"terrain\": {\"class\": \"" + spec.family + "\", \"seed\": " +
+                    std::to_string(spec.seed);
+    if (spec.base >= 0) s += ", \"base\": " + std::to_string(spec.base);
+    s += ", \"props\": ";
+    s += spec.props ? "true" : "false";
+    s += ", \"roads\": ";
+    s += spec.roads ? "true" : "false";
+    if (spec.roadX >= 0) s += ", \"road_x\": " + std::to_string(spec.roadX);
+    return s + "}";
 }
 
 } // namespace mapvox

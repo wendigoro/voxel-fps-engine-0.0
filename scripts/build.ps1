@@ -114,6 +114,18 @@ if (Test-Path $weaponsSrc) {
   New-Item -ItemType Directory -Force -Path $weaponsDst | Out-Null
   Copy-Item (Join-Path $weaponsSrc "*") $weaponsDst -Force -Recurse
 }
+# Terrain road + decoration prefabs (generated: scripts/build_terrain_prefabs.py).
+# The engine's terrain gate reads these back to check each tile presents the
+# sides its kind claims, so a stale copy here is a gate that passes on last
+# week's roads.
+$prefabsSrc = Join-Path $Root "data\prefabs"
+$prefabsDst = Join-Path $Build "prefabs"
+if (Test-Path $prefabsSrc) {
+  New-Item -ItemType Directory -Force -Path $prefabsDst | Out-Null
+  Copy-Item (Join-Path $prefabsSrc "*") $prefabsDst -Force -Recurse
+} elseif (Test-Path $prefabsDst) {
+  Remove-Item $prefabsDst -Recurse -Force
+}
 # Inventory item defs (RULES.md rule 12: unit=1, voxel_size=0.001)
 $itemsSrc = Join-Path $Root "data\items"
 $itemsDst = Join-Path $Build "items"
