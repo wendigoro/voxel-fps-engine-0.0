@@ -22,7 +22,11 @@
 // never reaches for a global: callers accumulate it and assert it stayed zero
 // (the sim-view smoke does exactly that).
 
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "view_chunk.hpp"
@@ -325,5 +329,99 @@ inline void meshChunk(view::ViewChunk& chunk, Stats& stats) {
         }
     }
 }
+
+// A small persistent pool that meshes a batch of chunks in parallel.
+//
+// This is safe because meshChunk reads only the chunk it is given (its own
+// snapshot and skirt) and writes only that chunk's mesh, so two chunks never
+// share state. The result is independent of which thread meshed which chunk:
+// each chunk's vertices are a pure function of its snapshot, and Stats are
+// per-thread counters summed after the batch, so their total is order-free.
+//
+// The caller thread works too, and meshAll does not return until every chunk
+// is done, so the frame still sees a finished mesh before it uploads. Nothing
+// here runs while the simulation ticks; the pool only exists during meshAll.
+class Workers {
+public:
+    // helpers = extra threads besides the caller. 0 runs everything inline.
+    explicit Workers(unsigned helpers) : threadStats_(helpers + 1) {
+        for (unsigned i = 0; i < helpers; ++i)
+            threads_.emplace_back([this, i] { run(i + 1); });
+    }
+    ~Workers() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            quit_ = true;
+        }
+        wake_.notify_all();
+        for (auto& t : threads_) t.join();
+    }
+    Workers(const Workers&) = delete;
+    Workers& operator=(const Workers&) = delete;
+
+    unsigned helpers() const { return static_cast<unsigned>(threads_.size()); }
+
+    void meshAll(const std::vector<view::ViewChunk*>& chunks, Stats& stats) {
+        // Waking helpers costs more than meshing one chunk, so a lone impact
+        // stays on the caller.
+        if (threads_.empty() || chunks.size() < 2) {
+            for (view::ViewChunk* c : chunks) meshChunk(*c, stats);
+            return;
+        }
+        for (auto& s : threadStats_) s = Stats{};
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            batch_ = &chunks;
+            next_.store(0);
+            busy_ = static_cast<unsigned>(threads_.size());
+            ++generation_;
+        }
+        wake_.notify_all();
+        drain(0);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            done_.wait(lk, [this] { return busy_ == 0; });
+            batch_ = nullptr;
+        }
+        for (const auto& s : threadStats_) stats.skirtAccessViolations += s.skirtAccessViolations;
+    }
+
+private:
+    void drain(unsigned slot) {
+        const auto& chunks = *batch_;
+        for (;;) {
+            const size_t i = next_.fetch_add(1);
+            if (i >= chunks.size()) return;
+            meshChunk(*chunks[i], threadStats_[slot]);
+        }
+    }
+
+    void run(unsigned slot) {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                wake_.wait(lk, [&] { return quit_ || generation_ != seen; });
+                if (quit_) return;
+                seen = generation_;
+            }
+            drain(slot);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (--busy_ == 0) done_.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::vector<Stats> threadStats_;          // [0] is the caller
+    std::mutex mu_;
+    std::condition_variable wake_, done_;
+    const std::vector<view::ViewChunk*>* batch_ = nullptr;
+    std::atomic<size_t> next_{0};
+    unsigned busy_ = 0;
+    uint64_t generation_ = 0;
+    bool quit_ = false;
+};
 
 } // namespace meshview
