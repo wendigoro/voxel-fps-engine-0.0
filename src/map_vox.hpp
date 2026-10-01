@@ -137,6 +137,11 @@ struct Doc {
     std::vector<sim::Block> rlePalette;
     std::vector<int> rleRuns;
     int rleCells = 0;                      // cells the runs cover
+    // "appearance": the map palette (0xRRGGBB, entry i is palette index i+1)
+    // and run-length paint as [y, z, x0, length, paletteIndex] quintuples.
+    std::vector<uint32_t> appearPalette;
+    std::vector<int> appearRuns;
+    int appearCells = 0;
 };
 
 // Every sim::Block by name, both directions. Painter materials map through
@@ -451,6 +456,34 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
         }
     }
 
+    // appearance (palette first, so each run's index can be checked)
+    {
+        const std::string ap = jsonExtractObjectBody(text, "appearance");
+        if (!ap.empty()) {
+            const std::vector<int> pal = jsonExtractIntArray(ap, "palette");
+            if (pal.size() % 3 != 0 || pal.size() / 3 > 255) {
+                doc.error = "appearance palette must be at most 255 [r, g, b] entries";
+                return false;
+            }
+            for (size_t i = 0; i < pal.size(); i += 3)
+                doc.appearPalette.push_back((uint32_t(pal[i] & 255) << 16) | (uint32_t(pal[i + 1] & 255) << 8) |
+                                            uint32_t(pal[i + 2] & 255));
+            doc.appearRuns = jsonExtractIntArray(ap, "runs");
+            if (doc.appearRuns.size() % 5 != 0) {
+                doc.error = "appearance runs must be [y, z, x0, length, palette] quintuples";
+                return false;
+            }
+            for (size_t r = 0; r < doc.appearRuns.size(); r += 5) {
+                const int len = doc.appearRuns[r + 3], pi = doc.appearRuns[r + 4];
+                if (len <= 0 || pi < 1 || pi > static_cast<int>(doc.appearPalette.size())) {
+                    doc.error = "appearance run " + std::to_string(r / 5) + " is malformed";
+                    return false;
+                }
+                doc.appearCells += len;
+            }
+        }
+    }
+
     restoreCounters(doc, doc.restored);
     doc.ok = true;
     return true;
@@ -475,6 +508,7 @@ inline bool loadMapVox(const std::string& path, Doc& doc) {
 struct StampResult {
     int written = 0;  // cells stamped into the world
     int skipped = 0;  // cells dropped: out of world bounds
+    int painted = 0;  // cells given an appearance (palette colour)
 };
 
 // Stamp a parsed map's voxel grid into a sim::World at origins (ox, oy, oz).
@@ -492,6 +526,11 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
         }
         world.set(wx, wy, wz, v.block);
         ++r.written;
+        // Painter colour -> appearance layer. 0 means "no colour authored".
+        if (v.rgb != 0 && v.block != sim::Block::Air) {
+            world.setAppearance(wx, wy, wz, world.paletteIndexFor(v.rgb));
+            ++r.painted;
+        }
     }
     const auto& runs = doc.rleRuns;
     for (size_t i = 0; i + 4 < runs.size(); i += 5) {
@@ -503,7 +542,53 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
             ++r.written;
         }
     }
+    // Appearance runs index the map's own palette, mapped into the world's.
+    if (!doc.appearPalette.empty()) {
+        std::vector<uint8_t> remap(doc.appearPalette.size() + 1, 0);
+        for (size_t i = 0; i < doc.appearPalette.size(); ++i)
+            remap[i + 1] = world.paletteIndexFor(doc.appearPalette[i]);
+        const auto& ar = doc.appearRuns;
+        for (size_t i = 0; i + 4 < ar.size(); i += 5) {
+            for (int k = 0; k < ar[i + 3]; ++k) {
+                const int wx = ox + ar[i + 2] + k, wy = oy + ar[i], wz = oz + ar[i + 1];
+                if (!sim::World::inBounds(wx, wy, wz)) continue;
+                world.setAppearance(wx, wy, wz, remap[ar[i + 4]]);
+                ++r.painted;
+            }
+        }
+    }
     return r;
+}
+
+// The world's appearance as an "appearance" section body, or "" when nothing
+// is painted. Runs along +X like cells_rle; unpainted cells are not written.
+inline std::string worldAppearanceRle(const sim::World& world) {
+    std::string runs;
+    bool first = true;
+    for (int y = 0; y < sim::kWorldH; ++y)
+        for (int z = 0; z < sim::kWorldD; ++z) {
+            int x = 0;
+            while (x < sim::kWorldW) {
+                const uint8_t a = world.getAppearance(x, y, z);
+                int len = 1;
+                while (x + len < sim::kWorldW && world.getAppearance(x + len, y, z) == a) ++len;
+                if (a != 0) {
+                    runs += first ? "" : ",";
+                    runs += std::to_string(y) + "," + std::to_string(z) + "," + std::to_string(x) + "," +
+                            std::to_string(len) + "," + std::to_string(int(a));
+                    first = false;
+                }
+                x += len;
+            }
+        }
+    if (first) return "";
+    std::string pal;
+    for (size_t i = 1; i < world.palette.size(); ++i) {
+        const uint32_t c = world.palette[i];
+        pal += (i > 1 ? ", [" : "[") + std::to_string((c >> 16) & 255) + ", " +
+               std::to_string((c >> 8) & 255) + ", " + std::to_string(c & 255) + "]";
+    }
+    return "{\"palette\": [" + pal + "], \"runs\": [" + runs + "]}";
 }
 
 // Write a whole world as a run-length map document (the inverse of

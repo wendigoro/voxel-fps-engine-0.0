@@ -53,6 +53,15 @@ struct SentCells {
         if (!inSkirt(lx, ly, lz)) return;
         cells[skirtIndex(lx, ly, lz)].id = static_cast<uint8_t>(b);
     }
+    // Palette index the sim sent for a cell; 0 = the material's own colour.
+    uint8_t appearance(int lx, int ly, int lz) const {
+        if (!inSkirt(lx, ly, lz)) return 0;
+        return cells[skirtIndex(lx, ly, lz)].appear;
+    }
+    void setAppearance(int lx, int ly, int lz, uint8_t a) {
+        if (!inSkirt(lx, ly, lz)) return;
+        cells[skirtIndex(lx, ly, lz)].appear = a;
+    }
 };
 
 // One chunk as the view sees it: the cells it was sent, the mesh built from
@@ -62,6 +71,11 @@ struct ViewChunk {
 
     // Occupancy exactly as sent. The only block data the view may consult.
     SentCells sent;
+
+    // The map palette the cells' appearance indices refer to (owned by the
+    // view, sent once with the map). Null means every cell uses its material
+    // colour.
+    const wire::Palette* palette = nullptr;
 
     // Mesh built purely from `sent`. No view code may look at sim::World here.
     struct Vertex {

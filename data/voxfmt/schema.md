@@ -112,6 +112,16 @@ The engine reads map mode through `src/map_vox.hpp`, which applies the same refu
   Air. Palette names are the painter material names that map to engine blocks, plus three
   engine-only blocks the painter cannot author: `water_current`, `light_bulb` and `moon`.
   An unknown palette name, a non-positive length, or an out-of-range index refuses the map.
+- `lights` are light sources (environment layer), never occupancy: `{"kind": "bulb", "x", "y",
+  "z" (cell units, floats), "color": [r, g, b], "intensity", "radius" (world units)}`. The
+  fixture model drawn for each light comes from `kind`.
+- `environment` holds map-wide sky data: `{"moon_dir": [x, y, z]}`.
+- `light_bulb` and `moon` are refused in `cells_rle` and `voxels`: lights are not occupancy.
+- `appearance` is the appearance layer: `{"palette": [[r, g, b], ...], "runs": [y, z, x0,
+  length, paletteIndex, ...]}` with palette indices starting at 1 (0 means "the material's own
+  colour" and is never written). At most 255 colours. A `voxels` entry's `rgb` also paints its
+  cell. Appearance is display data: it is sent to the view and never read by the simulation, and
+  breaking a cell clears its paint.
 - The painter does not read or write these sections yet.
 - `dims` must equal the engine world size (currently 192×64×160) for an engine map.
 
