@@ -29,6 +29,7 @@
 #include <thread>
 #include <vector>
 
+#include "render_class.hpp"
 #include "view_chunk.hpp"
 
 namespace meshview {
@@ -319,10 +320,11 @@ inline void meshChunk(view::ViewChunk& chunk, Stats& stats) {
                         expose = (nb == wire::BlockId::Air) || isWater(nb);
                     }
                     if (!expose) continue;
-                    float mat = 0.0f;
-                    if (isWater(b)) mat = 1.0f;
-                    else if (b == wire::BlockId::LightBulb) mat = 2.0f;
-                    else if (b == wire::BlockId::Moon) mat = 3.0f;
+                    rc::RenderClass cls = rc::RenderClass::World;
+                    if (isWater(b)) cls = rc::RenderClass::Water;
+                    else if (b == wire::BlockId::LightBulb) cls = rc::RenderClass::Bulb;
+                    else if (b == wire::BlockId::Moon) cls = rc::RenderClass::Moon;
+                    const float mat = rc::attr(cls);
                     emitSmoothedFace(chunk, stats, lx, ly, lz, x, y, z, f, col, mat);
                 }
             }

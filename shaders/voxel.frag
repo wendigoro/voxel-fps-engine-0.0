@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "render_class.glsl"
 layout(location = 0) in vec3 fragNormal;
 layout(location = 1) in vec3 fragColor;
 layout(location = 2) in vec3 fragWorldPos;
@@ -125,25 +127,22 @@ void applyFireOverlay(inout vec3 lit) {
 void main() {
     vec3 n = normalize(fragNormal);
     vec3 base = fragColor;
-    float matId = fragMat;
+    // Render class of this fragment (src/render_class.hpp). Each branch below
+    // tests one class exactly, so their order does not matter. Every branch
+    // except Water returns; Water adjusts the base colour and then takes the
+    // shared World lighting path at the bottom.
+    int rc = renderClass(fragMat);
 
-    // mat 8: world item pickups. These are real world objects, not overlay UI, so
-    // they take the mat-0 lighting path (shadow rays, height AO, vignette) and sit
-    // in the scene instead of floating on top of it. Remapping the id to 0 lets
-    // them fall through every branch below into that shared world path; testing
-    // it here is required because the chain is a descending `matId > N.5` and an
-    // untested mat 8 would be swallowed by the mat-7 lattice branch.
-    if (matId > 7.5) matId = 0.0;
+    // World pickups are real world objects, not overlay UI: they take the World
+    // lighting path (shadow rays, height AO, vignette) and sit in the scene.
+    if (rc == RC_WORLD_PICKUP) rc = RC_WORLD;
 
-    // mat 7: inventory lattice unit cubes (RULES.md rule 12).
-    // Must be tested FIRST of the remaining ids: the chain below is a descending
-    // `matId > N.5` and an
-    // untested mat 7 would fall into the muzzle-flash branch. Deliberately skips
-    // the mat-0 path's world-space shadow rays, world-Y height AO and vignette —
+    // Inventory lattice unit cubes (RULES.md rule 12). Deliberately skips the
+    // World path's world-space shadow rays, world-Y height AO and vignette —
     // none of which mean anything on a lattice parented to the camera. The
-    // vertex stage also skips the fisheye for mat 7, so this is a clean 3D
+    // vertex stage also skips the fisheye for this class, so this is a clean 3D
     // projection. Flat face shading plus a light bitcrush to match the look.
-    if (matId > 6.5) {
+    if (rc == RC_INVENTORY_LATTICE) {
         vec3 key = normalize(vec3(0.42, 0.78, 0.30));
         float ndl = max(dot(n, key), 0.0);
         float fill = 0.42 + 0.58 * max(n.y, 0.0);
@@ -158,8 +157,8 @@ void main() {
         return;
     }
 
-    // mat 6: muzzle flash cubes (emissive, no lighting)
-    if (matId > 5.5) {
+    // Muzzle flash cubes (emissive, no lighting)
+    if (rc == RC_MUZZLE) {
         vec3 glow = base * (1.4 + 0.6 * ubo.muzzleFlash);
         float pulse = 0.85 + 0.15 * sin(ubo.time * 90.0);
         glow *= pulse;
@@ -172,7 +171,7 @@ void main() {
     }
 
     // mat 5: cubic debris chips — lit + emissive lift so sub-voxels read clearly
-    if (matId > 4.5) {
+    if (rc == RC_DEBRIS) {
         float night = smoothstep(0.55, 0.8, ubo.timeOfDay);
         vec3 ambientCol = mix(vec3(0.35, 0.38, 0.42), vec3(0.08, 0.09, 0.11), night);
         float ambient = (0.28 + 0.14 * max(n.y, 0.0)) * ubo.ambientScale;
@@ -193,7 +192,7 @@ void main() {
     }
 
     // mat 4: pixel sky tiles
-    if (matId > 3.5) {
+    if (rc == RC_SKY) {
         vec2 tuv = fragColor.rg;
         float elev = fragColor.b;
         vec2 cell = floor(tuv * 8.0);
@@ -228,7 +227,7 @@ void main() {
     }
 
     // mat 3: moon sprite light source
-    if (matId > 2.5) {
+    if (rc == RC_MOON) {
         vec2 uv = fragColor.rg;
         vec2 p = uv * 2.0 - 1.0;
         float d1 = length(p);
@@ -258,7 +257,7 @@ void main() {
         return;
     }
 
-    if (matId > 1.5) {
+    if (rc == RC_BULB) {
         vec3 glow = vec3(1.0, 0.72, 0.42) * (1.1 + 0.15 * sin(ubo.time * 6.0));
         float r = length(fragNdc);
         glow *= 1.0 - smoothstep(0.6, 1.4, r) * 0.25;
@@ -267,7 +266,7 @@ void main() {
         return;
     }
 
-    if (matId > 0.5) {
+    if (rc == RC_WATER) {
         float tide = sin(fragWorldPos.x * 180.0 + ubo.time * 2.2) *
                      cos(fragWorldPos.z * 160.0 - ubo.time * 1.7);
         float foam = smoothstep(0.55, 0.95, abs(tide));

@@ -87,7 +87,8 @@ collide with an existing id.
 emit the current version; readers refuse a `format_version` **greater** than the version they
 understand.
 
-Map mode currently has no engine consumer: it is an authoring and interchange format only.
+The engine reads map mode through `src/map_vox.hpp`, which applies the same refusals (version,
+`unit`, `voxel_size`, mode) and stamps the voxel grid into authoritative occupancy.
 
 ## Weapon parts (per-voxel `part` field)
 
