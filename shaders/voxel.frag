@@ -10,6 +10,12 @@ layout(location = 5) in float fragViewZ;
 layout(location = 6) flat in vec2 fragTexId;
 layout(location = 7) in float fragShade;
 layout(set = 0, binding = 1) uniform sampler2DArray uTex;
+// Occupancy of the cells this client was sent (1 = opaque). Built by the view
+// from its chunk snapshots, so a hidden cell can never cast a visible shadow.
+layout(set = 0, binding = 2) uniform sampler3D uOcc;
+// Light sources (environment layer): two vec4 per light,
+// (position.xyz, intensity) then (colour.rgb, radius).
+layout(std430, set = 0, binding = 3) readonly buffer LightList { vec4 lights[]; };
 
 layout(set = 0, binding = 0) uniform FrameUBO {
     mat4 viewProj;
@@ -25,14 +31,15 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float fireOverlay;
     float damageFlash;
     float healthTint;
-    vec4 bulbPos[4];
-    vec4 bulbColor[4];
     float fisheyeScale; // visuals menu: lens curve multiplier (1 = original)
     float banding;      // visuals menu: colour-step multiplier (1 = original, 0 = off)
     float uboPad0;
     float uboPad1;
     vec4 texParams[16]; // per texture layer: tileCells, tint, coverage, maskFromLuma
     vec4 texGlobal;     // enabled, strength, scale, unused
+    vec4 occDims;       // occupancy volume W, H, D (cells), shadows enabled
+    vec4 shadowParams;  // max cells crossed, 1, unused, unused
+    vec4 lightInfo;     // light count (storage buffer below), unused x3
 } ubo;
 
 // World colour banding, scaled by the visuals menu. banding = 1 gives the
@@ -86,58 +93,53 @@ float hash21(vec2 p) {
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
 }
 
-float shadowRayDir(vec3 origin, vec3 L, float maxDist, out float edge) {
-    vec3 o = origin + normalize(fragNormal) * 0.0004;
-    float t = 0.0008;
-    float shadow = 1.0;
-    edge = 0.0;
-    float prev = 1.0;
-    for (int i = 0; i < 4; ++i) {
-        vec3 p = o + L * t;
-        float occ = 1.0;
-        if (p.y < 0.0025) occ = 0.12 + t * 8.0;
-        else if (p.y > 0.002 && p.y < 0.006) {
-            if (p.x > 0.01 && p.x < 0.15 && p.z > 0.01 && p.z < 0.12)
-                occ = 0.2 + t * 5.0;
-        }
-        edge = max(edge, abs(prev - occ));
-        prev = occ;
-        shadow = min(shadow, occ);
-        t += 0.0035 + t * 0.18;
-        if (t > maxDist) break;
-        if (shadow < 0.15) break;
+// Trace from just off the surface toward a light through the occupancy volume,
+// visiting every cell the ray crosses (Amanatides & Woo DDA, as the hitscan
+// does). A fixed-step march would slip between cubes that touch only at a
+// corner and leak light through a checkered roof; this cannot. A hit darkens
+// the light, less when the occluder is far (a cheap stand-in for a penumbra).
+// Returns 1 when unshadowed.
+float marchShadow(vec3 origin, vec3 L, float maxDist) {
+    if (ubo.occDims.w < 0.5) return 1.0;
+    const float vs = 0.001;
+    vec3 o = (origin + normalize(fragNormal) * 0.0007) / vs; // in cells
+    vec3 d = L;
+    ivec3 c = ivec3(floor(o));
+    ivec3 stp = ivec3(sign(d));
+    vec3 invAbs = 1.0 / max(abs(d), vec3(1e-6));
+    vec3 next = vec3(c) + max(vec3(stp), vec3(0.0));       // boundary ahead on each axis
+    vec3 tMax = (next - o) / d;
+    tMax = mix(tMax, vec3(1e30), lessThan(abs(d), vec3(1e-6)));
+    vec3 tDelta = invAbs;
+    ivec3 dims = ivec3(ubo.occDims.xyz);
+    float maxCells = maxDist / vs;
+    int budget = int(ubo.shadowParams.x * max(ubo.shadowParams.y, 0.25));
+    float t = 0.0;
+    for (int i = 0; i < 512; ++i) {
+        if (i >= budget || t > maxCells) break;
+        if (all(greaterThanEqual(c, ivec3(0))) && all(lessThan(c, dims)) &&
+            texelFetch(uOcc, c, 0).r > 0.5)
+            return mix(0.08, 0.45, clamp(t / maxCells, 0.0, 1.0));
+        // Step to the nearest boundary.
+        if (tMax.x < tMax.y && tMax.x < tMax.z) { t = tMax.x; tMax.x += tDelta.x; c.x += stp.x; }
+        else if (tMax.y < tMax.z)               { t = tMax.y; tMax.y += tDelta.y; c.y += stp.y; }
+        else                                    { t = tMax.z; tMax.z += tDelta.z; c.z += stp.z; }
     }
-    edge = clamp(edge * 2.5, 0.0, 1.0);
-    return clamp(shadow, 0.08, 1.0);
+    return 1.0;
+}
+
+float shadowRayDir(vec3 origin, vec3 L, float maxDist, out float edge) {
+    edge = 0.0;
+    return marchShadow(origin, L, maxDist);
 }
 
 float shadowRayPoint(vec3 origin, vec3 lightPos, out float edge) {
+    edge = 0.0;
     vec3 toL = lightPos - origin;
     float dist = length(toL);
-    edge = 0.0;
     if (dist < 1e-5) return 1.0;
-    vec3 L = toL / dist;
-    vec3 o = origin + normalize(fragNormal) * 0.00035;
-    float t = 0.0006;
-    float shadow = 1.0;
-    float prev = 1.0;
-    for (int i = 0; i < 3; ++i) {
-        vec3 p = o + L * t;
-        float occ = 1.0;
-        if (p.y < 0.0022) occ = 0.15;
-        else if (p.y > 0.035 && p.y < 0.05) {
-            if (p.x > 0.015 && p.x < 0.145 && p.z > 0.015 && p.z < 0.11)
-                occ = 0.55;
-        }
-        edge = max(edge, abs(prev - occ));
-        prev = occ;
-        shadow = min(shadow, occ);
-        t += 0.0025 + dist * 0.025;
-        if (t >= dist) break;
-        if (shadow < 0.2) break;
-    }
-    edge = clamp(edge * 2.0, 0.0, 1.0);
-    return clamp(shadow, 0.1, 1.0);
+    // Stop a cell short of the light so the fixture itself never shadows it.
+    return marchShadow(origin, toL / dist, max(dist - 0.0015, 0.0));
 }
 
 void applyFireOverlay(inout vec3 lit) {
@@ -344,11 +346,14 @@ void main() {
     vec3 bulbContrib = vec3(0.0);
     float bulbEdge = 0.0;
     vec3 viewDir = normalize(ubo.camPos - fragWorldPos);
-    for (int i = 0; i < 4; ++i) {
-        float inten = ubo.bulbPos[i].w;
+    int lightCount = int(ubo.lightInfo.x);
+    for (int i = 0; i < lightCount; ++i) {
+        vec4 lpi = lights[i * 2];
+        vec4 lcr = lights[i * 2 + 1];
+        float inten = lpi.w;
         if (inten <= 0.001) continue;
-        vec3 lp = ubo.bulbPos[i].xyz;
-        float radius = max(ubo.bulbColor[i].w, 0.01);
+        vec3 lp = lpi.xyz;
+        float radius = max(lcr.w, 0.01);
         vec3 toL = lp - fragWorldPos;
         float dist = length(toL);
         if (dist > radius * 1.2) continue;
@@ -356,18 +361,14 @@ void main() {
         att *= smoothstep(radius, radius * 0.12, dist);
         vec3 Ld = toL / max(dist, 1e-5);
         float nd = max(dot(n, Ld), 0.0);
-        float sh = 1.0;
-        if (i < 2) {
-            float e = 0.0;
-            sh = shadowRayPoint(fragWorldPos, lp, e);
-            bulbEdge = max(bulbEdge, e);
-        }
-        vec3 warm = ubo.bulbColor[i].rgb;
+        // Every light within range is shadowed through the occupancy volume.
+        float e = 0.0;
+        float sh = (nd > 0.0) ? shadowRayPoint(fragWorldPos, lp, e) : 1.0;
+        bulbEdge = max(bulbEdge, e);
+        vec3 warm = lcr.rgb;
         bulbContrib += warm * att * nd * sh;
-        if (i < 2) {
-            vec3 hh = normalize(Ld + viewDir);
-            bulbContrib += warm * pow(max(dot(n, hh), 0.0), 32.0) * att * 0.2 * sh;
-        }
+        vec3 hh = normalize(Ld + viewDir);
+        bulbContrib += warm * pow(max(dot(n, hh), 0.0), 32.0) * att * 0.2 * sh;
     }
 
     // Muzzle as transient point light near camera

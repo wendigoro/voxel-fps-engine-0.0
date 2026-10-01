@@ -21,14 +21,15 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float fireOverlay;
     float damageFlash;
     float healthTint;
-    vec4 bulbPos[4];
-    vec4 bulbColor[4];
     float fisheyeScale; // visuals menu: lens curve multiplier (1 = original)
     float banding;      // visuals menu: colour-step multiplier (1 = original, 0 = off)
     float uboPad0;
     float uboPad1;
     vec4 texParams[16]; // per texture layer: tileCells, tint, coverage, maskFromLuma
     vec4 texGlobal;     // enabled, strength, scale, unused
+    vec4 occDims;       // occupancy volume W, H, D (cells), shadows enabled
+    vec4 shadowParams;  // max cells crossed, 1, unused, unused
+    vec4 lightInfo;     // light count (storage buffer below), unused x3
 } ubo;
 
 layout(location = 0) out vec3 fragNormal;

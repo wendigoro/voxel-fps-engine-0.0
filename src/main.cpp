@@ -191,7 +191,8 @@ static_assert(sizeof(Vertex) == sizeof(view::ViewChunk::Vertex), "vertex layouts
 
 // Fixed light slots in the frame UBO. The shader loops this many, so it is a
 // layout constant, not a tuning knob.
-static constexpr int kMaxBulbs = 4;
+// Light sources go to the shaders through a storage buffer (two vec4 each).
+static constexpr int kMaxLights = 64;
 
 struct FrameUBO {
     float viewProj[16];
@@ -207,14 +208,35 @@ struct FrameUBO {
     float fireOverlay;     // 0..1 frame-border burn
     float damageFlash;     // 0..1 crimson damage intake flash
     float healthTint;      // 0..1 low-health pulsing vignette
-    float bulbPos[kMaxBulbs][4];   // xyz, intensity
-    float bulbColor[kMaxBulbs][4]; // rgb, radius
     float fisheyeScale;            // visuals menu: lens curve multiplier
     float banding;                 // visuals menu: colour-step multiplier
     float uboPad[2];
     float texParams[tex::kMaxLayers][4]; // per layer: tileCells, tint, coverage, maskFromLuma
     float texGlobal[4];            // enabled, strength, scale, unused
+    float occDims[4];              // occupancy volume W, H, D, shadows enabled
+    float shadowParams[4];         // max cells crossed, 1, unused, unused
+    float lightInfo[4];            // light count, unused x3
 };
+
+// Occupancy volume (view side): 1 byte per cell of the whole world, built
+// only from the chunk snapshots this client was sent, and uploaded to a 3D
+// image the shaders march shadows through. Remeshed chunks are re-uploaded,
+// each frame through its own staging buffer.
+static VkImage g_occImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_occMem = VK_NULL_HANDLE;
+static VkImageView g_occView = VK_NULL_HANDLE;
+static VkSampler g_occSampler = VK_NULL_HANDLE;
+static VkBuffer g_occStage[MAX_FRAMES]{};
+static VkDeviceMemory g_occStageMem[MAX_FRAMES]{};
+static void* g_occStageMapped[MAX_FRAMES]{};
+static bool g_occImageReady = false;       // has been transitioned out of UNDEFINED
+static std::vector<uint8_t> g_occCpu;      // the volume as last sent
+static std::vector<int> g_occDirty;        // chunk indices waiting for upload
+static uint64_t g_occChunkUploads = 0;     // telemetry
+// Lights for the shaders, one host-visible buffer per frame in flight.
+static VkBuffer g_lightBuf[MAX_FRAMES]{};
+static VkDeviceMemory g_lightMem[MAX_FRAMES]{};
+static void* g_lightMapped[MAX_FRAMES]{};
 
 // Surface textures (src/textures.hpp): one 2D array image, all mips.
 static VkImage g_texImage = VK_NULL_HANDLE;
@@ -844,10 +866,15 @@ static meshview::Workers* g_meshWorkers = nullptr;
 static int g_meshWorkerHelpers = 0; // telemetry: size of the live pool
 
 // Mesh each touched chunk from its snapshot, then record its size.
+static void noteOccupancy(const ViewChunk& c); // shadow volume (see createOccupancyVolume)
+
 static void buildChunkMeshes(const std::vector<ViewChunk*>& touched) {
     if (g_meshWorkers) g_meshWorkers->meshAll(touched, g_meshStats);
     else for (ViewChunk* c : touched) meshview::meshChunk(*c, g_meshStats);
-    for (ViewChunk* c : touched) c->vertexCount = static_cast<uint32_t>(c->mesh.size());
+    for (ViewChunk* c : touched) {
+        c->vertexCount = static_cast<uint32_t>(c->mesh.size());
+        noteOccupancy(*c);
+    }
 }
 
 // Slot size for a chunk mesh of `verts` vertices. The headroom means ordinary
@@ -2718,9 +2745,119 @@ static void uploadTextures() {
     if (vkCreateSampler(g_device, &sci, nullptr, &g_texSampler) != VK_SUCCESS) fail("texture sampler failed");
 }
 
+static void createOccupancyVolume() {
+    g_occCpu.assign(static_cast<size_t>(WORLD_W) * WORLD_H * WORLD_D, 0);
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_3D;
+    ii.extent = {static_cast<uint32_t>(WORLD_W), static_cast<uint32_t>(WORLD_H), static_cast<uint32_t>(WORLD_D)};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.format = VK_FORMAT_R8_UNORM;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(g_device, &ii, nullptr, &g_occImage) != VK_SUCCESS) fail("occupancy image failed");
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_device, g_occImage, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(g_device, &mai, nullptr, &g_occMem) != VK_SUCCESS) fail("occupancy memory failed");
+    vkBindImageMemory(g_device, g_occImage, g_occMem, 0);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = g_occImage;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    vi.format = VK_FORMAT_R8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(g_device, &vi, nullptr, &g_occView) != VK_SUCCESS) fail("occupancy view failed");
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(g_device, &sci, nullptr, &g_occSampler) != VK_SUCCESS) fail("occupancy sampler failed");
+    for (int i = 0; i < MAX_FRAMES; ++i) {
+        createBuffer(g_occCpu.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_occStage[i], g_occStageMem[i]);
+        vkMapMemory(g_device, g_occStageMem[i], 0, g_occCpu.size(), 0, &g_occStageMapped[i]);
+        createBuffer(sizeof(float) * 8 * kMaxLights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_lightBuf[i], g_lightMem[i]);
+        vkMapMemory(g_device, g_lightMem[i], 0, sizeof(float) * 8 * kMaxLights, 0, &g_lightMapped[i]);
+    }
+}
+
+// Copy a remeshed chunk's sent occupancy into the CPU volume and queue it.
+static void noteOccupancy(const ViewChunk& c) {
+    if (g_occCpu.empty() || !c.hasSnapshot) return;
+    for (int lz = 0; lz < CHUNK_SIZE; ++lz)
+        for (int ly = 0; ly < CHUNK_SIZE; ++ly)
+            for (int lx = 0; lx < CHUNK_SIZE; ++lx) {
+                const wire::BlockId b = c.sent.get(lx, ly, lz);
+                const bool opaque = b != wire::BlockId::Air && b != wire::BlockId::Water &&
+                                    b != wire::BlockId::WaterCurrent;
+                const size_t x = size_t(c.cx * CHUNK_SIZE + lx), y = size_t(c.cy * CHUNK_SIZE + ly),
+                             z = size_t(c.cz * CHUNK_SIZE + lz);
+                g_occCpu[x + size_t(WORLD_W) * (y + size_t(WORLD_H) * z)] = opaque ? 255 : 0;
+            }
+    const int idx = sim::World::chunkIndex(c.cx, c.cy, c.cz);
+    if (std::find(g_occDirty.begin(), g_occDirty.end(), idx) == g_occDirty.end()) g_occDirty.push_back(idx);
+}
+
+// Record the pending chunk uploads into this frame's command buffer, before
+// the world pass. The staging buffer is this frame's own, so a frame still in
+// flight never sees it change.
+static void recordOccupancyUpload(VkCommandBuffer cmd, uint32_t frameIndex) {
+    if (g_occDirty.empty() || !g_occImage) return;
+    uint8_t* stage = static_cast<uint8_t*>(g_occStageMapped[frameIndex]);
+    std::vector<VkBufferImageCopy> regions;
+    for (int idx : g_occDirty) {
+        const int cx = idx % CHUNKS_X, cz = (idx / CHUNKS_X) % CHUNKS_Z, cy = idx / (CHUNKS_X * CHUNKS_Z);
+        const size_t x0 = size_t(cx) * CHUNK_SIZE, y0 = size_t(cy) * CHUNK_SIZE, z0 = size_t(cz) * CHUNK_SIZE;
+        for (int lz = 0; lz < CHUNK_SIZE; ++lz)
+            for (int ly = 0; ly < CHUNK_SIZE; ++ly) {
+                const size_t o = x0 + size_t(WORLD_W) * ((y0 + ly) + size_t(WORLD_H) * (z0 + lz));
+                std::memcpy(stage + o, g_occCpu.data() + o, CHUNK_SIZE);
+            }
+        VkBufferImageCopy r{};
+        r.bufferOffset = x0 + size_t(WORLD_W) * (y0 + size_t(WORLD_H) * z0);
+        r.bufferRowLength = WORLD_W;
+        r.bufferImageHeight = WORLD_H;
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageOffset = {int32_t(x0), int32_t(y0), int32_t(z0)};
+        r.imageExtent = {uint32_t(CHUNK_SIZE), uint32_t(CHUNK_SIZE), uint32_t(CHUNK_SIZE)};
+        regions.push_back(r);
+    }
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = g_occImageReady ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = g_occImageReady ? VK_ACCESS_SHADER_READ_BIT : 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = g_occImage;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // A partial upload must keep the rest, so only the very first upload may
+    // discard (UNDEFINED); it covers every chunk, as all start dirty.
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    vkCmdCopyBufferToImage(cmd, g_occStage[frameIndex], g_occImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           static_cast<uint32_t>(regions.size()), regions.data());
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+    g_occChunkUploads += regions.size();
+    g_occDirty.clear();
+    g_occImageReady = true;
+}
+
 static void createDescriptors() {
     uploadTextures();
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    createOccupancyVolume();
+    VkDescriptorSetLayoutBinding bindings[4]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -2729,9 +2866,15 @@ static void createDescriptors() {
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[2] = bindings[1];
+    bindings[2].binding = 2; // occupancy volume
+    bindings[3].binding = 3; // light list
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 2;
+    lci.bindingCount = 4;
     lci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(g_device, &lci, nullptr, &g_dsl) != VK_SUCCESS)
         fail("descriptor set layout failed");
@@ -2743,10 +2886,11 @@ static void createDescriptors() {
         vkMapMemory(g_device, g_uboMems[i], 0, sizeof(FrameUBO), 0, &g_uboMapped[i]);
     }
 
-    VkDescriptorPoolSize poolSizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAMES}};
+    VkDescriptorPoolSize poolSizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES},
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * MAX_FRAMES},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAMES}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.poolSizeCount = 2;
+    pci.poolSizeCount = 3;
     pci.pPoolSizes = poolSizes;
     pci.maxSets = MAX_FRAMES;
     if (vkCreateDescriptorPool(g_device, &pci, nullptr, &g_descPool) != VK_SUCCESS)
@@ -2778,8 +2922,19 @@ static void createDescriptors() {
         texWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         texWrite.descriptorCount = 1;
         texWrite.pImageInfo = &ti;
-        VkWriteDescriptorSet writes[2] = {write, texWrite};
-        vkUpdateDescriptorSets(g_device, 2, writes, 0, nullptr);
+        VkDescriptorImageInfo oi{g_occSampler, g_occView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet occWrite = texWrite;
+        occWrite.dstBinding = 2;
+        occWrite.pImageInfo = &oi;
+        VkDescriptorBufferInfo li{g_lightBuf[i], 0, sizeof(float) * 8 * kMaxLights};
+        VkWriteDescriptorSet lightWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        lightWrite.dstSet = g_descSets[i];
+        lightWrite.dstBinding = 3;
+        lightWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        lightWrite.descriptorCount = 1;
+        lightWrite.pBufferInfo = &li;
+        VkWriteDescriptorSet writes[4] = {write, texWrite, occWrite, lightWrite};
+        vkUpdateDescriptorSets(g_device, 4, writes, 0, nullptr);
     }
 }
 
@@ -4882,6 +5037,8 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd, &bi);
 
+    recordOccupancyUpload(cmd, frameIndex);
+
     VkClearValue clears[2]{};
     clears[0].color = {{0.03f, 0.035f, 0.05f, 1.0f}}; // night sky
     clears[1].depthStencil = {1.0f, 0};
@@ -5451,18 +5608,23 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
                          ? std::clamp((0.35f - hpFrac) / 0.35f, 0.0f, 1.0f)
                          : (g_health.dead ? 1.0f : 0.0f);
 
-    // Warm bulbs harvested from Block::LightBulb occupancy. Unknown slots are
-    // zeroed so the shader's fixed loop sees intensity 0 and skips them.
-    std::memset(ubo.bulbPos, 0, sizeof(ubo.bulbPos));
-    std::memset(ubo.bulbColor, 0, sizeof(ubo.bulbColor));
-    for (int i = 0; i < kMaxBulbs; ++i) {
-        if (i >= static_cast<int>(g_bulbs.size())) break;
-        const BulbLight& l = g_bulbs[i];
-        ubo.bulbPos[i][0] = l.pos.x; ubo.bulbPos[i][1] = l.pos.y; ubo.bulbPos[i][2] = l.pos.z;
-        ubo.bulbPos[i][3] = l.intensity;
-        ubo.bulbColor[i][0] = l.color.x; ubo.bulbColor[i][1] = l.color.y; ubo.bulbColor[i][2] = l.color.z;
-        ubo.bulbColor[i][3] = l.radius;
+    // Lights from the map (environment layer) into this frame's light buffer.
+    const int lightCount = std::min(static_cast<int>(g_bulbs.size()), kMaxLights);
+    if (g_lightMapped[frameIndex]) {
+        float* dst = static_cast<float*>(g_lightMapped[frameIndex]);
+        for (int i = 0; i < lightCount; ++i) {
+            const BulbLight& l = g_bulbs[i];
+            const float v[8] = {l.pos.x, l.pos.y, l.pos.z, l.intensity, l.color.x, l.color.y, l.color.z, l.radius};
+            std::memcpy(dst + i * 8, v, sizeof(v));
+        }
     }
+    ubo.lightInfo[0] = static_cast<float>(lightCount);
+    ubo.occDims[0] = static_cast<float>(WORLD_W);
+    ubo.occDims[1] = static_cast<float>(WORLD_H);
+    ubo.occDims[2] = static_cast<float>(WORLD_D);
+    ubo.occDims[3] = (g_vis.shadows && g_occImageReady) ? 1.0f : 0.0f;
+    ubo.shadowParams[0] = static_cast<float>(g_vis.shadowSteps);
+    ubo.shadowParams[1] = 1.0f; // cells per budget unit (exact DDA visits every cell)
 
     ubo.fisheyeScale = g_vis.fisheye;
     ubo.banding = g_vis.banding;
@@ -5776,6 +5938,16 @@ static void cleanup() {
     if (g_overlayRenderPass) vkDestroyRenderPass(g_device, g_overlayRenderPass, nullptr);
     if (g_descPool) vkDestroyDescriptorPool(g_device, g_descPool, nullptr);
     if (g_texSampler) vkDestroySampler(g_device, g_texSampler, nullptr);
+    if (g_occSampler) vkDestroySampler(g_device, g_occSampler, nullptr);
+    if (g_occView) vkDestroyImageView(g_device, g_occView, nullptr);
+    if (g_occImage) vkDestroyImage(g_device, g_occImage, nullptr);
+    if (g_occMem) vkFreeMemory(g_device, g_occMem, nullptr);
+    for (int i = 0; i < MAX_FRAMES; ++i) {
+        if (g_occStage[i]) vkDestroyBuffer(g_device, g_occStage[i], nullptr);
+        if (g_occStageMem[i]) vkFreeMemory(g_device, g_occStageMem[i], nullptr);
+        if (g_lightBuf[i]) vkDestroyBuffer(g_device, g_lightBuf[i], nullptr);
+        if (g_lightMem[i]) vkFreeMemory(g_device, g_lightMem[i], nullptr);
+    }
     if (g_texView) vkDestroyImageView(g_device, g_texView, nullptr);
     if (g_texImage) vkDestroyImage(g_device, g_texImage, nullptr);
     if (g_texMem) vkFreeMemory(g_device, g_texMem, nullptr);
@@ -6373,7 +6545,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             if (g_paused) g_tickAccum = 0.0;
 
             int steps = 0;
-            while (g_tickAccum >= TICK_DT && steps < MAX_TICKS_PER_FRAME) {
+            // A smoke/stress run is exactly g_smokeTicks ticks however the
+            // frames fall: without this cap a slow last frame running two
+            // ticks overshot to 601, and the end state (and sim_fingerprint)
+            // depended on frame timing.
+            while (g_tickAccum >= TICK_DT && steps < MAX_TICKS_PER_FRAME &&
+                   !(g_smoke && g_tick >= g_smokeTicks)) {
                 g_tickAccum -= TICK_DT;
                 ++g_tick;
                 g_camPosPrevTick = g_camPos;
@@ -6511,6 +6688,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nbulbs=" << g_bulbs.size()
                 << "\nmap_lights=" << g_mapLights.size()
                 << "\ntextures_loaded=" << g_texLayerCount
+                << "\nocc_chunk_uploads=" << g_occChunkUploads
+                << "\nshadow_volume_ready=" << (g_occImageReady ? 1 : 0)
                 << "\nmax_anisotropy=" << g_maxAnisotropy
                 << "\nfixture_verts=" << g_fixtureVertexCount
                 << "\nwater_touch=" << g_touchingWaterUnits << "/" << g_characterUnitCount
