@@ -181,6 +181,9 @@ struct Settings {
     bool textures = true;
     float textureStrength = 1.0f; // 0 = the flat colour, 1 = fully textured
     float textureScale = 1.0f;    // multiplies every material's tile size
+    // Lighting
+    bool shadows = true;          // occupancy-volume shadows
+    int shadowSteps = 120;        // how many cells a shadow ray may cross
 };
 
 // Declare every parameter. Defaults reproduce the look the engine shipped
@@ -208,6 +211,11 @@ inline void registerEngineParams(Registry& r, Settings& s) {
                "Blend between the flat material colour (0) and the texture (1).");
     r.addFloat("Textures", "texture_scale", "Texture scale", &s.textureScale, 0.25f, 4.0f, 1.0f,
                "Size of one texture repeat. Larger spreads each texture over more cells.");
+
+    r.addBool("Lighting", "shadows", "Shadows", &s.shadows, true,
+              "Shadows traced through the cells you can see (moon and every light).");
+    r.addInt("Lighting", "shadow_steps", "Shadow reach (cells)", &s.shadowSteps, 8, 400, 120,
+             "How many cells a shadow ray may cross before giving up. Longer is slower.");
 
     r.addPreset({"Original", {{"textures", 0.0f}}});
     r.addPreset({"Retro", {{"render_scale", 0.5f}, {"posterize_levels", 16.0f}, {"dither", 0.35f},
