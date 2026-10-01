@@ -177,6 +177,10 @@ struct Settings {
     // World shading
     float banding = 1.0f;     // scales the shader's colour-step quantization; 0 = off
     float fisheye = 1.0f;     // scales the lens curve; 0 = rectilinear
+    // Textures (Surface layer)
+    bool textures = true;
+    float textureStrength = 1.0f; // 0 = the flat colour, 1 = fully textured
+    float textureScale = 1.0f;    // multiplies every material's tile size
 };
 
 // Declare every parameter. Defaults reproduce the look the engine shipped
@@ -198,7 +202,14 @@ inline void registerEngineParams(Registry& r, Settings& s) {
     r.addFloat("World", "fisheye", "Fisheye", &s.fisheye, 0.0f, 1.5f, 1.0f,
                "Lens curve strength. 0 is a plain perspective.");
 
-    r.addPreset({"Original", {}});
+    r.addBool("Textures", "textures", "Textures", &s.textures, true,
+              "Photo textures on world surfaces (CC0, data/textures/manifest.json).");
+    r.addFloat("Textures", "texture_strength", "Texture strength", &s.textureStrength, 0.0f, 1.0f, 1.0f,
+               "Blend between the flat material colour (0) and the texture (1).");
+    r.addFloat("Textures", "texture_scale", "Texture scale", &s.textureScale, 0.25f, 4.0f, 1.0f,
+               "Size of one texture repeat. Larger spreads each texture over more cells.");
+
+    r.addPreset({"Original", {{"textures", 0.0f}}});
     r.addPreset({"Retro", {{"render_scale", 0.5f}, {"posterize_levels", 16.0f}, {"dither", 0.35f},
                            {"crush", 1.15f}}});
     r.addPreset({"Clean", {{"banding", 0.0f}, {"fisheye", 0.35f}, {"upscale_nearest", 0.0f}}});
