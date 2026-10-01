@@ -302,7 +302,14 @@ inline void meshChunk(view::ViewChunk& chunk, Stats& stats) {
                 const wire::BlockId b = sentBlockAt(chunk, stats, lx, ly, lz);
                 if (b == wire::BlockId::Air) continue;
                 const int x = baseX + lx, y = baseY + ly, z = baseZ + lz;
+                // Appearance layer: a painted cell takes its palette colour;
+                // index 0 (or no palette) keeps the material colour.
                 Vec3 col = blockColor(b);
+                const uint8_t ap = chunk.sent.appearance(lx, ly, lz);
+                if (ap != 0 && chunk.palette) {
+                    const wire::PaletteColor& pc = chunk.palette->colors[ap];
+                    col = Vec3(pc.r / 255.0f, pc.g / 255.0f, pc.b / 255.0f);
+                }
 
                 for (int f = 0; f < 6; ++f) {
                     // Read the neighbour out of the skirt. lx+1 == CHUNK_SIZE

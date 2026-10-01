@@ -295,6 +295,18 @@ static int g_dashInvulnBlocks = 0;
 // load-bearing, so keep them with the declarations.
 static sim::World* g_world = nullptr;
 static std::vector<ViewChunk>* g_views = nullptr;
+// The map palette as the view received it (appearance layer). Sent once with
+// the map; every ViewChunk points here.
+static wire::Palette g_viewPalette;
+
+static void sendPalette(const sim::World& world, wire::Palette& out) {
+    out = wire::Palette{};
+    out.used = static_cast<int>(std::min<size_t>(world.palette.size(), wire::kPaletteSize));
+    for (int i = 1; i < out.used; ++i) {
+        const uint32_t c = world.palette[i];
+        out.colors[i] = wire::PaletteColor{uint8_t((c >> 16) & 255), uint8_t((c >> 8) & 255), uint8_t(c & 255)};
+    }
+}
 static std::vector<ProjectileDef> g_projDefs;
 static std::vector<AmmoDef> g_ammoDefs;
 // Live rounds and the last impact belong to the ballistics module's state.
@@ -742,6 +754,7 @@ static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc, bool isVis
         // Anti-cheat: zero out snapshot so client memory contains no hidden world data
         for (auto& cell : vc.sent.cells) {
             cell.id = static_cast<uint8_t>(wire::BlockId::Air);
+            cell.appear = 0;
         }
         vc.hasSnapshot = true;
         return;
@@ -754,6 +767,7 @@ static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc, bool isVis
             for (int lx = -view::kSkirt; lx < CHUNK_SIZE + view::kSkirt; ++lx) {
                 const Block b = world.get(baseX + lx, baseY + ly, baseZ + lz);
                 vc.sent.set(lx, ly, lz, static_cast<wire::BlockId>(static_cast<uint8_t>(b)));
+                vc.sent.setAppearance(lx, ly, lz, world.getAppearance(baseX + lx, baseY + ly, baseZ + lz));
             }
         }
     }
@@ -3747,6 +3761,7 @@ struct MapVoxSmokeReport {
     bool countersRestoredOk = false; // evt==2, npc==2, route==2 on the fixture
     bool materialDropOk = false; // un-representable material is dropped, counted
     bool stampOk = false;        // 1024 cells written, all concrete, no leftovers
+    bool appearanceOk = false;   // painter rgb -> appearance -> wire -> mesh colour
     bool refusalVersionOk = false; // format_version 2 + non-unit docs refuse
     bool refusalUnitOk = false;
     bool refusalVoxelSizeOk = false;
@@ -3886,6 +3901,37 @@ static MapVoxSmokeReport runMapVoxSmoke() {
         const bool allConcrete = (concrete == 1024);
         const bool aboveClear = (w.get(8, 1, 8) == Block::Air && w.get(39, 20, 39) == Block::Air);
         rep.stampOk = sr.written == 1024 && sr.skipped == 0 && allConcrete && aboveClear;
+
+        // Appearance layer. The fixture's painter colour (0x66666B on every
+        // voxel) must become one palette entry painting all 1024 cells.
+        const bool stamped = sr.painted == 1024 && w.palette.size() == 2 &&
+                             w.palette[1] == 0x66666Bu && w.getAppearance(8, 0, 8) == 1;
+        // Breaking a cell takes its paint with it.
+        sim::World broken = w;
+        broken.set(8, 0, 8, Block::Air);
+        const bool breakClears = broken.getAppearance(8, 0, 8) == 0 && broken.getAppearance(9, 0, 8) == 1;
+        // A cell painted pure red must reach the mesh as red, and only via the
+        // palette: the same snapshot meshed without one shows no red at all.
+        w.setAppearance(20, 0, 20, w.paletteIndexFor(0xFF0000u));
+        wire::Palette pal;
+        sendPalette(w, pal);
+        ViewChunk vc;
+        vc.cx = 0; vc.cy = 0; vc.cz = 0;
+        sendChunkSnapshot(w, vc);
+        meshview::Stats st;
+        auto redVerts = [](const ViewChunk& c) {
+            int n = 0;
+            for (const auto& v : c.mesh) n += (v.r > 0.3f && v.g < 0.05f && v.b < 0.05f) ? 1 : 0;
+            return n;
+        };
+        vc.palette = &pal;
+        meshview::meshChunk(vc, st);
+        const int withPalette = redVerts(vc);
+        vc.palette = nullptr;
+        meshview::meshChunk(vc, st);
+        const int withoutPalette = redVerts(vc);
+        rep.appearanceOk = stamped && breakClears && withPalette > 0 && withoutPalette == 0 &&
+                           vc.sent.appearance(20, 0, 20) == w.getAppearance(20, 0, 20);
     }
 
     return rep;
@@ -5307,6 +5353,8 @@ static bool exportMapDocument(const sim::World& world, const std::string& path) 
     std::snprintf(buf, sizeof(buf), "  \"environment\": {\"moon_dir\": [%.4f, %.4f, %.4f]},\n",
                   g_moonDirWorld.x, g_moonDirWorld.y, g_moonDirWorld.z);
     f << buf;
+    const std::string appearance = mapvox::worldAppearanceRle(world);
+    if (!appearance.empty()) f << "  \"appearance\": " << appearance << ",\n";
     f << "  \"cells_rle\": " << mapvox::worldToRle(world) << "\n}\n";
     return static_cast<bool>(f);
 }
@@ -5799,8 +5847,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                 for (int cx = 0; cx < CHUNKS_X; ++cx) {
                     ViewChunk& c = views[sim::World::chunkIndex(cx, cy, cz)];
                     c.cx = cx; c.cy = cy; c.cz = cz;
+                    c.palette = &g_viewPalette;
                 }
         g_views = &views;
+        sendPalette(world, g_viewPalette);
 
         // Load Python-exported projectile + ammo defs (gravity + effects)
         const std::string projCandidates[] = {
@@ -6247,6 +6297,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nmap_counters_restored_ok=" << (g_mapSmoke.countersRestoredOk ? 1 : 0)
                 << "\nmap_material_drop_ok=" << (g_mapSmoke.materialDropOk ? 1 : 0)
                 << "\nmap_stamp_ok=" << (g_mapSmoke.stampOk ? 1 : 0)
+                << "\nmap_appearance_ok=" << (g_mapSmoke.appearanceOk ? 1 : 0)
                 << "\nmap_stamp_written=" << g_mapSmoke.stampWritten
                 << "\nmap_stamp_skipped=" << g_mapSmoke.stampSkipped
                 << "\nmap_refusal_version_ok=" << (g_mapSmoke.refusalVersionOk ? 1 : 0)
@@ -6260,7 +6311,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                      g_mapSmoke.voxels == 1024 && g_mapSmoke.dropped == 0 &&
                      g_mapSmoke.eventFieldOk && g_mapSmoke.npcFieldOk &&
                      g_mapSmoke.routeFieldOk && g_mapSmoke.countersRestoredOk &&
-                     g_mapSmoke.materialDropOk && g_mapSmoke.stampOk &&
+                     g_mapSmoke.materialDropOk && g_mapSmoke.stampOk && g_mapSmoke.appearanceOk &&
                      g_mapSmoke.refusalVersionOk && g_mapSmoke.refusalUnitOk &&
                      g_mapSmoke.refusalVoxelSizeOk)
                         ? 1
@@ -6330,7 +6381,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 g_mapSmoke.dropped != 0 || !g_mapSmoke.eventFieldOk ||
                 !g_mapSmoke.npcFieldOk || !g_mapSmoke.routeFieldOk ||
                 !g_mapSmoke.countersRestoredOk || !g_mapSmoke.materialDropOk ||
-                !g_mapSmoke.stampOk || !g_mapSmoke.refusalVersionOk ||
+                !g_mapSmoke.stampOk || !g_mapSmoke.appearanceOk || !g_mapSmoke.refusalVersionOk ||
                 !g_mapSmoke.refusalUnitOk || !g_mapSmoke.refusalVoxelSizeOk) {
                 cleanup();
                 return 4;

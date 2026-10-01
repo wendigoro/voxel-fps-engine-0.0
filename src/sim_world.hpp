@@ -93,6 +93,10 @@ static constexpr int kFaceOZ[6] = {0, 0, 0, 0, 1, -1};
 struct Chunk {
     int cx = 0, cy = 0, cz = 0;
     std::vector<Block> voxels;  // kChunkSize^3
+    // Appearance (map palette index per cell, 0 = material default). Empty
+    // until something in the chunk is painted. Authored display data: sent to
+    // the view with the snapshot, never read by any simulation rule.
+    std::vector<uint8_t> appear;
 
     // Bumped whenever occupancy changes, including changes that only affect a
     // NEIGHBOUR's exposed faces. The view compares this against the version it
@@ -103,6 +107,9 @@ struct Chunk {
 
 struct World {
     std::vector<Chunk> chunks;
+    // The map palette that Chunk::appear indexes (entry 0 unused). Sent to
+    // the view as-is.
+    std::vector<uint32_t> palette = std::vector<uint32_t>(1, 0); // 0xRRGGBB
 
     void alloc() { chunks.resize(static_cast<size_t>(kChunksX) * kChunksY * kChunksZ); }
     static constexpr int chunkCount() { return kChunksX * kChunksY * kChunksZ; }
@@ -138,7 +145,11 @@ struct World {
     void set(int x, int y, int z, Block b) {
         if (!inBounds(x, y, z)) return;
         Chunk& owner = chunks[chunkIndex(x / kChunkSize, y / kChunkSize, z / kChunkSize)];
-        owner.voxels[localIndex(x % kChunkSize, y % kChunkSize, z % kChunkSize)] = b;
+        const int li = localIndex(x % kChunkSize, y % kChunkSize, z % kChunkSize);
+        owner.voxels[li] = b;
+        // A cell's paint belongs to what was in it: replacing or breaking the
+        // block clears it. Paint is applied after the block (setAppearance).
+        if (!owner.appear.empty()) owner.appear[li] = 0;
         ++owner.version;
         for (int f = 0; f < 6; ++f) {
             const int nx = x + kFaceOX[f], ny = y + kFaceOY[f], nz = z + kFaceOZ[f];
@@ -146,6 +157,48 @@ struct World {
             Chunk& nb = chunks[chunkIndex(nx / kChunkSize, ny / kChunkSize, nz / kChunkSize)];
             ++nb.version;
         }
+    }
+
+    uint8_t getAppearance(int x, int y, int z) const {
+        if (!inBounds(x, y, z)) return 0;
+        const Chunk& c = chunks[chunkIndex(x / kChunkSize, y / kChunkSize, z / kChunkSize)];
+        if (c.appear.empty()) return 0;
+        return c.appear[localIndex(x % kChunkSize, y % kChunkSize, z % kChunkSize)];
+    }
+
+    // Paint a cell (index into `palette`). Only the owning chunk is re-sent:
+    // appearance never changes which faces a neighbour exposes.
+    void setAppearance(int x, int y, int z, uint8_t a) {
+        if (!inBounds(x, y, z)) return;
+        Chunk& c = chunks[chunkIndex(x / kChunkSize, y / kChunkSize, z / kChunkSize)];
+        if (c.appear.empty()) {
+            if (a == 0) return;
+            c.appear.assign(c.voxels.size(), 0);
+        }
+        c.appear[localIndex(x % kChunkSize, y % kChunkSize, z % kChunkSize)] = a;
+        ++c.version;
+    }
+
+    // Palette index for an 0xRRGGBB colour: an exact match, else a new entry,
+    // else (palette full) the nearest existing colour. Deterministic.
+    uint8_t paletteIndexFor(uint32_t rgb) {
+        rgb &= 0xFFFFFFu;
+        for (size_t i = 1; i < palette.size(); ++i)
+            if (palette[i] == rgb) return static_cast<uint8_t>(i);
+        if (palette.size() < 256) {
+            palette.push_back(rgb);
+            return static_cast<uint8_t>(palette.size() - 1);
+        }
+        int best = 1;
+        long bestD = -1;
+        for (size_t i = 1; i < palette.size(); ++i) {
+            const long dr = long((palette[i] >> 16) & 255) - long((rgb >> 16) & 255);
+            const long dg = long((palette[i] >> 8) & 255) - long((rgb >> 8) & 255);
+            const long db = long(palette[i] & 255) - long(rgb & 255);
+            const long d = dr * dr + dg * dg + db * db;
+            if (bestD < 0 || d < bestD) { bestD = d; best = static_cast<int>(i); }
+        }
+        return static_cast<uint8_t>(best);
     }
 
     Block& ref(int x, int y, int z) {
