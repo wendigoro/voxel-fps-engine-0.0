@@ -3,6 +3,46 @@
 Cubic unit occupancy only. `unit` is always 1; `voxel_size` matches engine `0.001`.
 Cell extent on Z always equals X and Y (no non-cubic voxels).
 
+## Format v2 (current)
+
+Every kind of asset (model/prop, character, weapon, item, sky, map) uses the same layers. The
+painter writes v2 and reads v1 and v2; the engine reads both and refuses anything newer.
+`scripts/migrate_voxfmt_v2.py` converts v1 files cell for cell.
+
+```json
+{
+  "format_version": 2, "unit": 1, "voxel_size": 0.001, "mode": "model", "dims": [sx, sy, sz],
+  "anchors": {"pivot": [x, y, z], "feet": [x, y, z]},
+  "appearance": {"palette": [[r, g, b], ...], "runs": [y, z, x0, length, paletteIndex, ...]},
+  "parts_rle": {"palette": ["barrel", ...], "runs": [y, z, x0, length, index, ...]},
+  "cells_rle": {"palette": ["concrete", "wood", ...], "runs": [y, z, x0, length, index, ...]}
+}
+```
+
+- All three layers are runs along +X within a (y, z) row; cells no run covers are Air / unpainted
+  / no part.
+- `cells_rle` names are painter material names. The engine maps them to blocks; a painter-only
+  material (`bush_leaves`, `plexiglass`, `carbon_fiber`, `treated_wood`, `custom`) is dropped and
+  counted, never approximated.
+- `appearance` is paint that differs from the material's own colour; a cell in its material's own
+  colour is not painted. Palette indices start at 1 (0 means "material colour"); at most 255.
+- `anchors` are named cells: `pivot` (bottom centre) on everything, `feet` on characters.
+- The v1 voxel list below is still read, so older files keep working.
+
+### Prefabs
+
+A map may list prefab instances, stamped at load from `data/prefabs/<id>.vox.json` (any v2
+asset) with the asset's local origin at the given cell and `rot` quarter turns about +Y within
+its own footprint. A quarter turn permutes cells and their paint; it never resamples them.
+Prefabs are stamped in list order after the map's own cells, so a later one overwrites an earlier
+one. A missing or invalid prefab refuses the map.
+
+```json
+"prefabs": [{"id": "crate_8", "x": 30, "y": 3, "z": 34, "rot": 1}]
+```
+
+## Format v1 (still read)
+
 ```json
 {
   "format_version": 1,
