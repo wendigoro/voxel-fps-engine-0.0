@@ -312,7 +312,7 @@ public final class SmokeMain {
         Path futureMap = Files.createTempFile("smoke_map_future", ".vox.json");
         try {
             String futureText = Files.readString(mapVox);
-            futureText = futureText.replaceFirst("\"format_version\": 1",
+            futureText = futureText.replaceFirst("\"format_version\": " + VoxIO.FORMAT_VERSION,
                     "\"format_version\": " + (VoxIO.FORMAT_VERSION + 999));
             Files.writeString(futureMap, futureText);
             try {

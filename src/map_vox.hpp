@@ -105,6 +105,17 @@ struct Environment {
     float moonDir[3] = {0.32f, 0.82f, -0.48f}; // direction toward the moon
 };
 
+// A prefab instance on a map: data/prefabs/<id>.vox.json stamped with its
+// local origin at cell (x, y, z), turned `rot` quarter turns about +Y.
+struct PrefabPlacement {
+    std::string id;
+    int x = 0, y = 0, z = 0;
+    int rot = 0;
+};
+
+// Newest document layout this reader understands (schema.md "Format v2").
+static constexpr int kMaxFormatVersion = 2;
+
 struct Voxel {
     int x = 0, y = 0, z = 0;
     sim::Block block = sim::Block::Air; // occupancy stamped into the world
@@ -131,10 +142,13 @@ struct Doc {
     std::vector<LightPlacement> lights;    // "lights" (optional)
     Environment environment;               // "environment" (optional)
     std::vector<PickupPlacement> pickups;  // "pickups" (optional)
+    std::vector<PrefabPlacement> prefabs;  // "prefabs" (optional)
+    std::string mode;                      // "map", "model", "character", ...
     // "cells_rle": run-length occupancy for whole maps. A palette of block
     // names, then runs as flat [y, z, x0, length, paletteIndex] quintuples
     // along +X. Cells not covered by a run are Air.
     std::vector<sim::Block> rlePalette;
+    std::vector<bool> rleDropped;          // palette entry has no engine block (painter-only material)
     std::vector<int> rleRuns;
     int rleCells = 0;                      // cells the runs cover
     // "appearance": the map palette (0xRRGGBB, entry i is palette index i+1)
@@ -219,11 +233,13 @@ inline int jsonInt(const std::string& obj, const char* key) {
 
 // Parse a MAP-mode document from text (pure; the smoke feeds crafted text to
 // prove refusals without touching disk). Fills `doc` and returns doc.ok.
-inline bool parseMapVox(const std::string& text, Doc& doc) {
+// Parse any voxfmt document (v1 or v2). Maps must be mode "map"; prefabs and
+// other assets may be any mode.
+inline bool parseVox(const std::string& text, Doc& doc, bool requireMap) {
     doc = Doc{};
 
     const float formatVersion = jsonExtractFloat(text, "format_version", 1.0f);
-    if (formatVersion > 1.0001f) {
+    if (formatVersion > kMaxFormatVersion + 0.0001f) {
         doc.error = "unsupported format_version " + std::to_string(formatVersion);
         return false;
     }
@@ -235,8 +251,9 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
     doc.voxelSizeOk = std::fabs(jsonExtractFloat(text, "voxel_size", 0.0f) - kVoxelSize) < 1e-9f;
     if (!doc.voxelSizeOk) { doc.error = "voxel_size must be " + std::to_string(kVoxelSize); return false; }
 
-    doc.modeMap = jsonExtractString(text, "mode", "") == "map";
-    if (!doc.modeMap) { doc.error = "mode must be \"map\""; return false; }
+    doc.mode = jsonExtractString(text, "mode", "");
+    doc.modeMap = doc.mode == "map";
+    if (requireMap && !doc.modeMap) { doc.error = "mode must be \"map\""; return false; }
 
     const std::vector<int> dims = jsonExtractIntArray(text, "dims");
     if (dims.size() != 3 || dims[0] <= 0 || dims[1] <= 0 || dims[2] <= 0) {
@@ -402,6 +419,21 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
         }
     }
 
+    // prefabs
+    {
+        const std::string arr = jsonExtractArrayBody(text, "prefabs");
+        size_t pos = 0, s = 0, e = 0;
+        while (jsonxNextObject(arr, pos, s, e)) {
+            const std::string o = arr.substr(s, e - s);
+            PrefabPlacement pf;
+            pf.id = jsonExtractString(o, "id", "");
+            pf.x = jsonInt(o, "x"); pf.y = jsonInt(o, "y"); pf.z = jsonInt(o, "z");
+            pf.rot = jsonInt(o, "rot") & 3;
+            if (!pf.id.empty()) doc.prefabs.push_back(pf);
+            pos = e;
+        }
+    }
+
     // pickups
     {
         const std::string arr = jsonExtractArrayBody(text, "pickups");
@@ -426,12 +458,12 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
             while ((i = pal.find('"', i)) != std::string::npos) {
                 const size_t j = pal.find('"', i + 1);
                 if (j == std::string::npos) break;
+                // A painter-only material (no engine block) is dropped and
+                // counted, as the v1 voxel list does; it is never approximated.
                 sim::Block b = sim::Block::Air;
-                if (!blockFromMaterialName(pal.substr(i + 1, j - i - 1), b)) {
-                    doc.error = "cells_rle palette has an unknown block \"" + pal.substr(i + 1, j - i - 1) + "\"";
-                    return false;
-                }
+                const bool known = blockFromMaterialName(pal.substr(i + 1, j - i - 1), b);
                 doc.rlePalette.push_back(b);
+                doc.rleDropped.push_back(!known);
                 i = j + 1;
             }
             doc.rleRuns = jsonExtractIntArray(rle, "runs");
@@ -445,6 +477,7 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
                     doc.error = "cells_rle run " + std::to_string(r / 5) + " is malformed";
                     return false;
                 }
+                if (doc.rleDropped[pi]) { doc.dropped += len; continue; }
                 const sim::Block rb = doc.rlePalette[pi];
                 if (rb == sim::Block::LightBulb || rb == sim::Block::Moon) {
                     doc.error = std::string("cells_rle run ") + std::to_string(r / 5) + " is \"" +
@@ -489,6 +522,9 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
     return true;
 }
 
+inline bool parseMapVox(const std::string& text, Doc& doc) { return parseVox(text, doc, true); }
+inline bool parseAssetVox(const std::string& text, Doc& doc) { return parseVox(text, doc, false); }
+
 // Load and parse a MAP document from disk. Sets doc.fileFound and doc.ok on the
 // doc. Returns doc.ok (convenience for gating).
 inline bool loadMapVox(const std::string& path, Doc& doc) {
@@ -505,21 +541,49 @@ inline bool loadMapVox(const std::string& path, Doc& doc) {
     return ok;
 }
 
+// Load any voxfmt asset (e.g. a prefab) from disk.
+inline bool loadAssetVox(const std::string& path, Doc& doc) {
+    bool readable = false;
+    const std::string text = jsonReadText(path, &readable);
+    if (!readable) {
+        doc = Doc{};
+        doc.error = "unreadable: " + path;
+        return false;
+    }
+    const bool ok = parseAssetVox(text, doc);
+    doc.fileFound = true;
+    return ok;
+}
+
 struct StampResult {
     int written = 0;  // cells stamped into the world
     int skipped = 0;  // cells dropped: out of world bounds
     int painted = 0;  // cells given an appearance (palette colour)
 };
 
-// Stamp a parsed map's voxel grid into a sim::World at origins (ox, oy, oz).
-// Every cell is a unit cube on the authoritative grid — no rescale, no offset
-// reinterpretation. Cells outside the world are skipped and counted.
-inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy, int oz) {
+// Stamp a parsed document's cells and paint into a sim::World with its local
+// origin at (ox, oy, oz), turned `rot` quarter turns about +Y within its own
+// footprint (dims). Every cell stays a unit cube on the authoritative grid: a
+// quarter turn permutes cells, it never resamples them. Cells outside the
+// world are skipped and counted.
+inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy, int oz, int rot = 0) {
     StampResult r;
+    rot &= 3;
+    // Local (x, z) -> rotated local (x, z) inside the turned footprint.
+    auto place = [&](int lx, int lz, int& rx, int& rz) {
+        switch (rot) {
+        case 1: rx = doc.sz - 1 - lz; rz = lx; break;
+        case 2: rx = doc.sx - 1 - lx; rz = doc.sz - 1 - lz; break;
+        case 3: rx = lz; rz = doc.sx - 1 - lx; break;
+        default: rx = lx; rz = lz; break;
+        }
+    };
     for (const auto& v : doc.voxels) {
-        const int wx = ox + v.x;
+        int rx = 0, rz = 0;
+        place(v.x, v.z, rx, rz);
+        const int wx = ox + rx;
         const int wy = oy + v.y;
-        const int wz = oz + v.z;
+        const int wz = oz + rz;
         if (!sim::World::inBounds(wx, wy, wz)) {
             ++r.skipped;
             continue;
@@ -534,9 +598,12 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
     }
     const auto& runs = doc.rleRuns;
     for (size_t i = 0; i + 4 < runs.size(); i += 5) {
+        if (doc.rleDropped[runs[i + 4]]) continue;
         const sim::Block b = doc.rlePalette[runs[i + 4]];
         for (int k = 0; k < runs[i + 3]; ++k) {
-            const int wx = ox + runs[i + 2] + k, wy = oy + runs[i], wz = oz + runs[i + 1];
+            int rx = 0, rz = 0;
+            place(runs[i + 2] + k, runs[i + 1], rx, rz);
+            const int wx = ox + rx, wy = oy + runs[i], wz = oz + rz;
             if (!sim::World::inBounds(wx, wy, wz)) { ++r.skipped; continue; }
             world.set(wx, wy, wz, b);
             ++r.written;
@@ -550,7 +617,9 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
         const auto& ar = doc.appearRuns;
         for (size_t i = 0; i + 4 < ar.size(); i += 5) {
             for (int k = 0; k < ar[i + 3]; ++k) {
-                const int wx = ox + ar[i + 2] + k, wy = oy + ar[i], wz = oz + ar[i + 1];
+                int rx = 0, rz = 0;
+                place(ar[i + 2] + k, ar[i + 1], rx, rz);
+                const int wx = ox + rx, wy = oy + ar[i], wz = oz + rz;
                 if (!sim::World::inBounds(wx, wy, wz)) continue;
                 world.setAppearance(wx, wy, wz, remap[ar[i + 4]]);
                 ++r.painted;

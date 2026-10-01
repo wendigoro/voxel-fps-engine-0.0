@@ -376,6 +376,7 @@ static std::vector<ProjectileRuntime>& g_projectiles = g_ballistics.projectiles;
 static mapvox::PlayerSpawn g_mapSpawn;
 static std::vector<mapvox::PickupPlacement> g_mapPickups;
 static std::string g_mapPath; // file the world was loaded from (empty = procedural)
+static int g_mapPrefabsStamped = 0;
 
 static int g_activeAmmoIndex = 0; // cycles ammo subtypes for active caliber (R)
 static bool g_meshDirty = false;
@@ -4079,6 +4080,7 @@ struct MapVoxSmokeReport {
     bool materialDropOk = false; // un-representable material is dropped, counted
     bool stampOk = false;        // 1024 cells written, all concrete, no leftovers
     bool appearanceOk = false;   // painter rgb -> appearance -> wire -> mesh colour
+    bool prefabOk = false;       // v2 asset parse + quarter-turn stamp of cells and paint
     bool refusalVersionOk = false; // format_version 2 + non-unit docs refuse
     bool refusalUnitOk = false;
     bool refusalVoxelSizeOk = false;
@@ -4111,7 +4113,7 @@ static MapVoxSmokeReport runMapVoxSmoke() {
     }
     rep.fileFound = anyFound;
 
-    rep.formatOk = (doc.formatVersion == 1);
+    rep.formatOk = (doc.formatVersion == mapvox::kMaxFormatVersion); // the painter writes the current layout
     rep.modeOk = doc.modeMap;
     rep.unitOk = doc.unitOk;
     rep.voxelSizeOk = doc.voxelSizeOk;
@@ -4119,7 +4121,7 @@ static MapVoxSmokeReport runMapVoxSmoke() {
     rep.events = static_cast<int>(doc.events.size());
     rep.npcs = static_cast<int>(doc.npcs.size());
     rep.routes = static_cast<int>(doc.routes.size());
-    rep.voxels = static_cast<int>(doc.voxels.size());
+    rep.voxels = static_cast<int>(doc.voxels.size()) + doc.rleCells; // v1 list or v2 runs
     rep.dropped = doc.dropped;
     rep.docOk = doc.ok;
 
@@ -4171,7 +4173,7 @@ static MapVoxSmokeReport runMapVoxSmoke() {
     {
         mapvox::Doc d;
         rep.refusalVersionOk = !mapvox::parseMapVox(
-            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+            "{\"format_version\":3,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
         rep.refusalUnitOk = !mapvox::parseMapVox(
             "{\"format_version\":1,\"unit\":2,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
         rep.refusalVoxelSizeOk = !mapvox::parseMapVox(
@@ -4219,14 +4221,16 @@ static MapVoxSmokeReport runMapVoxSmoke() {
         const bool aboveClear = (w.get(8, 1, 8) == Block::Air && w.get(39, 20, 39) == Block::Air);
         rep.stampOk = sr.written == 1024 && sr.skipped == 0 && allConcrete && aboveClear;
 
-        // Appearance layer. The fixture's painter colour (0x66666B on every
-        // voxel) must become one palette entry painting all 1024 cells.
-        const bool stamped = sr.painted == 1024 && w.palette.size() == 2 &&
-                             w.palette[1] == 0x66666Bu && w.getAppearance(8, 0, 8) == 1;
+        // Appearance layer. The fixture carries only its material's own colour,
+        // which v2 does not record as paint, so nothing is painted by it.
+        const bool stamped = sr.painted == doc.appearCells && w.getAppearance(8, 0, 8) == 0;
         // Breaking a cell takes its paint with it.
         sim::World broken = w;
         broken.set(8, 0, 8, Block::Air);
-        const bool breakClears = broken.getAppearance(8, 0, 8) == 0 && broken.getAppearance(9, 0, 8) == 1;
+        broken.setAppearance(9, 0, 8, broken.paletteIndexFor(0x123456u));
+        broken.setAppearance(8, 0, 8, broken.paletteIndexFor(0x123456u));
+        broken.set(8, 0, 8, Block::Air);
+        const bool breakClears = broken.getAppearance(8, 0, 8) == 0 && broken.getAppearance(9, 0, 8) != 0;
         // A cell painted pure red must reach the mesh as red, and only via the
         // palette: the same snapshot meshed without one shows no red at all.
         w.setAppearance(20, 0, 20, w.paletteIndexFor(0xFF0000u));
@@ -4249,6 +4253,25 @@ static MapVoxSmokeReport runMapVoxSmoke() {
         const int withoutPalette = redVerts(vc);
         rep.appearanceOk = stamped && breakClears && withPalette > 0 && withoutPalette == 0 &&
                            vc.sent.appearance(20, 0, 20) == w.getAppearance(20, 0, 20);
+
+        // Prefab: a v2 asset (3x1x2 wood L, one cell painted red, plus a
+        // painter-only material that must be dropped) turned a quarter turn.
+        // Local (x, z) -> (sz-1-z, x) with sz = 2, stamped at (60, 5, 60).
+        mapvox::Doc pf;
+        const bool parsed = mapvox::parseAssetVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"model\",\"dims\":[3,1,2],"
+            "\"appearance\":{\"palette\":[[255,0,0]],\"runs\":[0,1,0,1,1]},"
+            "\"cells_rle\":{\"palette\":[\"wood\",\"plexiglass\"],\"runs\":[0,0,0,3,0,0,1,0,1,0,0,1,1,1,1]}}",
+            pf);
+        sim::World pw = makeEmptyWorld();
+        mapvox::stampMapVox(pf, pw, 60, 5, 60, 1);
+        const bool cellsOk = pw.get(61, 5, 60) == Block::Wood && pw.get(61, 5, 61) == Block::Wood &&
+                             pw.get(61, 5, 62) == Block::Wood && pw.get(60, 5, 60) == Block::Wood &&
+                             pw.get(60, 5, 61) == Block::Air;
+        const bool paintOk = pw.getAppearance(60, 5, 60) != 0 &&
+                             pw.palette[pw.getAppearance(60, 5, 60)] == 0xFF0000u &&
+                             pw.getAppearance(61, 5, 60) == 0;
+        rep.prefabOk = parsed && pf.dropped == 1 && pf.rleCells == 4 && cellsOk && paintOk;
     }
 
     return rep;
@@ -5878,7 +5901,8 @@ static bool exportMapDocument(const sim::World& world, const std::string& path) 
     if (!f) return false;
     char buf[256];
     f << "{\n";
-    f << "  \"format_version\": 1,\n  \"unit\": 1,\n  \"voxel_size\": 0.001,\n  \"mode\": \"map\",\n";
+    f << "  \"format_version\": " << mapvox::kMaxFormatVersion
+      << ",\n  \"unit\": 1,\n  \"voxel_size\": 0.001,\n  \"mode\": \"map\",\n";
     f << "  \"dims\": [" << WORLD_W << ", " << WORLD_H << ", " << WORLD_D << "],\n";
     std::snprintf(buf, sizeof(buf),
                   "  \"player_spawn\": {\"x\": %d, \"y\": %d, \"z\": %d, \"yaw\": %.4f, \"pitch\": %.4f},\n",
@@ -6394,6 +6418,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                         fail("map " + path + " does not match the world size");
                     world = makeEmptyWorld();
                     mapvox::stampMapVox(mapDoc, world, 0, 0, 0);
+                    // Prefab instances: data/prefabs/<id>.vox.json, stamped in
+                    // list order (a later prefab overwrites an earlier one).
+                    for (const auto& pf : mapDoc.prefabs) {
+                        mapvox::Doc pd;
+                        bool found = false;
+                        for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                                      g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+                            if (mapvox::loadAssetVox(dir + pf.id + ".vox.json", pd)) { found = true; break; }
+                        }
+                        if (!found) fail("map " + path + ": prefab \"" + pf.id + "\" not found or invalid (" + pd.error + ")");
+                        mapvox::stampMapVox(pd, world, pf.x, pf.y, pf.z, pf.rot);
+                        ++g_mapPrefabsStamped;
+                    }
                     g_mapSpawn = mapDoc.spawn;
                     g_mapPickups = mapDoc.pickups;
                     g_mapLights = mapDoc.lights;
@@ -6632,6 +6669,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nvertex_slots=" << g_vertexCount
                 << "\nsim_fingerprint=" << std::hex << simPrint << std::dec
                 << "\nmap_source=" << (g_mapPath.empty() ? std::string("procedural") : g_mapPath)
+                << "\nmap_prefabs_stamped=" << g_mapPrefabsStamped
                 << "\nmesh_repacks=" << g_meshRepackCount
                 << "\nmesh_relocations=" << g_meshRelocateCount
                 << "\nmesh_touched_avg=" << (g_meshUploadSamples > 0 ? double(g_meshTouchedSum) / g_meshUploadSamples : 0.0)
@@ -6894,6 +6932,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nmap_material_drop_ok=" << (g_mapSmoke.materialDropOk ? 1 : 0)
                 << "\nmap_stamp_ok=" << (g_mapSmoke.stampOk ? 1 : 0)
                 << "\nmap_appearance_ok=" << (g_mapSmoke.appearanceOk ? 1 : 0)
+                << "\nmap_prefab_ok=" << (g_mapSmoke.prefabOk ? 1 : 0)
                 << "\nmap_stamp_written=" << g_mapSmoke.stampWritten
                 << "\nmap_stamp_skipped=" << g_mapSmoke.stampSkipped
                 << "\nmap_refusal_version_ok=" << (g_mapSmoke.refusalVersionOk ? 1 : 0)
@@ -6908,6 +6947,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                      g_mapSmoke.eventFieldOk && g_mapSmoke.npcFieldOk &&
                      g_mapSmoke.routeFieldOk && g_mapSmoke.countersRestoredOk &&
                      g_mapSmoke.materialDropOk && g_mapSmoke.stampOk && g_mapSmoke.appearanceOk &&
+                     g_mapSmoke.prefabOk &&
                      g_mapSmoke.refusalVersionOk && g_mapSmoke.refusalUnitOk &&
                      g_mapSmoke.refusalVoxelSizeOk)
                         ? 1
@@ -6979,7 +7019,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 g_mapSmoke.dropped != 0 || !g_mapSmoke.eventFieldOk ||
                 !g_mapSmoke.npcFieldOk || !g_mapSmoke.routeFieldOk ||
                 !g_mapSmoke.countersRestoredOk || !g_mapSmoke.materialDropOk ||
-                !g_mapSmoke.stampOk || !g_mapSmoke.appearanceOk || !g_mapSmoke.refusalVersionOk ||
+                !g_mapSmoke.stampOk || !g_mapSmoke.appearanceOk || !g_mapSmoke.prefabOk ||
+                !g_mapSmoke.refusalVersionOk ||
                 !g_mapSmoke.refusalUnitOk || !g_mapSmoke.refusalVoxelSizeOk) {
                 cleanup();
                 return 4;
