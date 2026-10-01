@@ -35,6 +35,14 @@
 #include "render_class.hpp"
 #include "post_fx.hpp"
 #include "visual_params.hpp"
+
+// Dear ImGui (third_party/imgui, MIT): the in-engine menu. View only.
+#include "imgui.h"
+#include "backends/imgui_impl_vulkan.h"
+#include "backends/imgui_impl_win32.h"
+// The backend header keeps this behind #if 0 so it need not pull in windows.h.
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam,
+                                                             LPARAM lParam);
 #include "sim_input.hpp"
 #include "movement.hpp"
 #include "ballistics.hpp"
@@ -1076,6 +1084,12 @@ static constexpr int kHudHealthCells = 10;
 static constexpr int kHudHealthCols = 5;
 static constexpr int kHudBreathCells = 5;
 
+// How far overlay cubes sit from the eye, as a multiple of the original 6 mm.
+// Cells are fixed 1 mm cubes, so distance sets their on-screen size: at the
+// original 1x the health block was ~250 px wide (sized while emitUnitCube drew
+// nothing). Every anchor offset scales with it, so positions on screen are kept.
+static constexpr float kOverlayDepthScale = 2.5f;
+
 static uint32_t emitHealthHud(uint32_t wi) {
     if (!g_inventoryMapped) return wi;
     Vec3 fwd = cameraForward();
@@ -1085,8 +1099,9 @@ static uint32_t emitHealthHud(uint32_t wi) {
     const Vec3 up = right.cross(fwd).normalized();
     // Same distance as the lattice so both sit on one visual grid; the HUD is
     // anchored below the panel and to its left.
-    const float dist = 0.006f;
-    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0062f) + right * (0.0009f);
+    const float k = kOverlayDepthScale;
+    const float dist = 0.006f * k;
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0062f * k) + right * (0.0009f * k);
     const float matId = static_cast<float>(kInventoryMatId);
 
     const float frac = g_health.healthFraction();
@@ -1201,10 +1216,11 @@ static void updateInventoryMesh() {
     const Vec3 dFwd = (dFwdY * cp + dUpY * sp).normalized();
     const Vec3 dUp = (dUpY * cp - dFwdY * sp).normalized();
 
-    // Anchor: down and to the right of the eye, ~0.006 out. A 3x3x4 cell block
-    // is 0.003 x 0.003 x 0.004 world units at this distance.
-    const float dist = 0.006f;
-    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f) + right * (0.0046f);
+    // Anchor: down and to the right of the eye. A 3x3x4 cell block is
+    // 0.003 x 0.003 x 0.004 world units; the distance sets its screen size.
+    const float k = kOverlayDepthScale;
+    const float dist = 0.006f * k;
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f * k) + right * (0.0046f * k);
 
     g_invDisplay.origin = origin;
     g_invDisplay.right = dRight;
@@ -1830,12 +1846,17 @@ static void updateMoonSkyTile() {
 // instead of a drag); they still reach the simulation as SimInput::lookDx/Dy.
 static bool g_paused = false;
 static bool g_cursorLocked = false;
+static bool g_uiReady = false;     // ImGui context and backends exist
+static bool g_menuForced = false;  // capture harness: draw the menu without pausing
+static VkRenderPass g_uiRenderPass = VK_NULL_HANDLE;   // menu pass (see initUi)
+static std::vector<VkFramebuffer> g_uiFramebuffers;    // one per swapchain image
+static void createUiFramebuffers();
 
 static void updateWindowTitle() {
     std::string t =
         "Voxel FPS 0.0 — WASD walk | Space jump | Q/E lean | RMB/F fire | X ADS | 1-4 cal | "
         "R ammo | V weapon | B mode | Tab pack";
-    if (g_paused) t += "  —  PAUSED: Esc or click to resume, Shift+Esc quits";
+    if (g_paused) t += "  —  PAUSED: Esc to resume, Shift+Esc quits";
     else if (g_cursorLocked) t += "  —  Esc pause";
     else t += "  —  click to look, Esc pause";
     SetWindowTextA(g_hwnd, t.c_str());
@@ -1882,6 +1903,8 @@ static void setPaused(bool paused) {
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // The menu sees every message first (it tracks the mouse even when closed).
+    if (g_uiReady && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return true;
     switch (msg) {
     case WM_CLOSE:
         g_running = false;
@@ -1987,13 +2010,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == 'F') g_pendingInput.fireHeld = false;
         return 0;
     case WM_LBUTTONDOWN:
-        // A click while paused only resumes; a click while unlocked only locks.
-        // Neither is also read as a look drag or an inventory pick.
-        if (g_paused) {
-            setPaused(false);
-            if (!g_inventoryOpen) setCursorLock(true);
-            return 0;
-        }
+        // While paused, clicks belong to the menu. A click while unlocked only
+        // locks the mouse; it is not also read as a look drag or a pick.
+        if (g_paused) return 0;
         if (!g_cursorLocked && !g_inventoryOpen && !g_smoke) {
             setCursorLock(true);
             return 0;
@@ -4395,6 +4414,7 @@ static void recreateSwapchain() {
     createDepthResources();
     createFramebuffers();
     g_post.createTargets(g_extent, g_vis.renderScale, g_swapViews);
+    if (g_uiRenderPass) createUiFramebuffers();
 }
 
 // ---- frame capture (view-only test harness) ----
@@ -4487,6 +4507,191 @@ static bool writeCapturePpm(const std::string& path) {
         f.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
     }
     return static_cast<bool>(f);
+}
+
+// ---- in-engine menu (Dear ImGui) ----
+// Drawn in its own pass on the swapchain image after the overlay pass, with
+// its own pipeline and no world state bound (RULES.md, "Menus, HUD and other
+// view overlays"). It is the pause menu: Esc opens it, and it holds the
+// visuals panel built from the parameter registry.
+static bool g_uiDrawPending = false; // this frame built draw data to record
+static int g_uiFrames = 0;           // frames that drew the menu (telemetry)
+static std::string g_uiStatus;       // last save/load result, shown in the menu
+
+static void createUiFramebuffers() {
+    for (VkFramebuffer fb : g_uiFramebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
+    g_uiFramebuffers.assign(g_swapViews.size(), VK_NULL_HANDLE);
+    for (size_t i = 0; i < g_swapViews.size(); ++i) {
+        VkFramebufferCreateInfo ci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        ci.renderPass = g_uiRenderPass;
+        ci.attachmentCount = 1;
+        ci.pAttachments = &g_swapViews[i];
+        ci.width = g_extent.width;
+        ci.height = g_extent.height;
+        ci.layers = 1;
+        if (vkCreateFramebuffer(g_device, &ci, nullptr, &g_uiFramebuffers[i]) != VK_SUCCESS)
+            fail("ui framebuffer failed");
+    }
+}
+
+static void initUi() {
+    VkAttachmentDescription color{};
+    color.format = g_swapFormat;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rci.attachmentCount = 1;
+    rci.pAttachments = &color;
+    rci.subpassCount = 1;
+    rci.pSubpasses = &sub;
+    rci.dependencyCount = 1;
+    rci.pDependencies = &dep;
+    if (vkCreateRenderPass(g_device, &rci, nullptr, &g_uiRenderPass) != VK_SUCCESS)
+        fail("ui render pass failed");
+    createUiFramebuffers();
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // window layout is not persisted; settings are
+    ImGui::StyleColorsDark();
+    ImGui_ImplWin32_Init(g_hwnd);
+    ImGui_ImplVulkan_InitInfo ii{};
+    ii.ApiVersion = VK_API_VERSION_1_2;
+    ii.Instance = g_instance;
+    ii.PhysicalDevice = g_phys;
+    ii.Device = g_device;
+    ii.QueueFamily = static_cast<uint32_t>(g_qidx.graphics);
+    ii.Queue = g_graphicsQueue;
+    ii.DescriptorPoolSize = 64; // the backend makes its own pool
+    ii.MinImageCount = 2;
+    ii.ImageCount = static_cast<uint32_t>(std::max<size_t>(2, g_swapImages.size()));
+    ii.PipelineInfoMain.RenderPass = g_uiRenderPass;
+    ii.PipelineInfoMain.Subpass = 0;
+    ii.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    if (!ImGui_ImplVulkan_Init(&ii)) fail("ImGui Vulkan backend init failed");
+    g_uiReady = true;
+}
+
+static void shutdownUi() {
+    if (!g_device) return;
+    if (g_uiReady) {
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        g_uiReady = false;
+    }
+    for (VkFramebuffer fb : g_uiFramebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
+    g_uiFramebuffers.clear();
+    if (g_uiRenderPass) vkDestroyRenderPass(g_device, g_uiRenderPass, nullptr);
+    g_uiRenderPass = VK_NULL_HANDLE;
+}
+
+// One widget per registered parameter, grouped in declaration order. A new
+// effect appears here by registering its parameters; nothing below changes.
+static void drawVisualsPanel() {
+    const std::string settingsPath = g_exeDir + "\\visual_settings.json";
+    ImGui::TextUnformatted("Presets");
+    for (const auto& pr : g_visReg.presets()) {
+        if (ImGui::Button(pr.name)) g_visReg.applyPreset(pr.name);
+        ImGui::SameLine();
+    }
+    if (ImGui::Button("Defaults")) g_visReg.resetDefaults();
+    if (ImGui::Button("Save")) {
+        std::ofstream f(settingsPath, std::ios::binary);
+        f << g_visReg.toJson();
+        g_uiStatus = f ? "Saved " + settingsPath : "Could not write " + settingsPath;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load")) {
+        bool readable = false;
+        const std::string text = jsonReadText(settingsPath, &readable);
+        g_uiStatus = readable ? "Loaded " + std::to_string(g_visReg.fromJson(text)) + " settings"
+                              : "No saved settings yet";
+    }
+    if (!g_uiStatus.empty()) ImGui::TextDisabled("%s", g_uiStatus.c_str());
+
+    std::vector<std::string> groups;
+    for (const auto& p : g_visReg.params())
+        if (std::find(groups.begin(), groups.end(), p.group) == groups.end()) groups.push_back(p.group);
+    for (const std::string& g : groups) {
+        if (!ImGui::CollapsingHeader(g.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) continue;
+        for (auto& p : g_visReg.params()) {
+            if (g != p.group) continue;
+            bool changed = false;
+            switch (p.type) {
+            case vis::ParamType::Float:
+                changed = ImGui::SliderFloat(p.label, p.f, p.minV, p.maxV, "%.2f");
+                break;
+            case vis::ParamType::Int:
+                changed = ImGui::SliderInt(p.label, p.i, static_cast<int>(p.minV), static_cast<int>(p.maxV));
+                break;
+            case vis::ParamType::Bool:
+                changed = ImGui::Checkbox(p.label, p.b);
+                break;
+            }
+            if (p.help && *p.help && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.help);
+            if (changed) {
+                p.set(p.get()); // re-clamp (Ctrl+click lets a slider be typed past its range)
+                g_visReg.touch();
+            }
+        }
+    }
+}
+
+// Build this frame's menu, if it is showing. Recorded later in the UI pass.
+static void buildUiFrame() {
+    g_uiDrawPending = false;
+    if (!g_uiReady || !(g_paused || g_menuForced)) return;
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Always);
+    ImGui::Begin("Paused", nullptr,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoSavedSettings);
+    if (ImGui::Button("Resume")) setPaused(false);
+    ImGui::SameLine();
+    if (ImGui::Button("Quit")) {
+        g_running = false;
+        PostQuitMessage(0);
+    }
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) drawVisualsPanel();
+    ImGui::End();
+    ImGui::Render();
+    g_uiDrawPending = true;
+}
+
+static void recordUiPass(VkCommandBuffer cmd, uint32_t imageIndex) {
+    if (!g_uiDrawPending) return;
+    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp.renderPass = g_uiRenderPass;
+    rp.framebuffer = g_uiFramebuffers[imageIndex];
+    rp.renderArea.extent = g_extent;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+    vkCmdEndRenderPass(cmd);
+    ++g_uiFrames;
 }
 
 static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
@@ -4626,6 +4831,8 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         vkCmdDraw(cmd, g_inventoryVertexCount, 1, 0, 0);
         vkCmdEndRenderPass(cmd);
     }
+
+    recordUiPass(cmd, imageIndex);
 
     if (g_captureThisFrame && g_captureBuf) recordCaptureCopy(cmd, imageIndex);
 
@@ -5213,6 +5420,7 @@ static void drawFrame(float timeSec) {
         updateInventoryMesh();
         drainInventoryInput();
     }
+    buildUiFrame();
     {
         ScopedSection s(SEC_RECORD);
         recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
@@ -5252,12 +5460,13 @@ static void drawFrame(float timeSec) {
 // harness posing a view, and nothing is simulated afterwards.
 // Extras stage view content a shot needs so every render class is on camera:
 // the inventory overlay, and a burst of debris chips plus a muzzle flash.
-enum CaptureExtras : int { kShotPlain = 0, kShotInventory = 1, kShotEffects = 2, kShotDebris = 4 };
+enum CaptureExtras : int { kShotPlain = 0, kShotInventory = 1, kShotEffects = 2, kShotDebris = 4, kShotMenu = 8 };
 struct CaptureShot {
     const char* name;
     float cx, cy, cz; // eye position, in cells
     float yaw, pitch;
     int extras;
+    const char* preset = nullptr; // visuals preset for this shot (defaults restored after)
 };
 static const CaptureShot kCaptureShots[] = {
     {"bay_inward",      96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotPlain},
@@ -5267,6 +5476,9 @@ static const CaptureShot kCaptureShots[] = {
     {"inventory_open",  96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotInventory},
     {"effects_crate",   34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotEffects},
     {"debris_crate",    34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotDebris},
+    {"pause_menu",      96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotMenu},
+    {"preset_retro",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Retro"},
+    {"preset_clean",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Clean"},
 };
 
 static int runCaptureShots(float timeSec) {
@@ -5278,6 +5490,8 @@ static int runCaptureShots(float timeSec) {
         g_yaw = shot.yaw;
         g_pitch = shot.pitch;
         g_inventoryOpen = (shot.extras & kShotInventory) != 0;
+        g_menuForced = (shot.extras & kShotMenu) != 0;
+        if (shot.preset) g_visReg.applyPreset(shot.preset);
         if (shot.extras & (kShotEffects | kShotDebris)) {
             // Chips thrown off the top edge of the first crate (see
             // data/maps/warehouse_v1). The sim is not ticking, so they hold still.
@@ -5301,6 +5515,8 @@ static int runCaptureShots(float timeSec) {
         g_captureThisFrame = false;
         g_inventoryOpen = false;
         g_muzzleFlash = 0.0f;
+        g_menuForced = false;
+        if (shot.preset) g_visReg.resetDefaults();
     }
     g_captureActive = false;
     return written;
@@ -5350,6 +5566,7 @@ static bool exportMapDocument(const sim::World& world, const std::string& path) 
 
 static void cleanup() {
     if (g_device) vkDeviceWaitIdle(g_device);
+    shutdownUi();
     if (g_fixtureVB) {
         vkUnmapMemory(g_device, g_fixtureMem);
         vkDestroyBuffer(g_device, g_fixtureVB, nullptr);
@@ -5794,6 +6011,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             return 1;
         }
         createSync();
+        initUi();
 
         // The world comes from data/maps/warehouse_v1.map.vox.json (exported
         // from the old procedural builder, with fingerprint parity, then the
@@ -5954,7 +6172,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     g_smokePauseTick = g_tick;
                 }
                 if (g_paused && ++g_smokePausedFrames >= 30) {
-                    g_smokePauseFrozenOk = (g_tick == g_smokePauseTick);
+                    // Ticks frozen, and the pause menu drew while paused.
+                    g_smokePauseFrozenOk = (g_tick == g_smokePauseTick) && g_uiFrames > 0;
                     setPaused(false);
                     g_smokePauseDone = true;
                 }
@@ -6275,6 +6494,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\npause_probe_done=" << (g_smokePauseDone ? 1 : 0)
                 << "\npause_frames=" << g_smokePausedFrames
                 << "\npause_ticks_frozen_ok=" << (g_smokePauseFrozenOk ? 1 : 0)
+                << "\nmenu_frames=" << g_uiFrames
                 << "\neye_interp_ok=" << (eyeInterpOk ? 1 : 0)
                 << "\ncapture_shots=" << captureShots
                 << "\nmesh_workers_equiv_ok=" << (g_simViewSmoke.meshWorkersEquivOk ? 1 : 0)
