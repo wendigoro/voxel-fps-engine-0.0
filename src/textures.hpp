@@ -85,6 +85,13 @@ inline const Blend* blendFor(wire::BlockId b) {
     static const Blend kWood{"wood", 64.0f, 0.6f, 1.0f, 0.0f};
     static const Blend kWoodDark{"wood_dark", 64.0f, 0.6f, 1.0f, 0.0f};
     static const Blend kDirt{"dirt", 80.0f, 0.4f, 1.0f, 0.0f};
+    // Ground blends. tileCells is world-space triplanar repeats per cell, so a
+    // ground tile is deliberately large: the point is to break up one 1 mm cube,
+    // not to show a 1 mm photograph.
+    static const Blend kSand{"sand", 120.0f, 0.5f, 1.0f, 0.0f};
+    static const Blend kGrass{"grass", 96.0f, 0.5f, 1.0f, 0.0f};
+    static const Blend kSnow{"snow", 110.0f, 0.4f, 1.0f, 0.0f};
+    static const Blend kAsphalt{"asphalt", 72.0f, 0.5f, 1.0f, 0.0f};
     switch (b) {
     case wire::BlockId::Concrete: return &kConcrete;
     case wire::BlockId::SheetMetal: return &kSheet;
@@ -92,6 +99,10 @@ inline const Blend* blendFor(wire::BlockId b) {
     case wire::BlockId::Wood: return &kWood;
     case wire::BlockId::WoodDark: return &kWoodDark;
     case wire::BlockId::Dirt: return &kDirt;
+    case wire::BlockId::Sand: return &kSand;
+    case wire::BlockId::Grass: return &kGrass;
+    case wire::BlockId::Snow: return &kSnow;
+    case wire::BlockId::Asphalt: return &kAsphalt;
     default: return nullptr;
     }
 }

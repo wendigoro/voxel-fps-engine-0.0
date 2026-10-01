@@ -142,6 +142,16 @@ Splitting simulation systems across machines is a planned goal, so the simulatio
 - Keep the tick shaped as repeated single-step calls (`for (n = 0; n < steps; ++n) simulateOnce(TICK_DT);`) so replay, rollback, and migration stay possible.
 - Determinism is far cheaper to preserve now than to retrofit. Do not introduce a source of nondeterminism "just for this one case".
 
+### Generated terrain (mandatory)
+
+World terrain may be generated at load time from a map's `terrain` section (`src/terrain.hpp`). When it is:
+
+- **The seed lives in the file.** A map with a `terrain` section and no `seed` is refused. The generator substitutes no clock, no RNG and no hash of anything else for it, so the same map and seed produce the same world on every machine.
+- **Everything is integer.** Hashes, noise, heights, tilings and property placement use integer arithmetic only — no float interpolation and no iteration-order dependence — so two machines cannot disagree through rounding.
+- **The generator fills, never clears.** It writes only `Air` cells, so generated ground lands around hand-authored structure instead of demolishing it. A road meeting high ground is raised onto an embankment, not cut through it. This holds for the road and decoration prefabs as well as the height field: a generated prefab declines an occupied cell, and the engine's gate proves it would otherwise have taken it.
+- **Generated cells are ordinary occupancy.** Every cell stays a 1 mm unit cube on the authoritative grid, so a terrain cell is no exception to the cubic-unit rule, and the mesher, physics, destruction and the sim fingerprint treat it like any other cell.
+- **A generated road's surface is its level.** A road tile is a base course plus the drivable surface, stamped one cell below the network's level. This is a contract between `terrain::kRoadLayers`, `scripts/build_terrain_prefabs.py` and the engine's altitude gate, and it is enforced where it can actually bite: the load path measures every road prefab and refuses one that is not exactly `kRoadLayers` tall, because a tile authored at the wrong height leaves an air gap under the road, and a check that only asks which sides a tile reaches will not see it. The gate proves the same thing over the generated network, but a gate only runs when someone runs it — a stale prefab loads every time, so the refusal belongs on the load path.
+
 ### When adding content
 
 - **Map piece** → write unit voxels into chunk storage; remesh dirty chunks.
@@ -150,6 +160,8 @@ Splitting simulation systems across machines is a planned goal, so the simulatio
 - **Painted asset** → save via painter voxfmt (unit cubes); optional crushed PNG is preview only.
 - **Inventory item** → author in painter `Mode.ITEM` and export `*.item.json` into `data/items/`; the footprint is the painted cells' tight box (rule 14).
 - **Map / map entities** → author in painter `Mode.MAP`. The grid is ordinary unit-cubic voxels and entity coordinates are integer cell coordinates on that same grid, so they rescale with `VOXEL_SIZE` alone. Entity ids are assigned per document in authoring order, never from a clock or RNG, so identical authoring order always yields identical ids. Schema: `data/voxfmt/schema.md`. Authoring and interchange only until an engine consumer exists.
+- **Terrain / road / decoration prefab** → do not hand-author. `scripts/build_terrain_prefabs.py` generates `data/prefabs/road_*.vox.json` and `prop_*.vox.json` from the same side-mask vocabulary `src/terrain.hpp` uses, and the engine's terrain gate reads each tile back off the grid to check it presents the sides its kind claims and sits at the right height. Adding a road kind means updating both, and the gate is what catches a disagreement.
+- **Terrain demo map** → `python scripts/build_terrain_map.py --class valley --seed N`, then `voxel_engine.exe --map <path>`. The seed is a literal argument, never a clock.
 
 ## Launcher contract
 
@@ -158,13 +170,14 @@ Use repo scripts so paths stay consistent:
 | Script | Purpose |
 |--------|---------|
 | `launch.ps1` | Root entry → `scripts/launch_dev.ps1` (also legacy `-Build`/`-Run`/`-SmokeOnly`) |
-| `scripts/launch_dev.ps1` | Dev menu / `-Action Build\|Painter\|Engine\|SmokeEngine\|SmokePainter\|SmokeAll\|Ui\|Help` |
+| `scripts/launch_dev.ps1` | Dev menu / `-Action Build\|Painter\|Engine\|SmokeEngine\|SmokePainter\|SmokeAll\|Stress\|Terrain\|Ui\|Help` |
 | `scripts/build.ps1` | Export Python defs + compile engine |
 | `scripts/build_painter.ps1` | Compile Java painter + run `voxel.painter.SmokeMain` |
 | `scripts/smoke_painter.ps1` | Painter smoke wrapper → `build_painter.ps1` |
 | `scripts/run_painter_ui.ps1` | Build painter then launch `voxel.painter.ui.PainterApp` |
 | `scripts/run.ps1` | Launch interactive engine |
 | `scripts/demo.ps1` | Full demo: export, build, smoke test, optional interactive |
+| `scripts/check_terrain.ps1` | Terrain gate: every chunk class generates, round-trips and stays seed-sensitive |
 
 Working directory for the engine executable is always `build/` so `projectiles.json` and shaders resolve next to the binary.
 

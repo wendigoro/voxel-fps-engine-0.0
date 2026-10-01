@@ -49,6 +49,12 @@ enum class BlockId : uint8_t {
     WaterCurrent = 8, // moving water source (same visual, current sampling)
     Moon = 9,         // cool emissive crescent grid
     LightBulb = 10,   // warm emissive indoor bulbs
+    // Ground materials. Appended for generated terrain (src/terrain.hpp) and
+    // painted ground; all solid, all unit cubes like every other block.
+    Sand = 11,
+    Grass = 12,
+    Snow = 13,
+    Asphalt = 14,
 };
 
 // 1 cell of padding on every side, so a view can decide whether a face on its

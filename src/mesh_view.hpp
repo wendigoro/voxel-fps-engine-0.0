@@ -93,6 +93,10 @@ inline Vec3 blockColor(wire::BlockId b) {
     case wire::BlockId::WaterCurrent: return {0.10f, 0.35f, 0.48f};
     case wire::BlockId::Moon:         return {0.75f, 0.80f, 0.90f};
     case wire::BlockId::LightBulb:    return {1.00f, 0.75f, 0.45f};
+    case wire::BlockId::Sand:         return {0.76f, 0.68f, 0.48f};
+    case wire::BlockId::Grass:        return {0.24f, 0.42f, 0.16f};
+    case wire::BlockId::Snow:         return {0.86f, 0.89f, 0.93f};
+    case wire::BlockId::Asphalt:      return {0.20f, 0.20f, 0.22f};
     default:                          return {1, 0, 1};
     }
 }
