@@ -77,12 +77,20 @@ struct ViewChunk {
     // colour.
     const wire::Palette* palette = nullptr;
 
+    // Block id -> texture layer + 1 (0 = untextured), owned by the view and
+    // resolved against the loaded texture set (src/textures.hpp). Null means
+    // no textures.
+    const uint8_t* texLayerPlus1 = nullptr;
+
     // Mesh built purely from `sent`. No view code may look at sim::World here.
     struct Vertex {
         float x = 0, y = 0, z = 0;
         float nx = 0, ny = 0, nz = 0;
         float r = 0, g = 0, b = 0;
         float mat = 0;
+        float texLayer = 0;  // texture layer + 1; 0 = untextured
+        float painted = 0;   // 1 when the cell has an appearance (palette) colour
+        float shade = 1;     // face shade x corner AO already folded into r,g,b
     };
     std::vector<Vertex> mesh;
 

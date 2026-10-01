@@ -155,7 +155,8 @@ inline void emitSharpFace(std::vector<view::ViewChunk::Vertex>& out, int ix, int
 inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
                              int lx, int ly, int lz,
                              int gx, int gy, int gz, int face,
-                             const Vec3& color, float mat = 0.0f) {
+                             const Vec3& color, float mat = 0.0f,
+                             float texLayerPlus1 = 0.0f, float painted = 0.0f) {
     static const float F[6][4][3] = {
         {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
         {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
@@ -184,6 +185,7 @@ inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
     int aoVal[4] = {3, 3, 3, 3};
     Vec3 cornerNorm[4];
     Vec3 cornerCol[4];
+    float cornerShade[4];
 
     for (int k = 0; k < 4; ++k) {
         const float* p = F[face][k];
@@ -218,7 +220,8 @@ inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
             aoVal[k] = 3;
         }
         const float aoFactor = kAoCurve[aoVal[k]];
-        cornerCol[k] = color * faceShade[face] * aoFactor;
+        cornerShade[k] = faceShade[face] * aoFactor;
+        cornerCol[k] = color * cornerShade[k];
 
         // Vertex normal smoothing: inspect 8 cubes around vertex in 1-cell skirt
         if (mat == 0.0f) {
@@ -275,7 +278,7 @@ inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
             oz + p[2] * kVoxelSize,
             cornerNorm[ci].x, cornerNorm[ci].y, cornerNorm[ci].z,
             cornerCol[ci].x, cornerCol[ci].y, cornerCol[ci].z,
-            mat
+            mat, texLayerPlus1, painted, cornerShade[ci]
         });
     }
 }
@@ -332,7 +335,9 @@ inline void meshChunk(view::ViewChunk& chunk, Stats& stats) {
                     else if (b == wire::BlockId::LightBulb) cls = rc::RenderClass::Bulb;
                     else if (b == wire::BlockId::Moon) cls = rc::RenderClass::Moon;
                     const float mat = rc::attr(cls);
-                    emitSmoothedFace(chunk, stats, lx, ly, lz, x, y, z, f, col, mat);
+                    const float texId = chunk.texLayerPlus1 ? float(chunk.texLayerPlus1[uint8_t(b)]) : 0.0f;
+                    emitSmoothedFace(chunk, stats, lx, ly, lz, x, y, z, f, col, mat, texId,
+                                     ap != 0 ? 1.0f : 0.0f);
                 }
             }
         }

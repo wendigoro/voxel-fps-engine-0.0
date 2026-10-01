@@ -5,6 +5,7 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec3 inColor;
 layout(location = 3) in float inMat;
+layout(location = 4) in vec3 inTex; // texture layer + 1, painted, shade
 
 layout(set = 0, binding = 0) uniform FrameUBO {
     mat4 viewProj;
@@ -26,6 +27,8 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float banding;      // visuals menu: colour-step multiplier (1 = original, 0 = off)
     float uboPad0;
     float uboPad1;
+    vec4 texParams[16]; // per texture layer: tileCells, tint, coverage, maskFromLuma
+    vec4 texGlobal;     // enabled, strength, scale, unused
 } ubo;
 
 layout(location = 0) out vec3 fragNormal;
@@ -34,6 +37,8 @@ layout(location = 2) out vec3 fragWorldPos;
 layout(location = 3) out float fragMat;
 layout(location = 4) out vec2 fragNdc;
 layout(location = 5) out float fragViewZ;
+layout(location = 6) flat out vec2 fragTexId; // texture layer + 1, painted
+layout(location = 7) out float fragShade;
 
 void main() {
     int rc = renderClass(inMat);
@@ -46,6 +51,8 @@ void main() {
     fragNormal = inNormal;
     fragColor = inColor;
     fragMat = inMat;
+    fragTexId = inTex.xy;
+    fragShade = inTex.z;
 
     vec4 clip = ubo.viewProj * vec4(pos, 1.0);
     float wclip = max(abs(clip.w), 1e-5);

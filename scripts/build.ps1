@@ -26,6 +26,10 @@ if ($LASTEXITCODE -ne 0) { throw "check_constants.py failed: $LASTEXITCODE" }
 Write-Host "== export projectiles/materials (Python) ==" -ForegroundColor Cyan
 & python (Join-Path $Root "python\export_projectiles.py")
 if ($LASTEXITCODE -ne 0) { throw "export_projectiles.py failed: $LASTEXITCODE" }
+# Textures: licence/provenance check (CC0, photographic, every file listed)
+# and packing into build/textures.bin. A failed check fails the build.
+& python (Join-Path $Root "scripts\build_textures.py")
+if ($LASTEXITCODE -ne 0) { throw "build_textures.py failed: $LASTEXITCODE" }
 
 Write-Host "== compile shaders ==" -ForegroundColor Cyan
 $glslc = Join-Path $VK "Bin\glslc.exe"

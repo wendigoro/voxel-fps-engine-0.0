@@ -7,6 +7,9 @@ layout(location = 2) in vec3 fragWorldPos;
 layout(location = 3) in float fragMat;
 layout(location = 4) in vec2 fragNdc;
 layout(location = 5) in float fragViewZ;
+layout(location = 6) flat in vec2 fragTexId;
+layout(location = 7) in float fragShade;
+layout(set = 0, binding = 1) uniform sampler2DArray uTex;
 
 layout(set = 0, binding = 0) uniform FrameUBO {
     mat4 viewProj;
@@ -28,10 +31,49 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float banding;      // visuals menu: colour-step multiplier (1 = original, 0 = off)
     float uboPad0;
     float uboPad1;
+    vec4 texParams[16]; // per texture layer: tileCells, tint, coverage, maskFromLuma
+    vec4 texGlobal;     // enabled, strength, scale, unused
 } ubo;
 
 // World colour banding, scaled by the visuals menu. banding = 1 gives the
 // original steps exactly; 0 turns stepping off; higher is coarser.
+// Triplanar sample of one texture layer in world space: a tile spans
+// `tileWorld` units, so a texture covers many unit cells rather than repeating
+// per cube.
+vec3 triplanar(int layer, vec3 p, vec3 n, float tileWorld) {
+    vec3 w = pow(abs(n), vec3(4.0));
+    w /= (w.x + w.y + w.z + 1e-5);
+    vec3 cx = texture(uTex, vec3(p.zy / tileWorld, float(layer))).rgb;
+    vec3 cy = texture(uTex, vec3(p.xz / tileWorld, float(layer))).rgb;
+    vec3 cz = texture(uTex, vec3(p.xy / tileWorld, float(layer))).rgb;
+    return cx * w.x + cy * w.y + cz * w.z;
+}
+
+// Surface colour for a textured world cell (src/textures.hpp, "Blending").
+// `shadedBase` is the mesh colour, already multiplied by face shade and AO
+// (fragShade); the texture replaces/blends the unshaded colour and the shade
+// is applied again on top.
+vec3 texturedBase(vec3 shadedBase) {
+    if (fragTexId.x < 0.5 || ubo.texGlobal.x < 0.5) return shadedBase;
+    int layer = int(fragTexId.x + 0.5) - 1;
+    vec4 prm = ubo.texParams[layer];
+    float tileWorld = max(prm.x * 0.001 * ubo.texGlobal.z, 1e-4);
+    vec3 t = triplanar(layer, fragWorldPos, normalize(fragNormal), tileWorld);
+    float shade = max(fragShade, 1e-3);
+    vec3 surface = t;
+    if (fragTexId.y > 0.5) {
+        vec3 paint = shadedBase / shade;
+        // Filter: the texture pulled toward the paint (x2 so mid grey is neutral).
+        vec3 filtered = mix(t, clamp(t * paint * 2.0, 0.0, 1.0), prm.y);
+        // Base: the paint shows through where the texture does not cover it;
+        // with maskFromLuma, the texture's bright patches reveal the paint.
+        float luma = dot(t, vec3(0.299, 0.587, 0.114));
+        float cover = prm.z * mix(1.0, 1.0 - smoothstep(0.55, 0.85, luma), prm.w);
+        surface = mix(paint, filtered, cover);
+    }
+    return mix(shadedBase, surface * shade, ubo.texGlobal.y);
+}
+
 vec3 bandq(vec3 c, float levels) {
     if (ubo.banding <= 0.0) return c;
     float l = levels / ubo.banding;
@@ -148,6 +190,9 @@ void main() {
     // World pickups are real world objects, not overlay UI: they take the World
     // lighting path (shadow rays, height AO, vignette) and sit in the scene.
     if (rc == RC_WORLD_PICKUP) rc = RC_WORLD;
+
+    // Surface layer: textured world cells (pickups carry no texture id).
+    if (rc == RC_WORLD) base = texturedBase(base);
 
     // Inventory lattice unit cubes (RULES.md rule 12). Deliberately skips the
     // World path's world-space shadow rays, world-Y height AO and vignette —

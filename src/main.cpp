@@ -34,6 +34,7 @@
 #include "mesh_view.hpp"
 #include "render_class.hpp"
 #include "post_fx.hpp"
+#include "textures.hpp"
 #include "visual_params.hpp"
 
 // Dear ImGui (third_party/imgui, MIT): the in-engine menu. View only.
@@ -179,8 +180,14 @@ struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
     float cr, cg, cb;
-float mat; // 0 solid, 1 water, 2 bulb, 3 moon, 4 sky, 5 debris cube, 6 muzzle flash, 7 inventory lattice
+    float mat;            // render class (src/render_class.hpp)
+    float texLayer = 0;   // texture layer + 1; 0 = untextured
+    float painted = 0;    // 1 = cell has an appearance colour
+    float shade = 1;      // face shade x AO already folded into cr,cg,cb
 };
+// Chunk meshes are built as view::ViewChunk::Vertex and copied into the same
+// vertex buffer, so the two layouts must be identical.
+static_assert(sizeof(Vertex) == sizeof(view::ViewChunk::Vertex), "vertex layouts must match");
 
 // Fixed light slots in the frame UBO. The shader loops this many, so it is a
 // layout constant, not a tuning knob.
@@ -205,7 +212,18 @@ struct FrameUBO {
     float fisheyeScale;            // visuals menu: lens curve multiplier
     float banding;                 // visuals menu: colour-step multiplier
     float uboPad[2];
+    float texParams[tex::kMaxLayers][4]; // per layer: tileCells, tint, coverage, maskFromLuma
+    float texGlobal[4];            // enabled, strength, scale, unused
 };
+
+// Surface textures (src/textures.hpp): one 2D array image, all mips.
+static VkImage g_texImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_texMem = VK_NULL_HANDLE;
+static VkImageView g_texView = VK_NULL_HANDLE;
+static VkSampler g_texSampler = VK_NULL_HANDLE;
+static tex::Table g_texTable;
+static int g_texLayerCount = 0;   // 0 = no texture file; a 1x1 white fallback is bound
+static float g_maxAnisotropy = 1.0f;
 
 // Visual settings (view only): the registry the menu, presets and the settings
 // file are built from, and the post chain that consumes most of them.
@@ -1061,6 +1079,9 @@ static void emitUnitCube(Vertex* verts, uint32_t& wi, uint32_t maxVerts,
             v.cg = cg;
             v.cb = cb;
             v.mat = matId;
+            v.texLayer = 0.0f;
+            v.painted = 0.0f;
+            v.shade = 1.0f;
         }
     }
 }
@@ -1694,6 +1715,9 @@ static void updateDebrisMesh() {
         v.nx = nx; v.ny = ny; v.nz = nz;
         v.cr = cr; v.cg = cg; v.cb = cb;
         v.mat = matId;
+        v.texLayer = 0.0f;
+        v.painted = 0.0f;
+        v.shade = 1.0f;
     };
 
     // Soft-cap drawn particles under load (36 verts each).
@@ -1785,6 +1809,9 @@ static void updateMoonSkyTile() {
         // cr/cg = local tile UV for pixel grid; cb packs sky elevation 0..1
         dst.cr = tileU; dst.cg = tileV; dst.cb = v;
         dst.mat = rc::attr(rc::RenderClass::Sky);
+        dst.texLayer = 0.0f;
+        dst.painted = 0.0f;
+        dst.shade = 1.0f;
     };
 
     uint32_t wi = 0;
@@ -1827,6 +1854,9 @@ static void updateMoonSkyTile() {
         dst.nx = mn.x; dst.ny = mn.y; dst.nz = mn.z;
         dst.cr = u; dst.cg = v; dst.cb = 1.0f;
         dst.mat = rc::attr(rc::RenderClass::Moon);
+        dst.texLayer = 0.0f;
+        dst.painted = 0.0f;
+        dst.shade = 1.0f;
     };
     putMoon(verts[wi++], m0, 0, 0);
     putMoon(verts[wi++], m1, 1, 0);
@@ -2274,6 +2304,16 @@ static void createLogicalDevice() {
     }
     const char* exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkPhysicalDeviceFeatures feats{};
+    {
+        // Anisotropic filtering keeps textures on 1 mm cells readable at grazing
+        // angles; enabled only where the device supports it.
+        VkPhysicalDeviceFeatures avail{};
+        vkGetPhysicalDeviceFeatures(g_phys, &avail);
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(g_phys, &props);
+        feats.samplerAnisotropy = avail.samplerAnisotropy;
+        g_maxAnisotropy = avail.samplerAnisotropy ? std::min(8.0f, props.limits.maxSamplerAnisotropy) : 1.0f;
+    }
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.queueCreateInfoCount = static_cast<uint32_t>(qcis.size());
     ci.pQueueCreateInfos = qcis.data();
@@ -2551,16 +2591,148 @@ static VkShaderModule loadShader(const std::string& path) {
     return mod;
 }
 
+// Upload build/textures.bin as one RGBA8 2D array with a full mip chain (the
+// mips are what keep a texture on far 1 mm cells from shimmering). Without the
+// file a 1x1 white layer is bound so the descriptor is always valid, and
+// texturing stays off.
+static void uploadTextures() {
+    const tex::TextureSet set = tex::load(g_exeDir + "\\textures.bin");
+    const uint8_t white[4] = {255, 255, 255, 255};
+    const bool have = set.ok();
+    const uint32_t size = have ? static_cast<uint32_t>(set.size) : 1u;
+    const uint32_t layers = have ? static_cast<uint32_t>(set.keys.size()) : 1u;
+    const uint8_t* pixels = have ? set.rgba.data() : white;
+    uint32_t mips = 1;
+    while ((size >> mips) > 0) ++mips;
+    if (have) {
+        g_texTable = tex::resolve(set);
+        g_texLayerCount = static_cast<int>(layers);
+    }
+
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.extent = {size, size, 1};
+    ii.mipLevels = mips;
+    ii.arrayLayers = layers;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(g_device, &ii, nullptr, &g_texImage) != VK_SUCCESS) fail("texture image failed");
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_device, g_texImage, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(g_device, &mai, nullptr, &g_texMem) != VK_SUCCESS) fail("texture memory failed");
+    vkBindImageMemory(g_device, g_texImage, g_texMem, 0);
+
+    const VkDeviceSize bytes = VkDeviceSize(size) * size * 4 * layers;
+    VkBuffer stg = VK_NULL_HANDLE;
+    VkDeviceMemory stgMem = VK_NULL_HANDLE;
+    createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stg, stgMem);
+    void* mapped = nullptr;
+    vkMapMemory(g_device, stgMem, 0, bytes, 0, &mapped);
+    std::memcpy(mapped, pixels, static_cast<size_t>(bytes));
+    vkUnmapMemory(g_device, stgMem);
+
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g_cmdPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g_device, &cai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    auto barrier = [&](uint32_t level, uint32_t count, VkImageLayout from, VkImageLayout to,
+                       VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS,
+                       VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcAccessMask = srcA;
+        b.dstAccessMask = dstA;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = g_texImage;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, count, 0, layers};
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    barrier(0, mips, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+    region.imageExtent = {size, size, 1};
+    vkCmdCopyBufferToImage(cmd, stg, g_texImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    // Mip chain: each level is a linear blit of the one above it.
+    for (uint32_t m = 1; m < mips; ++m) {
+        barrier(m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const int32_t src = static_cast<int32_t>(std::max(1u, size >> (m - 1)));
+        const int32_t dst = static_cast<int32_t>(std::max(1u, size >> m));
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m - 1, 0, layers};
+        blit.srcOffsets[1] = {src, src, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, layers};
+        blit.dstOffsets[1] = {dst, dst, 1};
+        vkCmdBlitImage(cmd, g_texImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_texImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+    if (mips > 1)
+        barrier(0, mips - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(g_graphicsQueue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_graphicsQueue);
+    vkFreeCommandBuffers(g_device, g_cmdPool, 1, &cmd);
+    vkDestroyBuffer(g_device, stg, nullptr);
+    vkFreeMemory(g_device, stgMem, nullptr);
+
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = g_texImage;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+    if (vkCreateImageView(g_device, &vi, nullptr, &g_texView) != VK_SUCCESS) fail("texture view failed");
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod = static_cast<float>(mips);
+    sci.anisotropyEnable = g_maxAnisotropy > 1.0f ? VK_TRUE : VK_FALSE;
+    sci.maxAnisotropy = g_maxAnisotropy;
+    if (vkCreateSampler(g_device, &sci, nullptr, &g_texSampler) != VK_SUCCESS) fail("texture sampler failed");
+}
+
 static void createDescriptors() {
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    uploadTextures();
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 1;
-    lci.pBindings = &binding;
+    lci.bindingCount = 2;
+    lci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(g_device, &lci, nullptr, &g_dsl) != VK_SUCCESS)
         fail("descriptor set layout failed");
 
@@ -2571,10 +2743,11 @@ static void createDescriptors() {
         vkMapMemory(g_device, g_uboMems[i], 0, sizeof(FrameUBO), 0, &g_uboMapped[i]);
     }
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES};
+    VkDescriptorPoolSize poolSizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES},
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAMES}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.poolSizeCount = 1;
-    pci.pPoolSizes = &poolSize;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = poolSizes;
     pci.maxSets = MAX_FRAMES;
     if (vkCreateDescriptorPool(g_device, &pci, nullptr, &g_descPool) != VK_SUCCESS)
         fail("descriptor pool failed");
@@ -2598,7 +2771,15 @@ static void createDescriptors() {
         write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         write.descriptorCount = 1;
         write.pBufferInfo = &bi;
-        vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+        VkDescriptorImageInfo ti{g_texSampler, g_texView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet texWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        texWrite.dstSet = g_descSets[i];
+        texWrite.dstBinding = 1;
+        texWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        texWrite.descriptorCount = 1;
+        texWrite.pImageInfo = &ti;
+        VkWriteDescriptorSet writes[2] = {write, texWrite};
+        vkUpdateDescriptorSets(g_device, 2, writes, 0, nullptr);
     }
 }
 
@@ -2657,16 +2838,17 @@ static bool createPipeline() {
     bind.stride = sizeof(Vertex);
     bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    VkVertexInputAttributeDescription attrs[4]{};
+    VkVertexInputAttributeDescription attrs[5]{};
     attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, px)};
     attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, nx)};
     attrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, cr)};
     attrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT, offsetof(Vertex, mat)};
+    attrs[4] = {4, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, texLayer)};
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &bind;
-    vi.vertexAttributeDescriptionCount = 4;
+    vi.vertexAttributeDescriptionCount = 5;
     vi.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -5284,6 +5466,10 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
 
     ubo.fisheyeScale = g_vis.fisheye;
     ubo.banding = g_vis.banding;
+    std::memcpy(ubo.texParams, g_texTable.params, sizeof(ubo.texParams));
+    ubo.texGlobal[0] = (g_vis.textures && g_texLayerCount > 0) ? 1.0f : 0.0f;
+    ubo.texGlobal[1] = g_vis.textureStrength;
+    ubo.texGlobal[2] = g_vis.textureScale;
     std::memcpy(g_uboMapped[frameIndex], &ubo, sizeof(ubo));
 }
 
@@ -5589,6 +5775,10 @@ static void cleanup() {
     g_renderPass = VK_NULL_HANDLE;
     if (g_overlayRenderPass) vkDestroyRenderPass(g_device, g_overlayRenderPass, nullptr);
     if (g_descPool) vkDestroyDescriptorPool(g_device, g_descPool, nullptr);
+    if (g_texSampler) vkDestroySampler(g_device, g_texSampler, nullptr);
+    if (g_texView) vkDestroyImageView(g_device, g_texView, nullptr);
+    if (g_texImage) vkDestroyImage(g_device, g_texImage, nullptr);
+    if (g_texMem) vkFreeMemory(g_device, g_texMem, nullptr);
     if (g_dsl) vkDestroyDescriptorSetLayout(g_device, g_dsl, nullptr);
     for (int i = 0; i < MAX_FRAMES; ++i) {
         if (g_uboBuffers[i]) vkDestroyBuffer(g_device, g_uboBuffers[i], nullptr);
@@ -6066,6 +6256,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     ViewChunk& c = views[sim::World::chunkIndex(cx, cy, cz)];
                     c.cx = cx; c.cy = cy; c.cz = cz;
                     c.palette = &g_viewPalette;
+                    c.texLayerPlus1 = g_texTable.layerPlus1;
                 }
         g_views = &views;
         sendPalette(world, g_viewPalette);
@@ -6319,6 +6510,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nvoxels_destroyed=" << g_voxelsDestroyed
                 << "\nbulbs=" << g_bulbs.size()
                 << "\nmap_lights=" << g_mapLights.size()
+                << "\ntextures_loaded=" << g_texLayerCount
+                << "\nmax_anisotropy=" << g_maxAnisotropy
                 << "\nfixture_verts=" << g_fixtureVertexCount
                 << "\nwater_touch=" << g_touchingWaterUnits << "/" << g_characterUnitCount
                 << "\ncurrent=" << (g_currentTriggered ? 1 : 0)
