@@ -33,6 +33,8 @@
 #include "map_vox.hpp"
 #include "mesh_view.hpp"
 #include "render_class.hpp"
+#include "post_fx.hpp"
+#include "visual_params.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
 #include "ballistics.hpp"
@@ -69,7 +71,6 @@ static constexpr int WIDTH = 1280;
 static constexpr int HEIGHT = 720;
 static constexpr int MAX_FRAMES = 2;
 // Internal 3D render scale (downscale for fill-rate). Presented upscaled with bitcrush look in shader.
-static constexpr float RENDER_SCALE = 0.5f;
 static constexpr int INTERNAL_W = 640;  // WIDTH * 0.5
 static constexpr int INTERNAL_H = 360;  // HEIGHT * 0.5
 static constexpr float DEFAULT_FOV_DEG = 101.5f; // 70 * 1.45 fisheye default
@@ -193,7 +194,16 @@ struct FrameUBO {
     float healthTint;      // 0..1 low-health pulsing vignette
     float bulbPos[kMaxBulbs][4];   // xyz, intensity
     float bulbColor[kMaxBulbs][4]; // rgb, radius
+    float fisheyeScale;            // visuals menu: lens curve multiplier
+    float banding;                 // visuals menu: colour-step multiplier
+    float uboPad[2];
 };
+
+// Visual settings (view only): the registry the menu, presets and the settings
+// file are built from, and the post chain that consumes most of them.
+static vis::Registry g_visReg;
+static vis::Settings g_vis;
+static postfx::PostFx g_post;
 
 // Time system. g_timeOfDay is frozen: the world ships as permanent night, and
 // the dead g_timeScale that was meant to advance it is gone.
@@ -2291,6 +2301,7 @@ static VkPresentModeKHR choosePresentMode() {
 
 static void createDepthResources();
 static void destroySwapchainObjects() {
+    g_post.destroyTargets(); // its framebuffers reference the swapchain views
     if (g_depthView) vkDestroyImageView(g_device, g_depthView, nullptr);
     if (g_depthImage) vkDestroyImage(g_device, g_depthImage, nullptr);
     if (g_depthMem) vkFreeMemory(g_device, g_depthMem, nullptr);
@@ -2373,56 +2384,11 @@ static void createSwapchain() {
     }
 }
 
+// The world pass belongs to the post module: the world renders offscreen at the
+// menu's render scale and the post pass draws it to the window.
 static void createRenderPass() {
-    VkAttachmentDescription color{};
-    color.format = g_swapFormat;
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-    VkAttachmentDescription depth{};
-    depth.format = VK_FORMAT_D32_SFLOAT;
-    depth.samples = VK_SAMPLE_COUNT_1_BIT;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-
-    VkSubpassDescription sub{};
-    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &colorRef;
-    sub.pDepthStencilAttachment = &depthRef;
-
-    VkSubpassDependency dep{};
-    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-    VkAttachmentDescription atts[] = {color, depth};
-    VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    ci.attachmentCount = 2;
-    ci.pAttachments = atts;
-    ci.subpassCount = 1;
-    ci.pSubpasses = &sub;
-    ci.dependencyCount = 1;
-    ci.pDependencies = &dep;
-    if (vkCreateRenderPass(g_device, &ci, nullptr, &g_renderPass) != VK_SUCCESS)
-        fail("vkCreateRenderPass failed");
+    g_post.init(g_device, g_phys, g_swapFormat);
+    g_renderPass = g_post.worldPass;
 }
 
 // RULES.md rule 12 — the sanctioned "paint over map voxels" exception.
@@ -2454,7 +2420,11 @@ static void createOverlayRenderPass() {
     VkAttachmentDescription depth{};
     depth.format = VK_FORMAT_D32_SFLOAT;
     depth.samples = VK_SAMPLE_COUNT_1_BIT;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // fresh depth for the lattice
+    // Cleared, as rule 12 requires. This was DONT_CARE and only worked because
+    // the overlay shared the world pass's depth image, so the lattice was in
+    // fact depth-tested against leftover world depth. With the world rendered
+    // offscreen that image is never written, and DONT_CARE hid every cube.
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -2534,21 +2504,8 @@ static void createDepthResources() {
 }
 
 static void createFramebuffers() {
-    g_framebuffers.resize(g_swapViews.size());
-    for (size_t i = 0; i < g_swapViews.size(); ++i) {
-        VkImageView atts[] = {g_swapViews[i], g_depthView};
-        VkFramebufferCreateInfo ci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        ci.renderPass = g_renderPass;
-        ci.attachmentCount = 2;
-        ci.pAttachments = atts;
-        ci.width = g_extent.width;
-        ci.height = g_extent.height;
-        ci.layers = 1;
-        if (vkCreateFramebuffer(g_device, &ci, nullptr, &g_framebuffers[i]) != VK_SUCCESS)
-            fail("framebuffer failed");
-    }
-
-    // Same attachments, bound to the overlay pass (RULES.md rule 12).
+    // The world renders offscreen (g_post); only the overlay pass draws to the
+    // swapchain image with a full-window depth buffer (RULES.md rule 12).
     g_overlayFramebuffers.resize(g_swapViews.size());
     for (size_t i = 0; i < g_swapViews.size(); ++i) {
         VkImageView atts[] = {g_swapViews[i], g_depthView};
@@ -2658,6 +2615,10 @@ static bool createPipeline() {
     const std::string vertPath = resolveShaderPath("voxel.vert");
     const std::string fragPath = resolveShaderPath("voxel.frag");
     if (vertPath.empty() || fragPath.empty()) return false;
+    const std::string postVert = resolveShaderPath("post.vert");
+    const std::string postFrag = resolveShaderPath("post.frag");
+    if (postVert.empty() || postFrag.empty()) return false;
+    g_post.createPipeline(readFile(postVert), readFile(postFrag));
 
     VkShaderModule vert = loadShader(vertPath);
     VkShaderModule frag = loadShader(fragPath);
@@ -4433,6 +4394,7 @@ static void recreateSwapchain() {
     createSwapchain();
     createDepthResources();
     createFramebuffers();
+    g_post.createTargets(g_extent, g_vis.renderScale, g_swapViews);
 }
 
 // ---- frame capture (view-only test harness) ----
@@ -4539,16 +4501,16 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
 
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rp.renderPass = g_renderPass;
-    rp.framebuffer = g_framebuffers[imageIndex];
-    rp.renderArea.extent = g_extent;
+    rp.framebuffer = g_post.worldFb;
+    rp.renderArea.extent = g_post.extent;
     rp.clearValueCount = 2;
     rp.pClearValues = clears;
 
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 
-    // Full swapchain viewport. Bitcrush in fragment shader provides the downscale/crunch look
-    // without a second pass; RENDER_SCALE documents intended internal scale for future offscreen RT.
+    // Full-window viewport for the overlay pass; the world pass uses the
+    // offscreen target's own size (render scale) below.
     VkViewport viewport{};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
@@ -4556,12 +4518,19 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     viewport.height = static_cast<float>(g_extent.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-
     VkRect2D scissor{};
     scissor.offset = {0, 0};
     scissor.extent = g_extent;
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    // The world pass draws into the offscreen target at the render scale; the
+    // overlay pass below uses the full-window viewport/scissor above.
+    {
+        VkViewport wv = viewport;
+        wv.width = static_cast<float>(g_post.extent.width);
+        wv.height = static_cast<float>(g_post.extent.height);
+        VkRect2D ws{{0, 0}, g_post.extent};
+        vkCmdSetViewport(cmd, 0, 1, &wv);
+        vkCmdSetScissor(cmd, 0, 1, &ws);
+    }
 
     VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexBuffer, &off);
@@ -4622,6 +4591,16 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
 
     vkCmdEndRenderPass(cmd);
 
+    // Post chain: the world image onto the swapchain (src/post_fx.hpp).
+    {
+        postfx::PostParams pp;
+        pp.posterize = static_cast<float>(g_vis.posterizeLevels);
+        pp.dither = g_vis.dither;
+        pp.crush = g_vis.crush;
+        pp.time = static_cast<float>(g_tick) * static_cast<float>(TICK_DT);
+        g_post.record(cmd, imageIndex, g_extent, g_vis.upscaleNearest, pp);
+    }
+
     // Inventory + HUD overlay (RULES.md rule 12/15): second pass, color LOAD +
     // depth DONT_CARE, so the lattice paints over the map while still
     // self-occluding against a fresh depth buffer. The pass runs when either the
@@ -4632,8 +4611,10 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         ovp.renderPass = g_overlayRenderPass;
         ovp.framebuffer = g_overlayFramebuffers[imageIndex];
         ovp.renderArea.extent = g_extent;
-        ovp.clearValueCount = 0;
-        ovp.pClearValues = nullptr;
+        VkClearValue ovClears[2]{};
+        ovClears[1].depthStencil = {1.0f, 0}; // colour is LOAD; only depth clears
+        ovp.clearValueCount = 2;
+        ovp.pClearValues = ovClears;
         vkCmdBeginRenderPass(cmd, &ovp, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_overlayPipeline);
         vkCmdSetViewport(cmd, 0, 1, &viewport);
@@ -5094,6 +5075,8 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
         ubo.bulbColor[i][3] = l.radius;
     }
 
+    ubo.fisheyeScale = g_vis.fisheye;
+    ubo.banding = g_vis.banding;
     std::memcpy(g_uboMapped[frameIndex], &ubo, sizeof(ubo));
 }
 
@@ -5179,6 +5162,12 @@ static void drawFrame(float timeSec) {
     {
         ScopedSection s(SEC_WAIT);
         vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
+    }
+
+    // The render scale changed (visuals menu): rebuild the offscreen target.
+    if (std::fabs(g_vis.renderScale - g_post.scale) > 1e-4f) {
+        vkDeviceWaitIdle(g_device);
+        g_post.createTargets(g_extent, g_vis.renderScale, g_swapViews);
     }
 
     // Safe to rebuild world VB now (no device-wide idle).
@@ -5379,7 +5368,8 @@ static void cleanup() {
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, nullptr);
     if (g_overlayPipeline) vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
     if (g_pipelineLayout) vkDestroyPipelineLayout(g_device, g_pipelineLayout, nullptr);
-    if (g_renderPass) vkDestroyRenderPass(g_device, g_renderPass, nullptr);
+    g_post.destroy(); // owns the world render pass (g_renderPass)
+    g_renderPass = VK_NULL_HANDLE;
     if (g_overlayRenderPass) vkDestroyRenderPass(g_device, g_overlayRenderPass, nullptr);
     if (g_descPool) vkDestroyDescriptorPool(g_device, g_descPool, nullptr);
     if (g_dsl) vkDestroyDescriptorSetLayout(g_device, g_dsl, nullptr);
@@ -5773,6 +5763,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
 
     try {
         g_exeDir = getExeDir();
+        // Visual settings: declare every parameter, then apply the saved file.
+        // Smoke/stress always run on defaults so their captures and timings
+        // do not depend on whatever a player last chose.
+        vis::registerEngineParams(g_visReg, g_vis);
+        if (!g_smoke) {
+            bool readable = false;
+            const std::string saved = jsonReadText(g_exeDir + "\\visual_settings.json", &readable);
+            if (readable) g_visReg.fromJson(saved);
+        }
         createWindow();
         createInstance();
         createSurface();
@@ -5784,6 +5783,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createOverlayRenderPass(); // must exist before createPipeline binds it
         createDepthResources();
         createFramebuffers();
+        g_post.createTargets(g_extent, g_vis.renderScale, g_swapViews);
         createDescriptors();
         if (!createPipeline()) {
             // Shader assets are missing; bail out cleanly instead of running a
@@ -6019,6 +6019,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         if (g_smoke) {
             const bool jsonxOk = jsonxSelfTest();
             const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
+            const bool visualParamsOk = vis::selfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -6105,7 +6106,9 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nsubmerged=" << (g_fullySubmerged ? 1 : 0)
                 << "\nweight=" << g_playerWeight
                 << "\ncurrent_force=" << g_currentForce
-                << "\nrender_scale=" << RENDER_SCALE
+                << "\nrender_scale=" << g_post.scale
+                << "\nrender_target=" << g_post.extent.width << "x" << g_post.extent.height
+                << "\nwindow=" << g_extent.width << "x" << g_extent.height
                 << "\ndrawn_chunks=" << g_drawnChunks
                 << "\nculled_chunks=" << g_culledChunks
                 << "\nfisheye_visible_radius=" << fisheyeVisibleNdcRadius(kFisheyeStrengthWorld)
@@ -6268,6 +6271,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nballistics_projectile_breaks_ok=" << (ballisticsRep.projectileBreaks ? 1 : 0)
                 << "\nballistics_shooter_not_swept_ok=" << (ballisticsRep.shooterNotSwept ? 1 : 0)
                 << "\nballistics_ok=" << (ballisticsRep.ok() ? 1 : 0)
+                << "\nvisual_params_ok=" << (visualParamsOk ? 1 : 0)
                 << "\npause_probe_done=" << (g_smokePauseDone ? 1 : 0)
                 << "\npause_frames=" << g_smokePausedFrames
                 << "\npause_ticks_frozen_ok=" << (g_smokePauseFrozenOk ? 1 : 0)
@@ -6368,6 +6372,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             if (!g_simViewSmoke.meshWorkersEquivOk) { cleanup(); return 5; }
             // The ballistics module's own contract, independent of the map.
             if (!ballisticsRep.ok()) { cleanup(); return 6; }
+            // Visual parameter registry: presets, save/load round trip, clamping.
+            if (!visualParamsOk) { cleanup(); return 9; }
             // View-side pause and camera: pause froze the ticks, interpolation holds.
             const bool pauseOk = g_stress || (g_smokePauseDone && g_smokePauseFrozenOk);
             if (!pauseOk || !eyeInterpOk) { cleanup(); return 8; }
