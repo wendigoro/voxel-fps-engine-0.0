@@ -94,8 +94,6 @@ static double g_tickAccum = 0.0;
 static constexpr float VOXEL_SIZE = kVoxelSize;
 
 // Warehouse layout in unit voxels (grid space)
-static constexpr int DIRT_MARGIN = 10;        // dirt apron around building
-static constexpr int SLAB_THICK = 2;          // concrete floor thickness (voxels)
 
 struct Vec3 {
     float x = 0, y = 0, z = 0;
@@ -303,6 +301,12 @@ static std::vector<AmmoDef> g_ammoDefs;
 // g_projectiles is the name the rest of this file uses for the round list.
 static ballistics::State g_ballistics;
 static std::vector<ProjectileRuntime>& g_projectiles = g_ballistics.projectiles;
+// What the loaded map authored for spawn and pickups (empty when the world
+// came from the procedural builder).
+static mapvox::PlayerSpawn g_mapSpawn;
+static std::vector<mapvox::PickupPlacement> g_mapPickups;
+static std::string g_mapPath; // file the world was loaded from (empty = procedural)
+
 static int g_activeAmmoIndex = 0; // cycles ammo subtypes for active caliber (R)
 static bool g_meshDirty = false;
 static bool g_firePressed = false; // edge: semi/bolt or smoke
@@ -739,92 +743,8 @@ static void harvestBulbLights(const sim::World& world,
 }
 
 // Fill a solid axis-aligned box with unit voxels (inclusive).
-static void fillBox(sim::World& world, int x0, int y0, int z0,
-                    int x1, int y1, int z1, Block b) {
-    if (x0 > x1) std::swap(x0, x1);
-    if (y0 > y1) std::swap(y0, y1);
-    if (z0 > z1) std::swap(z0, z1);
-    for (int z = z0; z <= z1; ++z)
-        for (int y = y0; y <= y1; ++y)
-            for (int x = x0; x <= x1; ++x)
-                setWorldBlock(world, x, y, z, b);
-}
-
-// Vertical I-beam girder (unit voxels only): flanges + web.
-static void placeGirderColumn(sim::World& world, int cx, int zc,
-                              int y0, int y1) {
-    for (int y = y0; y <= y1; ++y) {
-        // web
-        setWorldBlock(world, cx, y, zc, Block::Girder);
-        setWorldBlock(world, cx, y, zc + 1, Block::Girder);
-        // flanges
-        for (int dx = -2; dx <= 2; ++dx) {
-            setWorldBlock(world, cx + dx, y, zc - 1, Block::Girder);
-            setWorldBlock(world, cx + dx, y, zc + 2, Block::Girder);
-        }
-    }
-}
-
-// Horizontal I-beam along X at fixed y,z.
-static void placeGirderBeamX(sim::World& world, int x0, int x1, int y, int zc) {
-    for (int x = x0; x <= x1; ++x) {
-        setWorldBlock(world, x, y, zc, Block::Girder);
-        setWorldBlock(world, x, y, zc + 1, Block::Girder);
-        for (int dy = -2; dy <= 2; ++dy) {
-            setWorldBlock(world, x, y + dy, zc - 1, Block::Girder);
-            setWorldBlock(world, x, y + dy, zc + 2, Block::Girder);
-        }
-    }
-}
-
-// Horizontal I-beam along Z.
-static void placeGirderBeamZ(sim::World& world, int z0, int z1, int y, int xc) {
-    for (int z = z0; z <= z1; ++z) {
-        setWorldBlock(world, xc, y, z, Block::Girder);
-        setWorldBlock(world, xc + 1, y, z, Block::Girder);
-        for (int dy = -2; dy <= 2; ++dy) {
-            setWorldBlock(world, xc - 1, y + dy, z, Block::Girder);
-            setWorldBlock(world, xc + 2, y + dy, z, Block::Girder);
-        }
-    }
-}
-
-// Sheet-metal wall panel: 1-voxel-thick unit cubes (corrugation via alternate offset).
-static void placeSheetWallX(sim::World& world, int x, int y0, int y1, int z0, int z1) {
-    for (int z = z0; z <= z1; ++z) {
-        for (int y = y0; y <= y1; ++y) {
-            int xo = x + ((z + y) & 1); // slight corrugation still unit voxels
-            setWorldBlock(world, xo, y, z, Block::SheetMetal);
-        }
-    }
-}
-
-static void placeSheetWallZ(sim::World& world, int z, int y0, int y1, int x0, int x1) {
-    for (int x = x0; x <= x1; ++x) {
-        for (int y = y0; y <= y1; ++y) {
-            int zo = z + ((x + y) & 1);
-            setWorldBlock(world, x, y, zo, Block::SheetMetal);
-        }
-    }
-}
-
-// Wooden crate made of unit voxels.
-static void placeCrate(sim::World& world, int x0, int y0, int z0, int s) {
-    fillBox(world, x0, y0, z0, x0 + s - 1, y0 + s - 1, z0 + s - 1, Block::Wood);
-    // darker edge frame
-    for (int i = 0; i < s; ++i) {
-        setWorldBlock(world, x0 + i, y0, z0, Block::WoodDark);
-        setWorldBlock(world, x0 + i, y0, z0 + s - 1, Block::WoodDark);
-        setWorldBlock(world, x0, y0, z0 + i, Block::WoodDark);
-        setWorldBlock(world, x0 + s - 1, y0, z0 + i, Block::WoodDark);
-        setWorldBlock(world, x0 + i, y0 + s - 1, z0, Block::WoodDark);
-        setWorldBlock(world, x0 + i, y0 + s - 1, z0 + s - 1, Block::WoodDark);
-    }
-}
-
-// Simple warehouse map: dirt apron, concrete slab, sheet-metal walls,
-// red-oxide girder frame — every element is unit voxels on the impact grid.
-static sim::World buildWarehouseMap() {
+// An all-Air world with every chunk allocated and placed.
+static sim::World makeEmptyWorld() {
     sim::World world;
     world.alloc();
     for (int cy = 0; cy < CHUNKS_Y; ++cy)
@@ -834,127 +754,9 @@ static sim::World buildWarehouseMap() {
                 c.cx = cx; c.cy = cy; c.cz = cz;
                 c.voxels.assign(VOXELS_PER_CHUNK, Block::Air);
             }
-
-    // 1) Dirt apron (single unit layer under map - keeps occupancy grid, fewer faces)
-    fillBox(world, 0, 0, 0, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
-
-    const int bx0 = DIRT_MARGIN;
-    const int bz0 = DIRT_MARGIN;
-    const int bx1 = WORLD_W - 1 - DIRT_MARGIN;
-    const int bz1 = WORLD_D - 1 - DIRT_MARGIN;
-    const int wallH = 40;          // wall height in unit voxels
-    const int roofY = 1 + wallH;   // underside of roof beams
-
-    // 2) Concrete slab (multi-voxel thick — not a stretched plane).
-    fillBox(world, bx0, 1, bz0, bx1, 1 + SLAB_THICK - 1, bz1, Block::Concrete);
-
-    // Outer dirt remains as apron (already filled); clear building footprint dirt top under slab already overwritten.
-
-    // 3) Girder columns at corners and mid-span (I-beam unit voxels).
-    const int colsX[] = { bx0 + 2, (bx0 + bx1) / 2, bx1 - 3 };
-    const int colsZ[] = { bz0 + 2, (bz0 + bz1) / 2, bz1 - 3 };
-    for (int ix = 0; ix < 3; ++ix)
-        for (int iz = 0; iz < 3; ++iz)
-            placeGirderColumn(world, colsX[ix], colsZ[iz], 1 + SLAB_THICK, roofY);
-
-    // 4) Roof girder grid (unit I-beams).
-    for (int iz = 0; iz < 3; ++iz)
-        placeGirderBeamX(world, bx0 + 2, bx1 - 2, roofY, colsZ[iz]);
-    for (int ix = 0; ix < 3; ++ix)
-        placeGirderBeamZ(world, bz0 + 2, bz1 - 2, roofY, colsX[ix]);
-
-    // 5) Sheet-metal walls — 1-voxel-thick unit panels (open bay on +Z front).
-    placeSheetWallX(world, bx0, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // -X wall
-    placeSheetWallX(world, bx1, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // +X wall
-    placeSheetWallZ(world, bz0, 1 + SLAB_THICK, roofY - 1, bx0, bx1);           // -Z back wall
-    // Front (+Z): partial side wings, open center doorway
-    placeSheetWallZ(world, bz1, 1 + SLAB_THICK, roofY - 1, bx0, bx0 + 35);
-    placeSheetWallZ(world, bz1, 1 + SLAB_THICK, roofY - 1, bx1 - 35, bx1);
-    // Door lintel strip of sheet metal
-    placeSheetWallZ(world, bz1, roofY - 8, roofY - 1, bx0 + 36, bx1 - 36);
-
-    // 6) Roof sheet deck: unit metal cubes on top of beams (not a single quad).
-    for (int z = bz0; z <= bz1; ++z)
-        for (int x = bx0; x <= bx1; ++x) {
-            // skip every other for light vents still unit cubes
-            if (((x + z) & 3) == 0) continue;
-            setWorldBlock(world, x, roofY + 3, z, Block::SheetMetal);
-        }
-
-    // 7) A few unit-voxel crates inside for material variety / targets.
-    placeCrate(world, bx0 + 20, 1 + SLAB_THICK, bz0 + 24, 8);
-    placeCrate(world, bx0 + 40, 1 + SLAB_THICK, bz0 + 30, 10);
-    placeCrate(world, bx1 - 30, 1 + SLAB_THICK, bz0 + 20, 8);
-
-    // 7b) Warm light bulbs inside (unit voxels hanging near roof girders).
-    {
-        const int by = roofY - 2;
-        auto bulb = [&](int x, int z) {
-            setWorldBlock(world, x, by, z, Block::LightBulb);
-            setWorldBlock(world, x, by - 1, z, Block::LightBulb);
-            // small cage
-            setWorldBlock(world, x + 1, by, z, Block::Girder);
-            setWorldBlock(world, x - 1, by, z, Block::Girder);
-        };
-        bulb((bx0 + bx1) / 2, (bz0 + bz1) / 2);
-        bulb(bx0 + 28, bz0 + 28);
-        bulb(bx1 - 28, bz0 + 32);
-        bulb((bx0 + bx1) / 2, bz1 - 18);
-    }
-
-    // 7c) Moon: one solid emissive unit voxel high on the -Z sky side.
-    // The billboard sprite and the light direction are view concerns derived from
-    // g_moonDirWorld in updateMoonSkyTile(); map construction must not write
-    // render state, so nothing here touches a view global.
-    {
-        const int mx = WORLD_W / 2 + 24;
-        const int mz = 6;
-        const int my = WORLD_H - 6;
-        setWorldBlock(world, mx, my, mz, Block::Moon);
-    }
-
-    // 8) River slice beyond +Z apron: WATER_CELL (2x2) unit cubes, deep channel with current.
-    // Dirt bank extends; carve channel and fill water/current.
-    {
-        const int riverZ0 = bz1 + 2;
-        const int riverZ1 = WORLD_D - 3;
-        const int riverX0 = 8;
-        const int riverX1 = WORLD_W - 9;
-        // Ensure dirt banks around river
-        fillBox(world, 0, 0, riverZ0 - 2, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
-        // Deep channel center (unit voxels stacked)
-        const int surfaceY = 4;
-        const int deepY0 = 0;
-        const int deepY1 = surfaceY; // depth includes surface
-        for (int z = riverZ0; z <= riverZ1; ++z) {
-            for (int x = riverX0; x <= riverX1; ++x) {
-                // banks stay dirt; channel interior
-                bool channel = (x > riverX0 + 4 && x < riverX1 - 4);
-                if (!channel) continue;
-                // deeper mid-stream trench
-                int localDeep = surfaceY;
-                int mid = (riverX0 + riverX1) / 2;
-                int dist = std::abs(x - mid);
-                if (dist < 6) localDeep = surfaceY + 5;      // deepest
-                else if (dist < 12) localDeep = surfaceY + 2;
-                for (int y = 0; y <= localDeep && y < WORLD_H; ++y) {
-                    // place as WATER_CELL clumps: still unit cubes on grid
-                    Block wb = (dist < 10 && y <= localDeep) ? Block::WaterCurrent : Block::Water;
-                    setWorldBlock(world, x, y, z, wb);
-                    // thicken visually with adjacent unit cells (larger water voxels)
-                    // WATER_CELL clumps only on even layers to cut fill-rate
-                    if ((y & 1) == 0 && (x % WATER_CELL) == 0 && (z % WATER_CELL) == 0) {
-                        for (int dz = 0; dz < WATER_CELL; ++dz)
-                            for (int dx = 0; dx < WATER_CELL; ++dx)
-                                if (dx || dz) setWorldBlock(world, x + dx, y, z + dz, wb);
-                    }
-                }
-            }
-        }
-    }
-
     return world;
 }
+
 
 // Skirt isolation tracking: assert that client-side meshing never attempts to
 // read outside the supplied visible skirt (RULES.md, "Visibility filtering").
@@ -1704,40 +1506,24 @@ static void seedPickups() {
     g_pickups.clear();
     g_pickupTaken = 0;
     g_pickupRefused = 0;
-    struct Seed { const char* id; int dx, dz; };
-    // Spread across the bay the player spawns looking into. Ids must match the
-    // *.item.json files in data/items; an unknown id is skipped, not faked.
-    static const Seed kSeeds[] = {
-        {"supply_grenade",      -3, -6},
-        {"ammo_pouch_medium",   -1, -8},
-        {"weapon_sidearm_light", 2, -7},
-        {"weapon_starter_rifle", 3, -5},
-        {"armor_chest_plate",    0, -10},
-        {"armor_helmet",         5, -9},
-    };
-    for (const Seed& s : kSeeds) {
-        const int defIdx = itemIndexById(s.id);
-        if (defIdx < 0) continue;
-        const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
-        if (!d || !d->shape.valid()) continue;
-        WorldPickup p;
-        p.defIndex = defIdx;
-        p.rot = 0;
-        p.cx = g_spawnCellX + s.dx;
-        p.cz = g_spawnCellZ + s.dz;
-        // Drop onto whatever is under it: scan down for the first free cell so
-        // the item rests on the floor instead of hovering over a gap.
-        p.cy = g_spawnCellY;
-        if (g_world) {
-            for (int y = g_spawnCellY + 4; y >= 1; --y) {
-                if (isSolidBlock(g_world->get(p.cx, y - 1, p.cz))) {
-                    p.cy = y;
-                    break;
-                }
-            }
+    if (!g_mapPickups.empty()) {
+        // Map-authored placements: exact cells, no floor search. An unknown
+        // item id is skipped, not faked.
+        for (const auto& mp : g_mapPickups) {
+            const int defIdx = itemIndexById(mp.item.c_str());
+            if (defIdx < 0) continue;
+            const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+            if (!d || !d->shape.valid()) continue;
+            WorldPickup p;
+            p.defIndex = defIdx;
+            p.rot = mp.rot;
+            p.cx = mp.x; p.cy = mp.y; p.cz = mp.z;
+            g_pickups.push_back(p);
         }
-        g_pickups.push_back(p);
+        g_pickupMeshDirty = true;
+        return;
     }
+    // A map without "pickups" simply has none.
     g_pickupMeshDirty = true;
 }
 
@@ -4887,29 +4673,25 @@ static bool playerHitsSolid(float px, float py, float pz) {
 }
 
 static void spawnPlayerOnMap(const sim::World& world) {
-    // Stand on the concrete apron just inside the open bay, looking -Z into the warehouse.
-    const int sx = WORLD_W / 2;
-    const int sz = WORLD_D - DIRT_MARGIN - 18;
-    int gy = 1 + SLAB_THICK; // default slab top
-    // Stand on the concrete slab (or whatever solids remain under it) — looking
-    // for the first solid from the sky would spawn the player on the roof deck.
-    for (int y = 1 + SLAB_THICK; y >= 0; --y) {
-        Block b = getWorldBlock(world, sx, y, sz);
-        if (isSolidBlock(b)) { gy = y + 1; break; }
+    if (g_mapSpawn.present) {
+        // The map says where the player stands; respawn uses the same cell.
+        g_spawnCellX = g_mapSpawn.x;
+        g_spawnCellY = g_mapSpawn.y;
+        g_spawnCellZ = g_mapSpawn.z;
+        g_player.px = (g_mapSpawn.x + 0.5f) * VOXEL_SIZE;
+        g_player.py = g_mapSpawn.y * VOXEL_SIZE + 0.0002f;
+        g_player.pz = (g_mapSpawn.z + 0.5f) * VOXEL_SIZE;
+        g_player.vx = g_player.vy = g_player.vz = 0.0f;
+        g_player.onGround = true;
+        g_player.lean = 0.0f;
+        g_player.leanTarget = 0.0f;
+        g_yaw = g_mapSpawn.yaw;
+        g_pitch = g_mapSpawn.pitch;
+        g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+        return;
     }
-    g_spawnCellX = sx;
-    g_spawnCellY = gy;
-    g_spawnCellZ = sz;
-    g_player.px = (sx + 0.5f) * VOXEL_SIZE;
-    g_player.py = gy * VOXEL_SIZE + 0.0002f;
-    g_player.pz = (sz + 0.5f) * VOXEL_SIZE;
-    g_player.vx = g_player.vy = g_player.vz = 0.0f;
-    g_player.onGround = true;
-    g_player.lean = 0.0f;
-    g_player.leanTarget = 0.0f;
-    g_yaw = 0.0f;          // look toward -Z into bay
-    g_pitch = -0.08f;
-    g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+    (void)world;
+    fail("the map has no player_spawn");
 }
 
 // Water current + weight sampling from physics feet (not free-fly camera).
@@ -5466,7 +5248,7 @@ static int runCaptureShots(float timeSec) {
         g_inventoryOpen = (shot.extras & kShotInventory) != 0;
         if (shot.extras & (kShotEffects | kShotDebris)) {
             // Chips thrown off the top edge of the first crate (see
-            // buildWarehouseMap). The sim is not ticking, so they hold still.
+            // data/maps/warehouse_v1). The sim is not ticking, so they hold still.
             for (int x = 32; x <= 35; ++x)
                 g_debris.spawnFromVoxel(x, 10, 41, MaterialId::Wood, 0.0f, 0.4f, 1.0f, 6.0f,
                                         VOXEL_SIZE, 1.0f);
@@ -5490,6 +5272,33 @@ static int runCaptureShots(float timeSec) {
     }
     g_captureActive = false;
     return written;
+}
+
+// --export-map <path>: write the loaded world, with its spawn and pickups, as a
+// run-length map document. This is how the procedural warehouse became
+// data/maps/warehouse_v1.map.vox.json; the fingerprints proved the round trip.
+static bool exportMapDocument(const sim::World& world, const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    char buf[256];
+    f << "{\n";
+    f << "  \"format_version\": 1,\n  \"unit\": 1,\n  \"voxel_size\": 0.001,\n  \"mode\": \"map\",\n";
+    f << "  \"dims\": [" << WORLD_W << ", " << WORLD_H << ", " << WORLD_D << "],\n";
+    std::snprintf(buf, sizeof(buf),
+                  "  \"player_spawn\": {\"x\": %d, \"y\": %d, \"z\": %d, \"yaw\": %.4f, \"pitch\": %.4f},\n",
+                  g_spawnCellX, g_spawnCellY, g_spawnCellZ, g_yaw, g_pitch);
+    f << buf;
+    f << "  \"pickups\": [";
+    for (size_t i = 0; i < g_pickups.size(); ++i) {
+        const ItemDef* d = itemDefAt(g_itemDefs, g_pickups[i].defIndex);
+        std::snprintf(buf, sizeof(buf), "%s\n    {\"item\": \"%s\", \"x\": %d, \"y\": %d, \"z\": %d, \"rot\": %d}",
+                      i ? "," : "", d ? d->id.c_str() : "", g_pickups[i].cx, g_pickups[i].cy,
+                      g_pickups[i].cz, g_pickups[i].rot);
+        f << buf;
+    }
+    f << "\n  ],\n";
+    f << "  \"cells_rle\": " << mapvox::worldToRle(world) << "\n}\n";
+    return static_cast<bool>(f);
 }
 
 static void cleanup() {
@@ -5876,6 +5685,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             g_smoke = true;
         }
     }
+    std::string exportMapPath; // --export-map <path>: write the world as a map and exit
+    {
+        const std::string flag = "--export-map ";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos) {
+            size_t b = at + flag.size();
+            while (b < cmd.size() && cmd[b] == ' ') ++b;
+            size_t e = b;
+            if (b < cmd.size() && cmd[b] == '"') { ++b; e = cmd.find('"', b); }
+            else e = cmd.find(' ', b);
+            exportMapPath = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+        }
+    }
     int meshHelpersOverride = -1;
     {
         const std::string flag = "--mesh-helpers";
@@ -5908,7 +5730,34 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         }
         createSync();
 
-        sim::World world = buildWarehouseMap();
+        // The world comes from data/maps/warehouse_v1.map.vox.json (exported
+        // from the old procedural builder, with fingerprint parity, then the
+        // builder was deleted). --export-map re-saves whatever world loaded.
+        sim::World world;
+        {
+            mapvox::Doc mapDoc;
+            const std::string candidates[] = {
+                g_exeDir + "\\maps\\warehouse_v1.map.vox.json",
+                g_exeDir + "\\..\\data\\maps\\warehouse_v1.map.vox.json",
+                g_exeDir + "\\..\\..\\data\\maps\\warehouse_v1.map.vox.json",
+            };
+            bool loaded = false;
+            {
+                for (const auto& path : candidates) {
+                    if (!mapvox::loadMapVox(path, mapDoc)) continue;
+                    if (mapDoc.sx != WORLD_W || mapDoc.sy != WORLD_H || mapDoc.sz != WORLD_D)
+                        fail("map " + path + " does not match the world size");
+                    world = makeEmptyWorld();
+                    mapvox::stampMapVox(mapDoc, world, 0, 0, 0);
+                    g_mapSpawn = mapDoc.spawn;
+                    g_mapPickups = mapDoc.pickups;
+                    g_mapPath = path;
+                    loaded = true;
+                    break;
+                }
+            }
+            if (!loaded) fail("map not found: data\\maps\\warehouse_v1.map.vox.json");
+        }
         g_world = &world;
         spawnPlayerOnMap(world);
 
@@ -5949,6 +5798,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         // on the apron in front of the player.
         seedPickups();
         ensurePickupBuffer();
+
+        if (!exportMapPath.empty()) {
+            const bool ok = exportMapDocument(world, exportMapPath);
+            g_world = nullptr;
+            g_views = nullptr;
+            cleanup();
+            return ok ? 0 : 1;
+        }
 
         // Initial build: send every chunk's snapshot, mesh each one from that
         // snapshot, then lay out stable per-chunk slots so later impacts only
@@ -6105,6 +5962,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nvertices=" << g_liveVertexCount
                 << "\nvertex_slots=" << g_vertexCount
                 << "\nsim_fingerprint=" << std::hex << simPrint << std::dec
+                << "\nmap_source=" << (g_mapPath.empty() ? std::string("procedural") : g_mapPath)
                 << "\nmesh_repacks=" << g_meshRepackCount
                 << "\nmesh_relocations=" << g_meshRelocateCount
                 << "\nmesh_touched_avg=" << (g_meshUploadSamples > 0 ? double(g_meshTouchedSum) / g_meshUploadSamples : 0.0)

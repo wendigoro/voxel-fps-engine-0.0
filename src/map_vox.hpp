@@ -74,6 +74,21 @@ struct PatrolRoute {
     std::vector<PatrolNode> nodes;
 };
 
+// Where the player stands on (re)spawn: the cell the feet occupy, and the
+// facing. Authored on the map, so respawn never has to search the grid.
+struct PlayerSpawn {
+    bool present = false;
+    int x = 0, y = 0, z = 0;
+    float yaw = 0.0f, pitch = 0.0f;
+};
+
+// A world item resting on a cell. `item` is an id from data/items.
+struct PickupPlacement {
+    std::string item;
+    int x = 0, y = 0, z = 0;
+    int rot = 0; // quarter turns about +Y
+};
+
 struct Voxel {
     int x = 0, y = 0, z = 0;
     sim::Block block = sim::Block::Air; // occupancy stamped into the world
@@ -96,7 +111,35 @@ struct Doc {
     std::vector<PatrolRoute> routes;
     std::vector<Voxel> voxels;
     int dropped = 0;                       // voxels skipped (no sim::Block cup)
+    PlayerSpawn spawn;                     // "player_spawn" (optional)
+    std::vector<PickupPlacement> pickups;  // "pickups" (optional)
+    // "cells_rle": run-length occupancy for whole maps. A palette of block
+    // names, then runs as flat [y, z, x0, length, paletteIndex] quintuples
+    // along +X. Cells not covered by a run are Air.
+    std::vector<sim::Block> rlePalette;
+    std::vector<int> rleRuns;
+    int rleCells = 0;                      // cells the runs cover
 };
+
+// Every sim::Block by name, both directions. Painter materials map through
+// blockFromMaterialName below; these extra names (water_current, light_bulb,
+// moon) are engine blocks the painter cannot author, used by run-length maps.
+inline const char* blockName(sim::Block b) {
+    switch (b) {
+    case sim::Block::Air: return "air";
+    case sim::Block::Dirt: return "dirt";
+    case sim::Block::Concrete: return "concrete";
+    case sim::Block::SheetMetal: return "sheet_metal";
+    case sim::Block::Girder: return "girder";
+    case sim::Block::Wood: return "wood";
+    case sim::Block::WoodDark: return "bush_branch";
+    case sim::Block::Water: return "water";
+    case sim::Block::WaterCurrent: return "water_current";
+    case sim::Block::Moon: return "moon";
+    case sim::Block::LightBulb: return "light_bulb";
+    }
+    return "air";
+}
 
 // Painter material name -> sim::Block. Only materials with a real occupancy cup
 // map; anything else leaves `mapped` untouched and returns false (dropped).
@@ -109,6 +152,9 @@ inline bool blockFromMaterialName(const std::string& name, sim::Block& mapped) {
     if (name == "sheet_metal") { mapped = sim::Block::SheetMetal; return true; }
     if (name == "girder") { mapped = sim::Block::Girder; return true; }
     if (name == "water") { mapped = sim::Block::Water; return true; }
+    if (name == "water_current") { mapped = sim::Block::WaterCurrent; return true; }
+    if (name == "light_bulb") { mapped = sim::Block::LightBulb; return true; }
+    if (name == "moon") { mapped = sim::Block::Moon; return true; }
     return false; // bush_leaves / plexiglass / carbon_fiber / treated_wood / custom
 }
 
@@ -287,6 +333,65 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
         }
     }
 
+    // player_spawn
+    {
+        const std::string o = jsonExtractObjectBody(text, "player_spawn");
+        if (!o.empty()) {
+            doc.spawn.present = true;
+            doc.spawn.x = jsonInt(o, "x"); doc.spawn.y = jsonInt(o, "y"); doc.spawn.z = jsonInt(o, "z");
+            doc.spawn.yaw = jsonExtractFloat(o, "yaw", 0.0f);
+            doc.spawn.pitch = jsonExtractFloat(o, "pitch", 0.0f);
+        }
+    }
+
+    // pickups
+    {
+        const std::string arr = jsonExtractArrayBody(text, "pickups");
+        size_t pos = 0, s = 0, e = 0;
+        while (jsonxNextObject(arr, pos, s, e)) {
+            const std::string o = arr.substr(s, e - s);
+            PickupPlacement pk;
+            pk.item = jsonExtractString(o, "item", "");
+            pk.x = jsonInt(o, "x"); pk.y = jsonInt(o, "y"); pk.z = jsonInt(o, "z");
+            pk.rot = jsonInt(o, "rot") & 3;
+            if (!pk.item.empty()) doc.pickups.push_back(pk);
+            pos = e;
+        }
+    }
+
+    // cells_rle: palette names first, so a run can be validated as it is read
+    {
+        const std::string rle = jsonExtractObjectBody(text, "cells_rle");
+        if (!rle.empty()) {
+            const std::string pal = jsonExtractArrayBody(rle, "palette");
+            size_t i = 0;
+            while ((i = pal.find('"', i)) != std::string::npos) {
+                const size_t j = pal.find('"', i + 1);
+                if (j == std::string::npos) break;
+                sim::Block b = sim::Block::Air;
+                if (!blockFromMaterialName(pal.substr(i + 1, j - i - 1), b)) {
+                    doc.error = "cells_rle palette has an unknown block \"" + pal.substr(i + 1, j - i - 1) + "\"";
+                    return false;
+                }
+                doc.rlePalette.push_back(b);
+                i = j + 1;
+            }
+            doc.rleRuns = jsonExtractIntArray(rle, "runs");
+            if (doc.rleRuns.size() % 5 != 0) {
+                doc.error = "cells_rle runs must be [y, z, x0, length, palette] quintuples";
+                return false;
+            }
+            for (size_t r = 0; r < doc.rleRuns.size(); r += 5) {
+                const int len = doc.rleRuns[r + 3], pi = doc.rleRuns[r + 4];
+                if (len <= 0 || pi < 0 || pi >= static_cast<int>(doc.rlePalette.size())) {
+                    doc.error = "cells_rle run " + std::to_string(r / 5) + " is malformed";
+                    return false;
+                }
+                doc.rleCells += len;
+            }
+        }
+    }
+
     restoreCounters(doc, doc.restored);
     doc.ok = true;
     return true;
@@ -329,7 +434,48 @@ inline StampResult stampMapVox(const Doc& doc, sim::World& world, int ox, int oy
         world.set(wx, wy, wz, v.block);
         ++r.written;
     }
+    const auto& runs = doc.rleRuns;
+    for (size_t i = 0; i + 4 < runs.size(); i += 5) {
+        const sim::Block b = doc.rlePalette[runs[i + 4]];
+        for (int k = 0; k < runs[i + 3]; ++k) {
+            const int wx = ox + runs[i + 2] + k, wy = oy + runs[i], wz = oz + runs[i + 1];
+            if (!sim::World::inBounds(wx, wy, wz)) { ++r.skipped; continue; }
+            world.set(wx, wy, wz, b);
+            ++r.written;
+        }
+    }
     return r;
+}
+
+// Write a whole world as a run-length map document (the inverse of
+// cells_rle). Runs go along +X within each (y, z) row; Air is never written.
+inline std::string worldToRle(const sim::World& world) {
+    std::string runs;
+    bool first = true;
+    for (int y = 0; y < sim::kWorldH; ++y)
+        for (int z = 0; z < sim::kWorldD; ++z) {
+            int x = 0;
+            while (x < sim::kWorldW) {
+                const sim::Block b = world.get(x, y, z);
+                int len = 1;
+                while (x + len < sim::kWorldW && world.get(x + len, y, z) == b) ++len;
+                if (b != sim::Block::Air) {
+                    runs += first ? "" : ",";
+                    runs += std::to_string(y) + "," + std::to_string(z) + "," + std::to_string(x) + "," +
+                            std::to_string(len) + "," + std::to_string(static_cast<int>(b));
+                    first = false;
+                }
+                x += len;
+            }
+        }
+    // The palette is every block in enum order, so a run's index is its Block.
+    std::string pal;
+    for (int i = 0; i <= static_cast<int>(sim::Block::LightBulb); ++i) {
+        pal += (i ? ", \"" : "\"");
+        pal += blockName(static_cast<sim::Block>(i));
+        pal += "\"";
+    }
+    return "{\"palette\": [" + pal + "], \"runs\": [" + runs + "]}";
 }
 
 } // namespace mapvox

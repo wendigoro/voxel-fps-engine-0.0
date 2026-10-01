@@ -90,6 +90,31 @@ understand.
 The engine reads map mode through `src/map_vox.hpp`, which applies the same refusals (version,
 `unit`, `voxel_size`, mode) and stamps the voxel grid into authoritative occupancy.
 
+### Whole-map sections (engine maps, e.g. `data/maps/warehouse_v1.map.vox.json`)
+
+```json
+{
+  "player_spawn": {"x": 96, "y": 3, "z": 132, "yaw": 0.0, "pitch": -0.08},
+  "pickups": [{"item": "supply_grenade", "x": 93, "y": 3, "z": 126, "rot": 0}],
+  "cells_rle": {
+    "palette": ["air", "dirt", "concrete", "..."],
+    "runs": [0, 0, 0, 192, 1, "..."]
+  }
+}
+```
+
+- `player_spawn` is the cell the player's feet occupy, plus facing. It is used for the first
+  spawn and every respawn. An engine map without one is refused.
+- `pickups` are world items resting on exact cells; `item` is an id from `data/items`. An
+  unknown id is skipped, not faked. `rot` is quarter turns about +Y.
+- `cells_rle` is run-length occupancy for maps too large to list voxel by voxel. `runs` is a
+  flat list of `[y, z, x0, length, paletteIndex]` quintuples along +X; cells no run covers are
+  Air. Palette names are the painter material names that map to engine blocks, plus three
+  engine-only blocks the painter cannot author: `water_current`, `light_bulb` and `moon`.
+  An unknown palette name, a non-positive length, or an out-of-range index refuses the map.
+- The painter does not read or write these sections yet.
+- `dims` must equal the engine world size (currently 192×64×160) for an engine map.
+
 ## Weapon parts (per-voxel `part` field)
 
 | id | name | primary stat |
