@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "render_class.glsl"
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec3 inColor;
@@ -30,8 +32,9 @@ layout(location = 4) out vec2 fragNdc;
 layout(location = 5) out float fragViewZ;
 
 void main() {
+    int rc = renderClass(inMat);
     vec3 pos = inPosition;
-    if (inMat > 0.5 && inMat < 1.5) {
+    if (rc == RC_WATER) {
         float w = sin(pos.x * 200.0 + ubo.time * 2.0) * cos(pos.z * 180.0 + ubo.time * 1.5);
         pos.y += 0.00015 * w;
     }
@@ -45,16 +48,15 @@ void main() {
     vec2 ndc = clip.xy / wclip;
 
     // Strong true-sky style fisheye (barrel + higher-order terms)
-    // Skipped for mat 7 ONLY (inventory lattice, RULES.md rule 12): the lattice
-    // is parented to the camera and must read as a clean 3D projection rather
-    // than being bent by a screen-space barrel distortion. The gate is an exact
-    // mat-7 test, not `inMat < 6.5`, so mat 8 (world pickups) keeps the
-    // fisheye like every other world object. This is also what makes the CPU
-    // screen-space cell picking in main.cpp exact: mat 7 is the only geometry
-    // whose GPU rasterisation matches its unprojected CPU transform.
-    if (inMat < 6.5 || inMat > 7.5) {
+    // Skipped for the inventory lattice ONLY (RULES.md rule 12): it is parented
+    // to the camera and must read as a clean 3D projection rather than being
+    // bent by a screen-space barrel distortion. World pickups keep the fisheye
+    // like every other world object. This is also what makes the CPU
+    // screen-space cell picking in main.cpp exact: the lattice is the only
+    // geometry whose GPU rasterisation matches its unprojected CPU transform.
+    if (rc != RC_INVENTORY_LATTICE) {
     float r = length(ndc);
-float strength = (inMat > 2.5 && inMat < 4.5) ? 1.35 : 1.0;
+    float strength = (rc == RC_MOON || rc == RC_SKY) ? 1.35 : 1.0;
     float k1 = 0.55 * strength;
     float k2 = 0.22 * strength;
     float k3 = 0.08 * strength;
@@ -70,13 +72,13 @@ float strength = (inMat > 2.5 && inMat < 4.5) ? 1.35 : 1.0;
     clip.xy = ndc * wclip;
 
     // Sky dome + moon stay at far plane so world wins on depth
-    if (inMat > 2.5 && inMat < 4.5) {
+    if (rc == RC_MOON || rc == RC_SKY) {
         clip.z = clip.w * 0.999;
     }
     // Muzzle flash cubes: slight depth bias toward camera so they don't z-fight.
-    // mat 7 is excluded: it draws in the overlay pass with a cleared depth
-    // buffer, so no bias is needed (and none would be strong enough anyway).
-    if (inMat > 5.5 && inMat < 6.5) {
+    // The inventory lattice needs none: it draws in the overlay pass with a
+    // cleared depth buffer.
+    if (rc == RC_MUZZLE) {
         clip.z = clip.z * 0.98;
     }
 

@@ -32,6 +32,7 @@
 #include "materials.hpp"
 #include "map_vox.hpp"
 #include "mesh_view.hpp"
+#include "render_class.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
 #include "ballistics.hpp"
@@ -393,8 +394,8 @@ static VkDeviceMemory g_inventoryMem = VK_NULL_HANDLE;
 static void* g_inventoryMapped = nullptr;
 static uint32_t g_inventoryVertexCount = 0;
 static uint32_t g_inventoryOverlayFrames = 0; // frames that actually submitted the pass
-static constexpr uint32_t kInventoryMatId = 7;
-static constexpr uint32_t kPickupMatId = 8;    // world pickups: main pass, not the overlay
+static constexpr float kInventoryMatId = rc::attr(rc::RenderClass::InventoryLattice);
+static constexpr float kPickupMatId = rc::attr(rc::RenderClass::WorldPickup); // main pass, not the overlay
 
 // Display basis + origin, rebuilt with the mesh. Look-and-click picks cells in
 // SCREEN space against this transform rather than by casting a world ray, which
@@ -1962,7 +1963,7 @@ static void updateMoonSkyTile() {
         dst.nx = n.x; dst.ny = n.y; dst.nz = n.z;
         // cr/cg = local tile UV for pixel grid; cb packs sky elevation 0..1
         dst.cr = tileU; dst.cg = tileV; dst.cb = v;
-        dst.mat = 4.0f; // sky tile
+        dst.mat = rc::attr(rc::RenderClass::Sky);
     };
 
     uint32_t wi = 0;
@@ -1986,7 +1987,7 @@ static void updateMoonSkyTile() {
         }
     }
 
-    // Moon light-source sprite (mat=3), camera-facing at moon bearing
+    // Moon light-source sprite (RenderClass::Moon), camera-facing at moon bearing
     Vec3 to = g_moonDirWorld;
     Vec3 worldUp(0, 1, 0);
     Vec3 right = to.cross(worldUp);
@@ -2004,7 +2005,7 @@ static void updateMoonSkyTile() {
         dst.px = p.x; dst.py = p.y; dst.pz = p.z;
         dst.nx = mn.x; dst.ny = mn.y; dst.nz = mn.z;
         dst.cr = u; dst.cg = v; dst.cb = 1.0f;
-        dst.mat = 3.0f;
+        dst.mat = rc::attr(rc::RenderClass::Moon);
     };
     putMoon(verts[wi++], m0, 0, 0);
     putMoon(verts[wi++], m1, 1, 0);
@@ -2539,7 +2540,8 @@ static void createSwapchain() {
     ci.imageColorSpace = format.colorSpace;
     ci.imageExtent = g_extent;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // TRANSFER_SRC lets the capture harness copy a finished frame out (--capture).
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     uint32_t qfs[] = {static_cast<uint32_t>(g_qidx.graphics),
                       static_cast<uint32_t>(g_qidx.present)};
     if (g_qidx.graphics != g_qidx.present) {
@@ -4607,6 +4609,98 @@ static void recreateSwapchain() {
     createFramebuffers();
 }
 
+// ---- frame capture (view-only test harness) ----
+// --capture <dir> runs the smoke, stops ticking, then renders a fixed list of
+// camera shots and writes each finished frame to <dir>/<shot>.ppm. Golden
+// images of those shots are how visual changes are checked: a change that is
+// meant to be invisible must reproduce them, and one that is meant to be
+// visible can be looked at. The copy is recorded into the same command buffer
+// that draws the frame, while the image is still ours, i.e. before present.
+static std::string g_captureDir;
+static bool g_captureActive = false;    // shots are rendering; the sim is no longer ticking
+static bool g_captureThisFrame = false; // record a copy of this frame's swapchain image
+static VkBuffer g_captureBuf = VK_NULL_HANDLE;
+static VkDeviceMemory g_captureMem = VK_NULL_HANDLE;
+static void* g_captureMapped = nullptr;
+static VkDeviceSize g_captureSize = 0;
+
+static bool ensureCaptureBuffer() {
+    const VkDeviceSize need = VkDeviceSize(g_extent.width) * g_extent.height * 4;
+    if (g_captureBuf && g_captureSize >= need) return true;
+    if (g_captureBuf) {
+        vkUnmapMemory(g_device, g_captureMem);
+        vkDestroyBuffer(g_device, g_captureBuf, nullptr);
+        vkFreeMemory(g_device, g_captureMem, nullptr);
+        g_captureBuf = VK_NULL_HANDLE;
+        g_captureMem = VK_NULL_HANDLE;
+    }
+    createBuffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_captureBuf, g_captureMem);
+    vkMapMemory(g_device, g_captureMem, 0, need, 0, &g_captureMapped);
+    g_captureSize = need;
+    return g_captureMapped != nullptr;
+}
+
+// Both render passes leave the image in PRESENT_SRC_KHR; borrow it for a copy
+// and hand it back in the same layout, so presentation is unaffected.
+static void recordCaptureCopy(VkCommandBuffer cmd, uint32_t imageIndex) {
+    VkImageMemoryBarrier toSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image = g_swapImages[imageIndex];
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {g_extent.width, g_extent.height, 1};
+    vkCmdCopyImageToBuffer(cmd, g_swapImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           g_captureBuf, 1, &region);
+
+    VkImageMemoryBarrier back = toSrc;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    back.dstAccessMask = 0;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkBufferMemoryBarrier toHost{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHost.buffer = g_captureBuf;
+    toHost.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                         nullptr, 1, &toHost, 1, &back);
+}
+
+// Write the captured frame as binary PPM (RGB). Callers wait for the GPU first.
+static bool writeCapturePpm(const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const uint32_t w = g_extent.width, h = g_extent.height;
+    f << "P6\n" << w << " " << h << "\n255\n";
+    const bool bgr = g_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || g_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
+    const auto* px = static_cast<const uint8_t*>(g_captureMapped);
+    std::vector<uint8_t> row(size_t(w) * 3);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = px + (size_t(y) * w + x) * 4;
+            row[x * 3 + 0] = bgr ? p[2] : p[0];
+            row[x * 3 + 1] = p[1];
+            row[x * 3 + 2] = bgr ? p[0] : p[2];
+        }
+        f.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+    }
+    return static_cast<bool>(f);
+}
+
 static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     VkCommandBuffer cmd = g_cmdBuffers[frameIndex];
     vkResetCommandBuffer(cmd, 0);
@@ -4719,6 +4813,8 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         vkCmdDraw(cmd, g_inventoryVertexCount, 1, 0, 0);
         vkCmdEndRenderPass(cmd);
     }
+
+    if (g_captureThisFrame && g_captureBuf) recordCaptureCopy(cmd, imageIndex);
 
     vkEndCommandBuffer(cmd);
 }
@@ -5106,7 +5202,7 @@ static Vec3 lerpEye(const Vec3& a, const Vec3& b, float t) {
 }
 
 static Vec3 renderEye() {
-    if (g_paused) return g_camPos;
+    if (g_paused || g_captureActive) return g_camPos;
     const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
     return lerpEye(g_camPosPrevTick, g_camPos, alpha);
 }
@@ -5338,8 +5434,73 @@ static void drawFrame(float timeSec) {
     paceFrame120();
 }
 
+// Fixed camera shots for --capture, in cell coordinates on the current map.
+// The sim has stopped ticking when these run; placing the camera here is a test
+// harness posing a view, and nothing is simulated afterwards.
+// Extras stage view content a shot needs so every render class is on camera:
+// the inventory overlay, and a burst of debris chips plus a muzzle flash.
+enum CaptureExtras : int { kShotPlain = 0, kShotInventory = 1, kShotEffects = 2, kShotDebris = 4 };
+struct CaptureShot {
+    const char* name;
+    float cx, cy, cz; // eye position, in cells
+    float yaw, pitch;
+    int extras;
+};
+static const CaptureShot kCaptureShots[] = {
+    {"bay_inward",      96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotPlain},
+    {"interior_crates", 150.0f, 18.0f, 110.0f, -0.90f, -0.20f, kShotPlain},
+    {"back_corner",     20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain},
+    {"exterior_river",  186.0f, 46.0f, 158.0f, -0.85f, -0.42f, kShotPlain},
+    {"effects_crate",   34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotEffects},
+    {"debris_crate",    34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotDebris},
+};
+
+static int runCaptureShots(float timeSec) {
+    int written = 0;
+    g_captureActive = true;
+    g_recoilPitch = g_recoilYaw = 0.0f;
+    for (const CaptureShot& shot : kCaptureShots) {
+        g_camPos = Vec3(shot.cx * VOXEL_SIZE, shot.cy * VOXEL_SIZE, shot.cz * VOXEL_SIZE);
+        g_yaw = shot.yaw;
+        g_pitch = shot.pitch;
+        g_inventoryOpen = (shot.extras & kShotInventory) != 0;
+        if (shot.extras & (kShotEffects | kShotDebris)) {
+            // Chips thrown off the top edge of the first crate (see
+            // buildWarehouseMap). The sim is not ticking, so they hold still.
+            for (int x = 32; x <= 35; ++x)
+                g_debris.spawnFromVoxel(x, 10, 41, MaterialId::Wood, 0.0f, 0.4f, 1.0f, 6.0f,
+                                        VOXEL_SIZE, 1.0f);
+            g_debris.meshDirty = true;
+        }
+        if (shot.extras & kShotEffects) g_muzzleFlash = 1.0f;
+        // Two frames per shot: per-frame view state (sky dome around the eye,
+        // pickup hover) settles on the first, the second is the one kept.
+        for (int i = 0; i < 2; ++i) {
+            vkDeviceWaitIdle(g_device);
+            g_captureThisFrame = (i == 1) && ensureCaptureBuffer();
+            drawFrame(timeSec);
+        }
+        vkDeviceWaitIdle(g_device);
+        if (g_captureThisFrame &&
+            writeCapturePpm(g_captureDir + "\\" + shot.name + ".ppm"))
+            ++written;
+        g_captureThisFrame = false;
+        g_inventoryOpen = false;
+        g_muzzleFlash = 0.0f;
+    }
+    g_captureActive = false;
+    return written;
+}
+
 static void cleanup() {
     if (g_device) vkDeviceWaitIdle(g_device);
+    if (g_captureBuf) {
+        vkUnmapMemory(g_device, g_captureMem);
+        vkDestroyBuffer(g_device, g_captureBuf, nullptr);
+        vkFreeMemory(g_device, g_captureMem, nullptr);
+        g_captureBuf = VK_NULL_HANDLE;
+        g_captureMem = VK_NULL_HANDLE;
+    }
     destroySwapchainObjects();
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, nullptr);
     if (g_overlayPipeline) vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
@@ -5701,6 +5862,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
     }
     // --mesh-helpers N overrides the mesh pool size (0 = serial), so the pooled
     // and serial mesher can be timed back to back on the same machine state.
+    {
+        // --capture <dir>: run the smoke, then write the fixed camera shots there.
+        const std::string flag = "--capture";
+        const size_t at = cmd.find(flag + " ");
+        if (at != std::string::npos) {
+            size_t b = at + flag.size() + 1;
+            while (b < cmd.size() && cmd[b] == ' ') ++b;
+            size_t e = b;
+            if (b < cmd.size() && cmd[b] == '"') { ++b; e = cmd.find('"', b); }
+            else e = cmd.find(' ', b);
+            g_captureDir = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+            g_smoke = true;
+        }
+    }
     int meshHelpersOverride = -1;
     {
         const std::string flag = "--mesh-helpers";
@@ -5889,12 +6064,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             }
         }
 
+        // The simulation's end state, fingerprinted before anything else runs:
+        // capture shots stage view content and the self-tests poke player state.
+        const uint64_t simPrint = simFingerprint();
+
+        // Capture harness: the smoke ticks are done; pose and capture the shots.
+        int captureShots = 0;
+        if (!g_captureDir.empty() && g_running == false && g_tick >= g_smokeTicks) {
+            CreateDirectoryA(g_captureDir.c_str(), nullptr);
+            captureShots = runCaptureShots(static_cast<float>(g_tick) * static_cast<float>(TICK_DT));
+        }
+
         vkDeviceWaitIdle(g_device);
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
-            // Taken before the self-tests below, which may poke player state.
-            const uint64_t simPrint = simFingerprint();
             const bool jsonxOk = jsonxSelfTest();
             const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
@@ -6147,6 +6331,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\npause_frames=" << g_smokePausedFrames
                 << "\npause_ticks_frozen_ok=" << (g_smokePauseFrozenOk ? 1 : 0)
                 << "\neye_interp_ok=" << (eyeInterpOk ? 1 : 0)
+                << "\ncapture_shots=" << captureShots
                 << "\nmesh_workers_equiv_ok=" << (g_simViewSmoke.meshWorkersEquivOk ? 1 : 0)
                 << "\nmesh_workers_test_helpers=" << g_simViewSmoke.meshWorkersHelpers
                 << "\nmesh_workers_test_chunks=" << g_simViewSmoke.meshWorkersChunks

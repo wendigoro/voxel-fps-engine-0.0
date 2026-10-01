@@ -228,6 +228,32 @@ def check_fisheye_constants() -> None:
         )
 
 
+def check_render_classes() -> None:
+    """src/render_class.hpp enum == shaders/render_class.glsl RC_* constants."""
+    hpp = (ROOT / "src" / "render_class.hpp").read_text(encoding="utf-8")
+    glsl = (ROOT / "shaders" / "render_class.glsl").read_text(encoding="utf-8")
+    body = re.search(r"enum class RenderClass : uint8_t \{(.*?)\};", hpp, re.S)
+    check(body is not None, "render_class.hpp has a RenderClass enum")
+    if body is None:
+        return
+    cpp = {}
+    for name, value in re.findall(r"^\s*(\w+)\s*=\s*(\d+)\s*,", body.group(1), re.M):
+        cpp["RC_" + camel_to_snake(name).upper()] = int(value)
+    gl = {name: int(v) for name, v in re.findall(r"const int (RC_\w+)\s*=\s*(\d+);", glsl)}
+    check(len(cpp) > 0, "render classes parsed from render_class.hpp")
+    check(
+        cpp == gl,
+        "render classes: render_class.hpp == render_class.glsl",
+        f"c++={sorted(cpp.items(), key=lambda kv: kv[1])} "
+        f"glsl={sorted(gl.items(), key=lambda kv: kv[1])}",
+    )
+    check(
+        sorted(cpp.values()) == list(range(len(cpp))),
+        "render classes are dense from 0",
+        f"{sorted(cpp.values())}",
+    )
+
+
 def main() -> int:
     from projectiles.materials import MASS_SCALE, MATERIALS, VOXEL_SIZE  # noqa: PLC0415
 
@@ -313,6 +339,10 @@ def main() -> int:
     #    culler stops agreeing with what the vertex shader draws, which shows up
     #    as chunks popping or being drawn for nothing.
     check_fisheye_constants()
+
+    # 7. Render classes: the vertex attribute numbers must mean the same thing
+    #    to the C++ emitters and to the shaders that branch on them.
+    check_render_classes()
 
     if failures:
         print("check_constants: FAIL")

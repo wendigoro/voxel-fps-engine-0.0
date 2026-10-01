@@ -30,11 +30,17 @@ if ($LASTEXITCODE -ne 0) { throw "export_projectiles.py failed: $LASTEXITCODE" }
 Write-Host "== compile shaders ==" -ForegroundColor Cyan
 $glslc = Join-Path $VK "Bin\glslc.exe"
 if (-not (Test-Path $glslc)) { throw "glslc missing: $glslc" }
-& $glslc (Join-Path $Root "shaders\voxel.vert") -o (Join-Path $Build "shaders\voxel.vert.spv")
-& $glslc (Join-Path $Root "shaders\voxel.frag") -o (Join-Path $Build "shaders\voxel.frag.spv")
+# A failed compile must fail the build: otherwise the previous .spv stays in
+# build/shaders and the engine silently runs the old shader.
+function Compile-Shader([string]$Name) {
+  & $glslc (Join-Path $Root "shaders\$Name") -o (Join-Path $Build "shaders\$Name.spv")
+  if ($LASTEXITCODE -ne 0) { throw "glslc failed for $Name ($LASTEXITCODE)" }
+}
+Compile-Shader "voxel.vert"
+Compile-Shader "voxel.frag"
 if (Test-Path (Join-Path $Root "shaders\post.vert")) {
-  & $glslc (Join-Path $Root "shaders\post.vert") -o (Join-Path $Build "shaders\post.vert.spv")
-  & $glslc (Join-Path $Root "shaders\post.frag") -o (Join-Path $Build "shaders\post.frag.spv")
+  Compile-Shader "post.vert"
+  Compile-Shader "post.frag"
 }
 
 Write-Host "== compile engine (Clang + VS env) ==" -ForegroundColor Cyan

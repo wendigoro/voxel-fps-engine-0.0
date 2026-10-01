@@ -35,6 +35,27 @@ The engine is being split into an **authoritative simulation process** (physics,
 - A full-screen effect that shades the *world* (e.g. `applyFireOverlay` in `shaders/voxel.frag`) is a **world pass**, not a menu. Keep the two categories distinct: a world post effect runs inside the world pipeline over already-shaded geometry, whereas a menu is separate geometry in a separate pass. Do not implement a menu by extending the world fragment shader's output.
 - If an overlay ever needs information the client was not sent (another player's inventory, a cell behind a wall), that is a **contract violation**, not a rendering problem. Route it through the visibility filter like any other stream.
 
+### Render layers
+
+Everything on screen belongs to exactly one layer. The layer decides who owns the data and
+whether the simulation may ever read it.
+
+| Layer | Owner | Holds | Read by the sim? |
+|-------|-------|-------|------------------|
+| Occupancy | sim | material per unit cell (solid, water, air) | **yes: it is the authority** |
+| Appearance | sim → view | per-cell palette colour, emissive flag; sent with chunk snapshots | never |
+| Surface | view | meshes derived from sent cells: faces, AO, smoothing, textures | never |
+| Entities | sim | spawn points, pickups, lights, NPCs, events, props | yes (their sim state) |
+| Models | view | character, weapon and prop meshes placed by entity transforms | never |
+| Effects | view | debris sub-lattice chips, muzzle flash | never |
+| Environment | view (from map data) | sky, moon, light sources | never |
+| Overlay | view | inventory lattice, HUD, menus (separate pass) | never |
+
+Each vertex carries a **render class** (`src/render_class.hpp`, mirrored in
+`shaders/render_class.glsl`; `scripts/check_constants.py` fails the build if they differ). Shaders
+test classes by exact equality, never by `>` thresholds, so branch order cannot change what a
+surface is. Class numbers are permanent; new classes are appended.
+
 ### Player body, and the camera-offset contract (mandatory)
 
 The player's body position and velocity are **simulation state**. The camera is a **view output**. These are separate, and the separation is not negotiable.
