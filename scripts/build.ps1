@@ -47,6 +47,27 @@ Write-Host "== compile engine (Clang + VS env) ==" -ForegroundColor Cyan
 if (-not (Test-Path $VCVARS)) { throw "vcvars64.bat missing: $VCVARS" }
 if (-not (Test-Path (Join-Path $LLVM "clang++.exe"))) { throw "clang++ missing under $LLVM" }
 
+# Dear ImGui (third_party/imgui, MIT) is compiled once into build/imgui/*.o and
+# only recompiled when a source is newer than its object, so the engine build
+# does not pay for ~2 MB of third-party source every time.
+$ImguiDir = Join-Path $Root "third_party\imgui"
+$ImguiObjDir = Join-Path $Build "imgui"
+New-Item -ItemType Directory -Force -Path $ImguiObjDir | Out-Null
+$imguiSources = @("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp",
+                  "backends\imgui_impl_vulkan.cpp", "backends\imgui_impl_win32.cpp")
+$imguiCompile = @()
+$imguiObjects = @()
+foreach ($rel in $imguiSources) {
+  $srcFile = Join-Path $ImguiDir $rel
+  $objFile = Join-Path $ImguiObjDir ([IO.Path]::GetFileNameWithoutExtension($rel) + ".o")
+  $imguiObjects += "`"$objFile`""
+  if (-not (Test-Path $objFile) -or (Get-Item $srcFile).LastWriteTime -gt (Get-Item $objFile).LastWriteTime) {
+    $imguiCompile += "clang++.exe -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS -I`"$ImguiDir`" -I`"$VK\Include`" -c `"$srcFile`" -o `"$objFile`" || exit /b 1"
+  }
+}
+$imguiCompileLines = $imguiCompile -join "`r`n"
+$imguiObjectList = $imguiObjects -join " "
+
 $bat = @"
 @echo off
 REM vcvars64.bat probes for vswhere.exe and prints a benign "not recognized"
@@ -54,7 +75,8 @@ REM warning on stderr when it is absent. That must not abort the build, so
 REM both streams are discarded and the real clang exit code is what counts.
 call "$VCVARS" >nul 2>&1
 set "PATH=$LLVM;%PATH%"
-clang++.exe -std=c++17 -O2 -g -D_CRT_SECURE_NO_WARNINGS -I"$Src" -I"$VK\Include" "$Src\main.cpp" -o "$Build\voxel_engine.exe" -L"$VK\Lib" -lvulkan-1 -luser32 -lgdi32 -lshell32
+$imguiCompileLines
+clang++.exe -std=c++17 -O2 -g -D_CRT_SECURE_NO_WARNINGS -I"$Src" -I"$ImguiDir" -I"$VK\Include" "$Src\main.cpp" $imguiObjectList -o "$Build\voxel_engine.exe" -L"$VK\Lib" -lvulkan-1 -luser32 -lgdi32 -lshell32 -ldwmapi
 echo CLANG_EXIT=%ERRORLEVEL%
 exit /b %ERRORLEVEL%
 "@
