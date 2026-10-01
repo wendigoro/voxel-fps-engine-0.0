@@ -113,7 +113,7 @@ struct Vec3 {
     }
 };
 
-// A light the view should shade with, derived from occupancy.
+// A light the view shades with: one entry per map light (environment layer).
 struct BulbLight {
     Vec3 pos;          // world-space centre
     Vec3 color;
@@ -538,10 +538,9 @@ static uint32_t g_skyTileVertexCount = 0;
 static Vec3 g_skyTileEye = {0, 0, 0};
 static bool g_skyTileBuilt = false;
 static Vec3 g_moonWorldPos = {0, 0, 0};
-// Bulb lights harvested from Block::LightBulb occupancy. Cached because the grid
-// is 1.3M cells; re-harvested only when a fixture is actually destroyed.
+// Lights from the map's "lights" section (environment layer, not occupancy).
 static std::vector<BulbLight> g_bulbs;
-static bool g_bulbsDirty = true;
+static std::vector<mapvox::LightPlacement> g_mapLights;
 static Vec3 g_moonDirWorld = {0.32f, 0.82f, -0.48f}; // fixed sky bearing (light source)
 static float g_moonTileSize = 0.034f;
 static float g_skyRadius = 0.55f;
@@ -699,48 +698,6 @@ static void setWorldBlock(sim::World& w, int x, int y, int z, Block b) {
     w.set(x, y, z, b);
 }
 
-// Harvest bulb lights by reading Block::LightBulb out of the grid, then folding
-// vertically adjacent cells into one light per fixture. The grid is the only
-// authority on where a light is: the map can be repainted or a painter edit can
-// move a fixture, and lighting follows without a second list to keep in sync.
-static void harvestBulbLights(const sim::World& world,
-                              std::vector<BulbLight>& out) {
-    out.clear();
-    std::vector<char> consumed(static_cast<size_t>(WORLD_W) * WORLD_H * WORLD_D, 0);
-    auto idx = [](int x, int y, int z) {
-        return (static_cast<size_t>(z) * WORLD_H + y) * WORLD_W + x;
-    };
-    for (int z = 0; z < WORLD_D; ++z) {
-        for (int y = 0; y < WORLD_H; ++y) {
-            for (int x = 0; x < WORLD_W; ++x) {
-                if (consumed[idx(x, y, z)]) continue;
-                if (getWorldBlock(world, x, y, z) != Block::LightBulb) continue;
-                // Absorb the whole vertical run so a two-cell fixture is one light.
-                int runTop = y;
-                int cells = 0;
-                float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
-                while (runTop < WORLD_H &&
-                       getWorldBlock(world, x, runTop, z) == Block::LightBulb) {
-                    consumed[idx(x, runTop, z)] = 1;
-                    sumX += (x + 0.5f) * VOXEL_SIZE;
-                    sumY += (runTop + 0.5f) * VOXEL_SIZE;
-                    sumZ += (z + 0.5f) * VOXEL_SIZE;
-                    ++cells;
-                    ++runTop;
-                }
-                if (cells <= 0) continue;
-                const float inv = 1.0f / static_cast<float>(cells);
-                BulbLight l;
-                l.pos = Vec3(sumX * inv, sumY * inv, sumZ * inv);
-                l.color = Vec3(1.00f, 0.75f, 0.45f);
-                // Brighter and wider for a taller fixture, capped at the slot count.
-                l.intensity = std::min(1.8f, 1.2f + 0.2f * static_cast<float>(cells));
-                l.radius = std::min(0.09f, 0.06f + 0.01f * static_cast<float>(cells));
-                out.push_back(l);
-            }
-        }
-    }
-}
 
 // Fill a solid axis-aligned box with unit voxels (inclusive).
 // An all-Air world with every chunk allocated and placed.
@@ -1041,22 +998,27 @@ static void emitUnitCube(Vertex* verts, uint32_t& wi, uint32_t maxVerts,
                axU * ((y0 + ((bits & 2) ? 1.0f : 0.0f)) * edge) +
                axF * ((z0 + ((bits & 4) ? 1.0f : 0.0f)) * edge);
     };
-    // face axis, sign, then the two in-plane corner bitmaps
-    struct Face { int axis; int sign; int a, b, c, d; };
+    // Face axis and sign, then its four corners counter-clockwise seen from
+    // outside (the same faces and winding as meshview::emitSharpFace).
+    // Corner bits: 1 = +x, 2 = +y, 4 = +z.
+    struct Face { int axis; int sign; int c[4]; };
     static const Face kFaces[6] = {
-        {0, +1, 6, 2, 3, 7}, // +x
-        {0, -1, 4, 0, 1, 5}, // -x
-        {1, +1, 5, 1, 3, 7}, // +y
-        {1, -1, 4, 0, 2, 6}, // -y
-        {2, +1, 7, 3, 1, 5}, // +z
-        {2, -1, 6, 0, 2, 4}, // -z
+        {0, +1, {1, 3, 7, 5}}, // +x
+        {0, -1, {4, 6, 2, 0}}, // -x
+        {1, +1, {2, 6, 7, 3}}, // +y
+        {1, -1, {4, 0, 1, 5}}, // -y
+        {2, +1, {5, 7, 6, 4}}, // +z
+        {2, -1, {0, 2, 3, 1}}, // -z
     };
+    // Two triangles per quad. (This used to be corner(order[t / 2]), i.e.
+    // a,a,b,b,c,c: two degenerate triangles per face, so every cube drawn
+    // through here rasterised nothing.)
+    static const int kTri[6] = {0, 1, 2, 0, 2, 3};
     for (const auto& f : kFaces) {
         const Vec3 nrm = (f.axis == 0 ? axR : (f.axis == 1 ? axU : axF)) * static_cast<float>(f.sign);
-        const int order[4] = {f.a, f.b, f.c, f.d};
         for (int t = 0; t < 6; ++t) {
             Vertex& v = verts[wi++];
-            const Vec3 p = corner(order[t / 2]);
+            const Vec3 p = corner(f.c[kTri[t]]);
             v.px = p.x;
             v.py = p.y;
             v.pz = p.z;
@@ -1525,6 +1487,39 @@ static void seedPickups() {
     }
     // A map without "pickups" simply has none.
     g_pickupMeshDirty = true;
+}
+
+// Light fixtures (environment layer) are models, not occupancy: built once
+// from the map's lights and drawn in the main pass with the Bulb render class.
+// A "bulb" is a 1x2x1 stack of unit cubes centred on its light, the same
+// silhouette the old light_bulb cells had.
+static constexpr uint32_t kFixtureMaxVerts = 36u * 2u * 64u;
+static VkBuffer g_fixtureVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_fixtureMem = VK_NULL_HANDLE;
+static void* g_fixtureMapped = nullptr;
+static uint32_t g_fixtureVertexCount = 0;
+
+static void buildFixtureMesh() {
+    if (!g_fixtureVB) {
+        const VkDeviceSize size = sizeof(Vertex) * kFixtureMaxVerts;
+        createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_fixtureVB, g_fixtureMem);
+        vkMapMemory(g_device, g_fixtureMem, 0, size, 0, &g_fixtureMapped);
+    }
+    g_fixtureVertexCount = 0;
+    if (!g_fixtureMapped) return;
+    const Vec3 axR(1, 0, 0), axU(0, 1, 0), axF(0, 0, 1);
+    Vertex* verts = reinterpret_cast<Vertex*>(g_fixtureMapped);
+    uint32_t wi = 0;
+    const float cls = rc::attr(rc::RenderClass::Bulb);
+    for (const auto& l : g_mapLights) {
+        if (l.kind != "bulb") continue;
+        for (int k = 0; k < 2; ++k)
+            emitUnitCube(verts, wi, kFixtureMaxVerts, Vec3(0, 0, 0), axR, axU, axF, l.x - 0.5f,
+                         l.y - 1.0f + static_cast<float>(k), l.z - 0.5f, VOXEL_SIZE, l.r, l.g, l.b, cls);
+    }
+    g_fixtureVertexCount = wi;
 }
 
 static void updatePickupMesh() {
@@ -2839,8 +2834,7 @@ struct SimBallisticsHooks final : ballistics::Hooks {
         // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
         g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
                                 imp.aoeScale);
-        // Removing a fixture changes the light set, not just the surface mesh.
-        if (was == Block::LightBulb) g_bulbsDirty = true;
+        (void)was;
         g_meshDirty = true;
         ++g_voxelsDestroyed;
     }
@@ -4554,6 +4548,12 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     // World item pickups (mat 8) live in the main pass so they depth-test against
     // the map and cast/receive light like the world does. Only the player's own
     // lattice is overlay-only.
+    // Light fixtures (environment layer): same pass, same pipeline.
+    if (g_fixtureVB != VK_NULL_HANDLE && g_fixtureVertexCount > 0) {
+        VkDeviceSize fOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_fixtureVB, &fOff);
+        vkCmdDraw(cmd, g_fixtureVertexCount, 1, 0, 0);
+    }
     if (g_pickupVB != VK_NULL_HANDLE && g_pickupVertexCount > 0) {
         VkDeviceSize pOff = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &g_pickupVB, &pOff);
@@ -5037,10 +5037,6 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
 
     // Warm bulbs harvested from Block::LightBulb occupancy. Unknown slots are
     // zeroed so the shader's fixed loop sees intensity 0 and skips them.
-    if (g_bulbsDirty && g_world) {
-        harvestBulbLights(*g_world, g_bulbs);
-        g_bulbsDirty = false;
-    }
     std::memset(ubo.bulbPos, 0, sizeof(ubo.bulbPos));
     std::memset(ubo.bulbColor, 0, sizeof(ubo.bulbColor));
     for (int i = 0; i < kMaxBulbs; ++i) {
@@ -5233,6 +5229,7 @@ static const CaptureShot kCaptureShots[] = {
     {"interior_crates", 150.0f, 18.0f, 110.0f, -0.90f, -0.20f, kShotPlain},
     {"back_corner",     20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain},
     {"exterior_river",  186.0f, 46.0f, 158.0f, -0.85f, -0.42f, kShotPlain},
+    {"inventory_open",  96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotInventory},
     {"effects_crate",   34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotEffects},
     {"debris_crate",    34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotDebris},
 };
@@ -5297,12 +5294,32 @@ static bool exportMapDocument(const sim::World& world, const std::string& path) 
         f << buf;
     }
     f << "\n  ],\n";
+    f << "  \"lights\": [";
+    for (size_t i = 0; i < g_mapLights.size(); ++i) {
+        const auto& l = g_mapLights[i];
+        std::snprintf(buf, sizeof(buf),
+                      "%s\n    {\"kind\": \"%s\", \"x\": %.4f, \"y\": %.4f, \"z\": %.4f, "
+                      "\"color\": [%.4f, %.4f, %.4f], \"intensity\": %.4f, \"radius\": %.4f}",
+                      i ? "," : "", l.kind.c_str(), l.x, l.y, l.z, l.r, l.g, l.b, l.intensity, l.radius);
+        f << buf;
+    }
+    f << "\n  ],\n";
+    std::snprintf(buf, sizeof(buf), "  \"environment\": {\"moon_dir\": [%.4f, %.4f, %.4f]},\n",
+                  g_moonDirWorld.x, g_moonDirWorld.y, g_moonDirWorld.z);
+    f << buf;
     f << "  \"cells_rle\": " << mapvox::worldToRle(world) << "\n}\n";
     return static_cast<bool>(f);
 }
 
 static void cleanup() {
     if (g_device) vkDeviceWaitIdle(g_device);
+    if (g_fixtureVB) {
+        vkUnmapMemory(g_device, g_fixtureMem);
+        vkDestroyBuffer(g_device, g_fixtureVB, nullptr);
+        vkFreeMemory(g_device, g_fixtureMem, nullptr);
+        g_fixtureVB = VK_NULL_HANDLE;
+        g_fixtureMem = VK_NULL_HANDLE;
+    }
     if (g_captureBuf) {
         vkUnmapMemory(g_device, g_captureMem);
         vkDestroyBuffer(g_device, g_captureBuf, nullptr);
@@ -5751,6 +5768,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     mapvox::stampMapVox(mapDoc, world, 0, 0, 0);
                     g_mapSpawn = mapDoc.spawn;
                     g_mapPickups = mapDoc.pickups;
+                    g_mapLights = mapDoc.lights;
+                    g_bulbs.clear();
+                    for (const auto& ml : mapDoc.lights) {
+                        BulbLight l;
+                        l.pos = Vec3(ml.x * VOXEL_SIZE, ml.y * VOXEL_SIZE, ml.z * VOXEL_SIZE);
+                        l.color = Vec3(ml.r, ml.g, ml.b);
+                        l.intensity = ml.intensity;
+                        l.radius = ml.radius;
+                        g_bulbs.push_back(l);
+                    }
+                    if (mapDoc.environment.present)
+                        g_moonDirWorld = Vec3(mapDoc.environment.moonDir[0], mapDoc.environment.moonDir[1],
+                                              mapDoc.environment.moonDir[2]).normalized();
                     g_mapPath = path;
                     loaded = true;
                     break;
@@ -5798,6 +5828,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         // on the apron in front of the player.
         seedPickups();
         ensurePickupBuffer();
+        buildFixtureMesh();
 
         if (!exportMapPath.empty()) {
             const bool ok = exportMapDocument(world, exportMapPath);
@@ -6017,6 +6048,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\ngravity=" << kWorldGravity
                 << "\nvoxels_destroyed=" << g_voxelsDestroyed
                 << "\nbulbs=" << g_bulbs.size()
+                << "\nmap_lights=" << g_mapLights.size()
+                << "\nfixture_verts=" << g_fixtureVertexCount
                 << "\nwater_touch=" << g_touchingWaterUnits << "/" << g_characterUnitCount
                 << "\ncurrent=" << (g_currentTriggered ? 1 : 0)
                 << "\nsubmerged=" << (g_fullySubmerged ? 1 : 0)

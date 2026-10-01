@@ -89,6 +89,22 @@ struct PickupPlacement {
     int rot = 0; // quarter turns about +Y
 };
 
+// A light source (environment layer). It is not occupancy: it never blocks,
+// collides or breaks. Position is in cell units, so (x + 0.5) is a cell centre.
+struct LightPlacement {
+    std::string kind;            // "bulb" today; the fixture model to draw
+    float x = 0, y = 0, z = 0;   // cells
+    float r = 1, g = 1, b = 1;   // linear colour
+    float intensity = 1.0f;
+    float radius = 0.06f;        // world units
+};
+
+// Map-wide environment (sky, moon).
+struct Environment {
+    bool present = false;
+    float moonDir[3] = {0.32f, 0.82f, -0.48f}; // direction toward the moon
+};
+
 struct Voxel {
     int x = 0, y = 0, z = 0;
     sim::Block block = sim::Block::Air; // occupancy stamped into the world
@@ -112,6 +128,8 @@ struct Doc {
     std::vector<Voxel> voxels;
     int dropped = 0;                       // voxels skipped (no sim::Block cup)
     PlayerSpawn spawn;                     // "player_spawn" (optional)
+    std::vector<LightPlacement> lights;    // "lights" (optional)
+    Environment environment;               // "environment" (optional)
     std::vector<PickupPlacement> pickups;  // "pickups" (optional)
     // "cells_rle": run-length occupancy for whole maps. A palette of block
     // names, then runs as flat [y, z, x0, length, paletteIndex] quintuples
@@ -327,6 +345,10 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
                 pos = e;
                 continue;
             }
+            if (mapped == sim::Block::LightBulb || mapped == sim::Block::Moon) {
+                doc.error = "\"" + mat + "\" is not occupancy: author it under lights / environment";
+                return false;
+            }
             v.block = mapped;
             doc.voxels.push_back(v);
             pos = e;
@@ -341,6 +363,37 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
             doc.spawn.x = jsonInt(o, "x"); doc.spawn.y = jsonInt(o, "y"); doc.spawn.z = jsonInt(o, "z");
             doc.spawn.yaw = jsonExtractFloat(o, "yaw", 0.0f);
             doc.spawn.pitch = jsonExtractFloat(o, "pitch", 0.0f);
+        }
+    }
+
+    // lights
+    {
+        const std::string arr = jsonExtractArrayBody(text, "lights");
+        size_t pos = 0, s = 0, e = 0;
+        while (jsonxNextObject(arr, pos, s, e)) {
+            const std::string o = arr.substr(s, e - s);
+            LightPlacement l;
+            l.kind = jsonExtractString(o, "kind", "bulb");
+            l.x = jsonExtractFloat(o, "x", 0.0f);
+            l.y = jsonExtractFloat(o, "y", 0.0f);
+            l.z = jsonExtractFloat(o, "z", 0.0f);
+            const std::vector<float> c = jsonExtractFloatArray(o, "color");
+            if (c.size() == 3) { l.r = c[0]; l.g = c[1]; l.b = c[2]; }
+            l.intensity = jsonExtractFloat(o, "intensity", 1.0f);
+            l.radius = jsonExtractFloat(o, "radius", 0.06f);
+            doc.lights.push_back(l);
+            pos = e;
+        }
+    }
+
+    // environment
+    {
+        const std::string o = jsonExtractObjectBody(text, "environment");
+        if (!o.empty()) {
+            doc.environment.present = true;
+            const std::vector<float> d = jsonExtractFloatArray(o, "moon_dir");
+            if (d.size() == 3)
+                for (int i = 0; i < 3; ++i) doc.environment.moonDir[i] = d[i];
         }
     }
 
@@ -385,6 +438,12 @@ inline bool parseMapVox(const std::string& text, Doc& doc) {
                 const int len = doc.rleRuns[r + 3], pi = doc.rleRuns[r + 4];
                 if (len <= 0 || pi < 0 || pi >= static_cast<int>(doc.rlePalette.size())) {
                     doc.error = "cells_rle run " + std::to_string(r / 5) + " is malformed";
+                    return false;
+                }
+                const sim::Block rb = doc.rlePalette[pi];
+                if (rb == sim::Block::LightBulb || rb == sim::Block::Moon) {
+                    doc.error = std::string("cells_rle run ") + std::to_string(r / 5) + " is \"" +
+                                blockName(rb) + "\", which is not occupancy: author it under lights / environment";
                     return false;
                 }
                 doc.rleCells += len;
