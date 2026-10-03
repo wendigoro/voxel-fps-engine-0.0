@@ -58,5 +58,10 @@ When changing scale, materials, or launch flow, update:
 | Player movement (body) | `src/movement.hpp` — sim-side; intent in, `MoveIntent` + `CameraOffset` out |
 | Camera offset application | `syncCameraToPlayer()` in `src/main.cpp` (view pass; sim never reads it back) |
 | Sim/view boundary + overlay rules | `RULES.md` ("Authority and the view/sim split", "Menus, HUD and other view overlays") |
+| Render classes (per-vertex layer id) | `src/render_class.hpp`, mirrored in `shaders/render_class.glsl` (checked by `check_constants.py`) |
+| Offscreen world target + post chain | `src/post_fx.hpp`, `shaders/post.frag` |
+| Visual parameters (menu, presets, settings file) | `src/visual_params.hpp` — declare a parameter there and it appears in the menu |
+| Pause / visuals menu (Dear ImGui) | `initUi` / `buildUiFrame` in `src/main.cpp`; vendored `third_party/imgui` (MIT, v1.92.9b) |
+| Frame capture for visual checks | `--capture <dir>` (`kCaptureShots` in `src/main.cpp`), `scripts/capture_compare.py` |
 
 Any new menu/HUD/debug overlay is a **separate view pass** — own scissor/viewport, depth test and depth write off, blending on, no world vertex buffer or world UBO bound. Do not add menus by extending the world fragment shader; see `RULES.md`.

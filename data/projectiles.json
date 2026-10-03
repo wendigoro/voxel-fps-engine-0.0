@@ -89,6 +89,38 @@
       "fragility": 0.35,
       "toughness": 1.5,
       "damping": 0.42
+    },
+    {
+      "id": "sand",
+      "density": 1.6,
+      "weight": 1.6,
+      "fragility": 0.8,
+      "toughness": 0.4,
+      "damping": 0.45
+    },
+    {
+      "id": "grass",
+      "density": 0.5,
+      "weight": 0.7,
+      "fragility": 0.95,
+      "toughness": 0.1,
+      "damping": 0.2
+    },
+    {
+      "id": "snow",
+      "density": 0.3,
+      "weight": 0.4,
+      "fragility": 0.99,
+      "toughness": 0.06,
+      "damping": 0.3
+    },
+    {
+      "id": "asphalt",
+      "density": 2.3,
+      "weight": 1.3,
+      "fragility": 0.12,
+      "toughness": 2.2,
+      "damping": 0.5
     }
   ],
   "projectiles": [

@@ -1,11 +1,18 @@
 #version 450
+// Post chain: the world image (rendered at the menu's render scale) is drawn
+// full-screen through these effects, in this order. Each effect is a no-op at
+// its neutral value, so with default settings this is an exact pass-through.
+// Parameters come from the visuals registry (src/visual_params.hpp) as push
+// constants; add an effect by adding a field here, in PostParams, and a
+// parameter declaration there.
 layout(location = 0) in vec2 vUv;
 layout(location = 0) out vec4 outColor;
 layout(set = 0, binding = 0) uniform sampler2D uScene;
 layout(push_constant) uniform PC {
-    float bits;       // color quantization levels (e.g. 16, 32)
-    float dither;     // 0..1
-    float time;
+    float posterize; // levels per channel; < 2 = off
+    float dither;    // 0..1, noise before posterizing
+    float crush;     // gamma; 1 = off
+    float time;      // seconds, animates the dither
 } pc;
 
 float hash21(vec2 p) {
@@ -13,16 +20,19 @@ float hash21(vec2 p) {
 }
 
 void main() {
-    // Nearest-neighbor sample for chunky downscale look
-    vec2 texSize = vec2(textureSize(uScene, 0));
-    vec2 uv = (floor(vUv * texSize) + 0.5) / texSize;
-    vec3 col = texture(uScene, uv).rgb;
+    vec3 col = texture(uScene, vUv).rgb;
 
-    float levels = max(pc.bits, 2.0);
-    float d = (hash21(gl_FragCoord.xy + pc.time) - 0.5) * pc.dither / levels;
-    col = floor(col * levels + d) / levels;
+    // 1. Posterize, optionally dithered.
+    if (pc.posterize >= 2.0) {
+        float levels = pc.posterize;
+        float d = (hash21(gl_FragCoord.xy + fract(pc.time) * 61.0) - 0.5) * pc.dither;
+        col = floor(col * levels + 0.5 + d) / levels;
+    }
 
-    // Mild crush curve keeps darks heavy (cheap "bitcrunch")
-    col = pow(clamp(col, 0.0, 1.0), vec3(1.15));
-    outColor = vec4(col, 1.0);
+    // 2. Crush (gamma).
+    if (pc.crush != 1.0) {
+        col = pow(clamp(col, 0.0, 1.0), vec3(pc.crush));
+    }
+
+    outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }

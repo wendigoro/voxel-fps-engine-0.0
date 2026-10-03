@@ -3,6 +3,7 @@
 // Display/effects only — occupancy remains the cubic unit grid (VOXEL_SIZE).
 
 #include "materials.hpp"
+#include "render_class.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -91,8 +92,8 @@ inline constexpr int kMaxDebris = 1536;
 inline constexpr int kMaxSpawnPerVoxel = 28;
 inline constexpr int kHardMaxSpawnBurst = 120;
 // Shader mat id for debris cubes (see voxel.frag).
-inline constexpr float kDebrisMatId = 5.0f;
-inline constexpr float kMuzzleMatId = 6.0f;
+inline constexpr float kDebrisMatId = rc::attr(rc::RenderClass::Debris);
+inline constexpr float kMuzzleMatId = rc::attr(rc::RenderClass::Muzzle);
 
 struct DebrisParticle {
     float px = 0, py = 0, pz = 0;
@@ -146,6 +147,10 @@ struct DebrisSystem {
         case MaterialId::CarbonFiber: r = 0.18f; g = 0.18f; b = 0.22f; break;
         case MaterialId::TreatedWood: r = 0.50f; g = 0.32f; b = 0.18f; break;
         case MaterialId::Plexiglass:  r = 0.78f; g = 0.92f; b = 1.00f; break;
+        case MaterialId::Sand:        r = 0.82f; g = 0.74f; b = 0.54f; break;
+        case MaterialId::Grass:       r = 0.30f; g = 0.52f; b = 0.20f; break;
+        case MaterialId::Snow:        r = 0.92f; g = 0.94f; b = 0.97f; break;
+        case MaterialId::Asphalt:     r = 0.26f; g = 0.26f; b = 0.28f; break;
         default:                      r = 0.62f; g = 0.62f; b = 0.62f; break;
         }
     }

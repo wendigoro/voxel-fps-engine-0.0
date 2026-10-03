@@ -14,14 +14,18 @@ import java.util.regex.Pattern;
 public final class VoxIO {
     private VoxIO() {}
 
-    /** Current document format. Files without the key default to 1. */
-    public static final int FORMAT_VERSION = 1;
+    /** Current document format. Files without the key default to 1.
+     *  v1: a "voxels" list, one object per cell (still read).
+     *  v2: run-length layers shared with the engine's maps (data/voxfmt/schema.md,
+     *      "Format v2"): cells_rle (materials), appearance (paint that differs
+     *      from the material's own colour), parts_rle (weapon parts), anchors. */
+    public static final int FORMAT_VERSION = 2;
 
     public static void save(VoxDocument doc, Path path) throws IOException {
         doc.grid.assertCubicUnitInvariant();
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
-        sb.append("  \"format_version\": 1,\n");
+        sb.append("  \"format_version\": ").append(FORMAT_VERSION).append(",\n");
         sb.append("  \"unit\": ").append(doc.unit).append(",\n");
         sb.append("  \"voxel_size\": ").append(doc.voxelSize).append(",\n");
         sb.append("  \"mode\": \"").append(doc.modeName()).append("\",\n");
@@ -34,10 +38,15 @@ public final class VoxIO {
                     .append(doc.moonDirY).append(", ").append(doc.moonDirZ).append("],\n");
             sb.append("  \"moon_intensity\": ").append(doc.moonIntensity).append(",\n");
         }
-if (doc.mode == VoxDocument.Mode.CHARACTER) {
-            sb.append("  \"feet\": [").append(doc.feetX).append(", ")
-                    .append(doc.feetY).append(", ").append(doc.feetZ).append("],\n");
+        // Anchors: named attachment cells. Every model has a pivot (bottom
+        // centre of its grid); characters add their feet.
+        sb.append("  \"anchors\": {\"pivot\": [").append(doc.grid.sizeX() / 2).append(", 0, ")
+                .append(doc.grid.sizeZ() / 2).append("]");
+        if (doc.mode == VoxDocument.Mode.CHARACTER) {
+            sb.append(", \"feet\": [").append(doc.feetX).append(", ")
+                    .append(doc.feetY).append(", ").append(doc.feetZ).append("]");
         }
+        sb.append("},\n");
         if (doc.mode == VoxDocument.Mode.WEAPON) {
             sb.append("  \"caliber\": \"").append(doc.caliber).append("\",\n");
             sb.append("  \"ammo_id\": \"").append(doc.ammoId).append("\",\n");
@@ -57,29 +66,73 @@ if (doc.mode == VoxDocument.Mode.CHARACTER) {
                     .append(", \"route\": ").append(counters[2]).append("},\n");
             saveMapEntities(sb, doc.mapData);
         }
-        sb.append("  \"voxels\": [\n");
-        List<String> rows = new ArrayList<>();
         VoxelGrid g = doc.grid;
+        // Three run-length layers along +X, one (y, z) row at a time.
+        // Materials: a run of one material id.
+        List<String> matNames = new ArrayList<>();
+        StringBuilder matRuns = new StringBuilder();
+        // Paint: a run of one colour, only where it differs from the material's own.
+        List<Integer> paintColors = new ArrayList<>();
+        StringBuilder paintRuns = new StringBuilder();
+        // Parts: a run of one weapon part id.
+        List<String> partNames = new ArrayList<>();
+        StringBuilder partRuns = new StringBuilder();
         for (int y = 0; y < g.sizeY(); y++)
-            for (int z = 0; z < g.sizeZ(); z++)
-                for (int x = 0; x < g.sizeX(); x++) {
+            for (int z = 0; z < g.sizeZ(); z++) {
+                for (int x = 0; x < g.sizeX(); ) {
                     int m = g.getMat(x, y, z);
-                    if (m == MaterialPalette.AIR && g.getRgb(x, y, z) == 0) continue;
-                    int rgb = g.getRgb(x, y, z);
-                    int part = g.getPart(x, y, z);
-                    if (part > 0) {
-                        rows.add(String.format(Locale.ROOT,
-                                "    {\"x\":%d,\"y\":%d,\"z\":%d,\"mat\":\"%s\",\"rgb\":%d,\"part\":\"%s\"}",
-                                x, y, z, MaterialPalette.nameFromId(m), rgb, WeaponParts.name(part)));
-                    } else {
-                        rows.add(String.format(Locale.ROOT,
-                                "    {\"x\":%d,\"y\":%d,\"z\":%d,\"mat\":\"%s\",\"rgb\":%d}",
-                                x, y, z, MaterialPalette.nameFromId(m), rgb));
+                    int len = 1;
+                    while (x + len < g.sizeX() && g.getMat(x + len, y, z) == m) len++;
+                    if (m != MaterialPalette.AIR) {
+                        String n = MaterialPalette.nameFromId(m);
+                        int idx = matNames.indexOf(n);
+                        if (idx < 0) { matNames.add(n); idx = matNames.size() - 1; }
+                        appendRun(matRuns, y, z, x, len, idx);
                     }
+                    x += len;
                 }
-        sb.append(String.join(",\n", rows));
-        if (!rows.isEmpty()) sb.append('\n');
-        sb.append("  ]\n}\n");
+                for (int x = 0; x < g.sizeX(); ) {
+                    int c = paintOf(g, x, y, z);
+                    int len = 1;
+                    while (x + len < g.sizeX() && paintOf(g, x + len, y, z) == c) len++;
+                    if (c >= 0) {
+                        int idx = paintColors.indexOf(c);
+                        if (idx < 0 && paintColors.size() < 255) { paintColors.add(c); idx = paintColors.size() - 1; }
+                        if (idx < 0) idx = nearestColor(paintColors, c);
+                        appendRun(paintRuns, y, z, x, len, idx + 1);
+                    }
+                    x += len;
+                }
+                for (int x = 0; x < g.sizeX(); ) {
+                    int p = g.getMat(x, y, z) == MaterialPalette.AIR ? 0 : g.getPart(x, y, z);
+                    int len = 1;
+                    while (x + len < g.sizeX() && (g.getMat(x + len, y, z) == MaterialPalette.AIR ? 0
+                            : g.getPart(x + len, y, z)) == p) len++;
+                    if (p > 0) {
+                        String n = WeaponParts.name(p);
+                        int idx = partNames.indexOf(n);
+                        if (idx < 0) { partNames.add(n); idx = partNames.size() - 1; }
+                        appendRun(partRuns, y, z, x, len, idx);
+                    }
+                    x += len;
+                }
+            }
+        if (!paintColors.isEmpty()) {
+            sb.append("  \"appearance\": {\"palette\": [");
+            for (int i = 0; i < paintColors.size(); i++) {
+                int c = paintColors.get(i);
+                if (i > 0) sb.append(", ");
+                sb.append('[').append((c >> 16) & 255).append(", ").append((c >> 8) & 255).append(", ")
+                        .append(c & 255).append(']');
+            }
+            sb.append("], \"runs\": [").append(paintRuns).append("]},\n");
+        }
+        if (!partNames.isEmpty()) {
+            sb.append("  \"parts_rle\": {\"palette\": ").append(quoted(partNames))
+                    .append(", \"runs\": [").append(partRuns).append("]},\n");
+        }
+        sb.append("  \"cells_rle\": {\"palette\": ").append(quoted(matNames))
+                .append(", \"runs\": [").append(matRuns).append("]}\n}\n");
         Files.createDirectories(path.getParent() == null ? Path.of(".") : path.getParent());
         Files.writeString(path, sb.toString(), StandardCharsets.UTF_8);
     }
@@ -99,7 +152,7 @@ if (doc.mode == VoxDocument.Mode.CHARACTER) {
         float[] moon = findFloatArray(text, "moon_dir", new float[]{0.32f, 0.82f, -0.48f});
         doc.moonDirX = moon[0]; doc.moonDirY = moon[1]; doc.moonDirZ = moon[2];
         doc.moonIntensity = findFloat(text, "moon_intensity", 0.95f);
-        int[] feet = findIntArray(text, "feet", new int[]{0, 0, 0});
+        int[] feet = findIntArray(text, "feet", new int[]{0, 0, 0}); // v1 key and v2 anchor share the name
 doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
         doc.caliber = findString(text, "caliber", doc.caliber);
         doc.ammoId = findString(text, "ammo_id", doc.ammoId);
@@ -117,6 +170,13 @@ doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
             doc.mapData.restoreCounters(evt, npc, route);
         }
 
+        if (text.contains("\"cells_rle\"")) {
+            loadRunLayers(text, doc);
+            doc.grid.assertCubicUnitInvariant();
+            return doc;
+        }
+
+        // v1: one object per cell.
         Matcher vm = Pattern.compile(
                 "\\{\\s*\"x\"\\s*:\\s*(\\d+)\\s*,\\s*\"y\"\\s*:\\s*(\\d+)\\s*,\\s*\"z\"\\s*:\\s*(\\d+)\\s*,\\s*\"mat\"\\s*:\\s*\"([^\"]+)\"\\s*,\\s*\"rgb\"\\s*:\\s*(\\d+)(?:\\s*,\\s*\"part\"\\s*:\\s*\"([^\"]+)\")?\\s*\\}")
                 .matcher(text);
@@ -131,6 +191,128 @@ doc.feetX = feet[0]; doc.feetY = feet[1]; doc.feetZ = feet[2];
         }
         doc.grid.assertCubicUnitInvariant();
         return doc;
+    }
+
+    // ---- v2 run-length layers ----------------------------------------------
+
+    private static void appendRun(StringBuilder sb, int y, int z, int x0, int len, int idx) {
+        if (sb.length() > 0) sb.append(',');
+        sb.append(y).append(',').append(z).append(',').append(x0).append(',').append(len).append(',').append(idx);
+    }
+
+    /** The cell's paint, or -1 when it is air or carries its material's own colour. */
+    private static int paintOf(VoxelGrid g, int x, int y, int z) {
+        int m = g.getMat(x, y, z);
+        if (m == MaterialPalette.AIR) return -1;
+        int rgb = g.getRgb(x, y, z) & 0xFFFFFF;
+        return rgb == MaterialPalette.defaultRgb(m) ? -1 : rgb;
+    }
+
+    private static int nearestColor(List<Integer> colors, int c) {
+        int best = 0;
+        long bestD = Long.MAX_VALUE;
+        for (int i = 0; i < colors.size(); i++) {
+            int o = colors.get(i);
+            long dr = ((o >> 16) & 255) - ((c >> 16) & 255);
+            long dg = ((o >> 8) & 255) - ((c >> 8) & 255);
+            long db = (o & 255) - (c & 255);
+            long d = dr * dr + dg * dg + db * db;
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    private static String quoted(List<String> names) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append('"').append(names.get(i)).append('"');
+        }
+        return sb.append(']').toString();
+    }
+
+    /** The {...} body that follows "key": in text, braces balanced; "" when absent. */
+    private static String objectBody(String text, String key) {
+        int k = text.indexOf("\"" + key + "\"");
+        if (k < 0) return "";
+        int open = text.indexOf('{', k);
+        if (open < 0) return "";
+        int depth = 0;
+        for (int i = open; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == '{') depth++;
+            else if (ch == '}' && --depth == 0) return text.substring(open + 1, i);
+        }
+        return "";
+    }
+
+    /** Every integer inside the [...] that follows "key": (nested arrays flatten). */
+    private static int[] intsAfter(String body, String key) {
+        int k = body.indexOf("\"" + key + "\"");
+        if (k < 0) return new int[0];
+        int open = body.indexOf('[', k);
+        int depth = 0, close = -1;
+        for (int i = open; i >= 0 && i < body.length(); i++) {
+            char ch = body.charAt(i);
+            if (ch == '[') depth++;
+            else if (ch == ']' && --depth == 0) { close = i; break; }
+        }
+        if (open < 0 || close < 0) return new int[0];
+        Matcher m = Pattern.compile("-?\\d+").matcher(body.substring(open, close));
+        List<Integer> out = new ArrayList<>();
+        while (m.find()) out.add(Integer.parseInt(m.group()));
+        int[] a = new int[out.size()];
+        for (int i = 0; i < a.length; i++) a[i] = out.get(i);
+        return a;
+    }
+
+    private static List<String> namesAfter(String body, String key) {
+        List<String> out = new ArrayList<>();
+        int k = body.indexOf("\"" + key + "\"");
+        if (k < 0) return out;
+        int open = body.indexOf('[', k), close = body.indexOf(']', open);
+        if (open < 0 || close < 0) return out;
+        Matcher m = Pattern.compile("\"([^\"]*)\"").matcher(body.substring(open, close));
+        while (m.find()) out.add(m.group(1));
+        return out;
+    }
+
+    private static void loadRunLayers(String text, VoxDocument doc) throws IOException {
+        VoxelGrid g = doc.grid;
+        String cells = objectBody(text, "cells_rle");
+        List<String> mats = namesAfter(cells, "palette");
+        int[] runs = intsAfter(cells, "runs");
+        if (runs.length % 5 != 0) throw new IOException("cells_rle runs must be quintuples");
+        for (int r = 0; r < runs.length; r += 5) {
+            int y = runs[r], z = runs[r + 1], x0 = runs[r + 2], len = runs[r + 3], idx = runs[r + 4];
+            if (idx < 0 || idx >= mats.size() || len <= 0) throw new IOException("cells_rle run " + r / 5 + " is malformed");
+            int m = MaterialPalette.idFromName(mats.get(idx));
+            for (int x = x0; x < x0 + len; x++)
+                if (g.inBounds(x, y, z)) g.set(x, y, z, m, MaterialPalette.defaultRgb(m));
+        }
+        String paint = objectBody(text, "appearance");
+        int[] pal = intsAfter(paint, "palette");
+        int[] pruns = intsAfter(paint, "runs");
+        for (int r = 0; r + 4 < pruns.length; r += 5) {
+            int idx = pruns[r + 4] - 1;
+            if (idx < 0 || idx * 3 + 2 >= pal.length) throw new IOException("appearance run " + r / 5 + " is malformed");
+            int rgb = ((pal[idx * 3] & 255) << 16) | ((pal[idx * 3 + 1] & 255) << 8) | (pal[idx * 3 + 2] & 255);
+            for (int x = pruns[r + 2]; x < pruns[r + 2] + pruns[r + 3]; x++) {
+                int y = pruns[r], z = pruns[r + 1];
+                if (g.inBounds(x, y, z) && g.getMat(x, y, z) != MaterialPalette.AIR)
+                    g.set(x, y, z, g.getMat(x, y, z), rgb, g.getPart(x, y, z));
+            }
+        }
+        String parts = objectBody(text, "parts_rle");
+        List<String> partNames = namesAfter(parts, "palette");
+        int[] partRuns = intsAfter(parts, "runs");
+        for (int r = 0; r + 4 < partRuns.length; r += 5) {
+            int idx = partRuns[r + 4];
+            if (idx < 0 || idx >= partNames.size()) throw new IOException("parts_rle run " + r / 5 + " is malformed");
+            int part = WeaponParts.idFromName(partNames.get(idx));
+            for (int x = partRuns[r + 2]; x < partRuns[r + 2] + partRuns[r + 3]; x++)
+                if (g.inBounds(x, partRuns[r], partRuns[r + 1])) g.setPart(x, partRuns[r], partRuns[r + 1], part);
+        }
     }
 
     // ---- MAP mode serialization --------------------------------------------

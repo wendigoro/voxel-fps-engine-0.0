@@ -31,12 +31,32 @@
 #include "fisheye.hpp"
 #include "materials.hpp"
 #include "map_vox.hpp"
+#include "mesh_view.hpp"
+#include "render_class.hpp"
+#include "post_fx.hpp"
+#include "textures.hpp"
+#include "visual_params.hpp"
+
+// Dear ImGui (third_party/imgui, MIT): the in-engine menu. View only.
+#include "imgui.h"
+#include "backends/imgui_impl_vulkan.h"
+#include "backends/imgui_impl_win32.h"
+// The backend header keeps this behind #if 0 so it need not pull in windows.h.
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam,
+                                                             LPARAM lParam);
 #include "sim_input.hpp"
 #include "movement.hpp"
+#include "ballistics.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// The view mesher keeps its own (deliberately sim-free) copy of the voxel
+// scale; this is the compile-time bridge proving it never drifts from the
+// authority. Same rule as the wire enum asserts in sim_world.hpp.
+static_assert(meshview::kVoxelSize == kVoxelSize,
+              "mesh_view mesh scale must agree with the sim's voxel scale");
 
 // ---- grid aliases ----
 // Block identity, scale, and the authoritative grid now live in sim_world.hpp.
@@ -60,7 +80,6 @@ static constexpr int WIDTH = 1280;
 static constexpr int HEIGHT = 720;
 static constexpr int MAX_FRAMES = 2;
 // Internal 3D render scale (downscale for fill-rate). Presented upscaled with bitcrush look in shader.
-static constexpr float RENDER_SCALE = 0.5f;
 static constexpr int INTERNAL_W = 640;  // WIDTH * 0.5
 static constexpr int INTERNAL_H = 360;  // HEIGHT * 0.5
 static constexpr float DEFAULT_FOV_DEG = 101.5f; // 70 * 1.45 fisheye default
@@ -85,8 +104,6 @@ static double g_tickAccum = 0.0;
 static constexpr float VOXEL_SIZE = kVoxelSize;
 
 // Warehouse layout in unit voxels (grid space)
-static constexpr int DIRT_MARGIN = 10;        // dirt apron around building
-static constexpr int SLAB_THICK = 2;          // concrete floor thickness (voxels)
 
 struct Vec3 {
     float x = 0, y = 0, z = 0;
@@ -106,7 +123,7 @@ struct Vec3 {
     }
 };
 
-// A light the view should shade with, derived from occupancy.
+// A light the view shades with: one entry per map light (environment layer).
 struct BulbLight {
     Vec3 pos;          // world-space centre
     Vec3 color;
@@ -163,12 +180,19 @@ struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
     float cr, cg, cb;
-float mat; // 0 solid, 1 water, 2 bulb, 3 moon, 4 sky, 5 debris cube, 6 muzzle flash, 7 inventory lattice
+    float mat;            // render class (src/render_class.hpp)
+    float texLayer = 0;   // texture layer + 1; 0 = untextured
+    float painted = 0;    // 1 = cell has an appearance colour
+    float shade = 1;      // face shade x AO already folded into cr,cg,cb
 };
+// Chunk meshes are built as view::ViewChunk::Vertex and copied into the same
+// vertex buffer, so the two layouts must be identical.
+static_assert(sizeof(Vertex) == sizeof(view::ViewChunk::Vertex), "vertex layouts must match");
 
 // Fixed light slots in the frame UBO. The shader loops this many, so it is a
 // layout constant, not a tuning knob.
-static constexpr int kMaxBulbs = 4;
+// Light sources go to the shaders through a storage buffer (two vec4 each).
+static constexpr int kMaxLights = 64;
 
 struct FrameUBO {
     float viewProj[16];
@@ -184,9 +208,50 @@ struct FrameUBO {
     float fireOverlay;     // 0..1 frame-border burn
     float damageFlash;     // 0..1 crimson damage intake flash
     float healthTint;      // 0..1 low-health pulsing vignette
-    float bulbPos[kMaxBulbs][4];   // xyz, intensity
-    float bulbColor[kMaxBulbs][4]; // rgb, radius
+    float fisheyeScale;            // visuals menu: lens curve multiplier
+    float banding;                 // visuals menu: colour-step multiplier
+    float uboPad[2];
+    float texParams[tex::kMaxLayers][4]; // per layer: tileCells, tint, coverage, maskFromLuma
+    float texGlobal[4];            // enabled, strength, scale, unused
+    float occDims[4];              // occupancy volume W, H, D, shadows enabled
+    float shadowParams[4];         // max cells crossed, 1, unused, unused
+    float lightInfo[4];            // light count, unused x3
 };
+
+// Occupancy volume (view side): 1 byte per cell of the whole world, built
+// only from the chunk snapshots this client was sent, and uploaded to a 3D
+// image the shaders march shadows through. Remeshed chunks are re-uploaded,
+// each frame through its own staging buffer.
+static VkImage g_occImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_occMem = VK_NULL_HANDLE;
+static VkImageView g_occView = VK_NULL_HANDLE;
+static VkSampler g_occSampler = VK_NULL_HANDLE;
+static VkBuffer g_occStage[MAX_FRAMES]{};
+static VkDeviceMemory g_occStageMem[MAX_FRAMES]{};
+static void* g_occStageMapped[MAX_FRAMES]{};
+static bool g_occImageReady = false;       // has been transitioned out of UNDEFINED
+static std::vector<uint8_t> g_occCpu;      // the volume as last sent
+static std::vector<int> g_occDirty;        // chunk indices waiting for upload
+static uint64_t g_occChunkUploads = 0;     // telemetry
+// Lights for the shaders, one host-visible buffer per frame in flight.
+static VkBuffer g_lightBuf[MAX_FRAMES]{};
+static VkDeviceMemory g_lightMem[MAX_FRAMES]{};
+static void* g_lightMapped[MAX_FRAMES]{};
+
+// Surface textures (src/textures.hpp): one 2D array image, all mips.
+static VkImage g_texImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_texMem = VK_NULL_HANDLE;
+static VkImageView g_texView = VK_NULL_HANDLE;
+static VkSampler g_texSampler = VK_NULL_HANDLE;
+static tex::Table g_texTable;
+static int g_texLayerCount = 0;   // 0 = no texture file; a 1x1 white fallback is bound
+static float g_maxAnisotropy = 1.0f;
+
+// Visual settings (view only): the registry the menu, presets and the settings
+// file are built from, and the post chain that consumes most of them.
+static vis::Registry g_visReg;
+static vis::Settings g_vis;
+static postfx::PostFx g_post;
 
 // Time system. g_timeOfDay is frozen: the world ships as permanent night, and
 // the dead g_timeScale that was meant to advance it is gone.
@@ -250,6 +315,14 @@ static bool g_wantJump = false;
 // See RULES.md, "Player body, and the camera-offset contract".
 static movement::MoveState g_move;
 static movement::CameraOffset g_camOffset;
+// The sim eye as it stood before the most recent tick; renderEye() interpolates
+// from here to g_camPos. Written only by the host loop, read only by the view.
+static Vec3 g_camPosPrevTick;
+// Smoke pause probe (see the main loop).
+static bool g_smokePauseDone = false;
+static bool g_smokePauseFrozenOk = false;
+static uint64_t g_smokePauseTick = 0;
+static int g_smokePausedFrames = 0;
 
 // Player health (RULES.md rule 15). Kept as a distinct ActorHealth rather than
 // fields on PlayerBody so a second actor is a new type, not a refactor.
@@ -280,9 +353,43 @@ static int g_dashInvulnBlocks = 0;
 // load-bearing, so keep them with the declarations.
 static sim::World* g_world = nullptr;
 static std::vector<ViewChunk>* g_views = nullptr;
+// The map palette as the view received it (appearance layer). Sent once with
+// the map; every ViewChunk points here.
+static wire::Palette g_viewPalette;
+
+static void sendPalette(const sim::World& world, wire::Palette& out) {
+    out = wire::Palette{};
+    out.used = static_cast<int>(std::min<size_t>(world.palette.size(), wire::kPaletteSize));
+    for (int i = 1; i < out.used; ++i) {
+        const uint32_t c = world.palette[i];
+        out.colors[i] = wire::PaletteColor{uint8_t((c >> 16) & 255), uint8_t((c >> 8) & 255), uint8_t(c & 255)};
+    }
+}
 static std::vector<ProjectileDef> g_projDefs;
 static std::vector<AmmoDef> g_ammoDefs;
-static std::vector<ProjectileRuntime> g_projectiles;
+// Live rounds and the last impact belong to the ballistics module's state.
+// g_projectiles is the name the rest of this file uses for the round list.
+static ballistics::State g_ballistics;
+static std::vector<ProjectileRuntime>& g_projectiles = g_ballistics.projectiles;
+// What the loaded map authored for spawn and pickups (empty when the world
+// came from the procedural builder).
+static mapvox::PlayerSpawn g_mapSpawn;
+// The map's environment section as authored. See the export below: the renderer's
+// g_moonDirWorld is normalized in place, so it cannot be the thing re-exported.
+static mapvox::Environment g_mapEnvironment;
+static std::vector<mapvox::PickupPlacement> g_mapPickups;
+static std::string g_mapPath; // file the world was loaded from (empty = procedural)
+static int g_mapPrefabsStamped = 0;
+// --map <path>: load this map instead of the default warehouse_v1. Empty means
+// the default search list.
+static std::string g_mapOverridePath;
+// The terrain section the loaded map asked for, and what generating it did.
+// Kept so --export-map can write the section back and the report can show the
+// numbers; a map with no section leaves these at their defaults and generates
+// nothing at all.
+static terrain::Spec g_mapTerrain;
+static terrain::Report g_terrainReport;
+
 static int g_activeAmmoIndex = 0; // cycles ammo subtypes for active caliber (R)
 static bool g_meshDirty = false;
 static bool g_firePressed = false; // edge: semi/bolt or smoke
@@ -374,8 +481,8 @@ static VkDeviceMemory g_inventoryMem = VK_NULL_HANDLE;
 static void* g_inventoryMapped = nullptr;
 static uint32_t g_inventoryVertexCount = 0;
 static uint32_t g_inventoryOverlayFrames = 0; // frames that actually submitted the pass
-static constexpr uint32_t kInventoryMatId = 7;
-static constexpr uint32_t kPickupMatId = 8;    // world pickups: main pass, not the overlay
+static constexpr float kInventoryMatId = rc::attr(rc::RenderClass::InventoryLattice);
+static constexpr float kPickupMatId = rc::attr(rc::RenderClass::WorldPickup); // main pass, not the overlay
 
 // Display basis + origin, rebuilt with the mesh. Look-and-click picks cells in
 // SCREEN space against this transform rather than by casting a world ray, which
@@ -397,9 +504,6 @@ struct InventoryHover {
 };
 static InventoryHover g_invHover;
 static int g_inventoryHandRot = 0;   // preview rotation while carrying an item
-static float g_lastImpactDx = 0, g_lastImpactDy = 0, g_lastImpactDz = -1;
-static float g_lastImpactEnergy = 10.0f;
-static float g_lastAoeScale = 1.0f;
 static int g_shotgunShots = 0;
 static int g_pelletSpawns = 0;
 // GPU buffer for visual debris cubes (display-only 8^3 chips) + muzzle flash cubes
@@ -466,7 +570,12 @@ static uint32_t g_vertexCount = 0;
 // Vertices currently occupied across all chunk slots. Kept separate from
 // g_vertexCount (buffer capacity in vertices) so telemetry reports real geometry.
 static uint32_t g_liveVertexCount = 0;
-static bool g_needsFullMeshRepack = false;
+// End of the last allocated chunk slot, in vertices. Everything past it is free,
+// so a chunk that outgrows its slot can move there without a full repack.
+static uint32_t g_slotCursor = 0;
+static int g_meshRelocateCount = 0;   // chunks moved to the tail instead of repacking
+static uint64_t g_meshTouchedSum = 0; // chunks remeshed per flush (batch size for the pool)
+static int g_meshTouchedMax = 0;
 static int g_meshRepackCount = 0;
 static double g_meshUploadUsMax = 0.0;
 static double g_meshUploadUsSum = 0.0;
@@ -512,10 +621,9 @@ static uint32_t g_skyTileVertexCount = 0;
 static Vec3 g_skyTileEye = {0, 0, 0};
 static bool g_skyTileBuilt = false;
 static Vec3 g_moonWorldPos = {0, 0, 0};
-// Bulb lights harvested from Block::LightBulb occupancy. Cached because the grid
-// is 1.3M cells; re-harvested only when a fixture is actually destroyed.
+// Lights from the map's "lights" section (environment layer, not occupancy).
 static std::vector<BulbLight> g_bulbs;
-static bool g_bulbsDirty = true;
+static std::vector<mapvox::LightPlacement> g_mapLights;
 static Vec3 g_moonDirWorld = {0.32f, 0.82f, -0.48f}; // fixed sky bearing (light source)
 static float g_moonTileSize = 0.034f;
 static float g_skyRadius = 0.55f;
@@ -541,7 +649,10 @@ enum SectionId {
     SEC_PROJECTILES,   // ballistic integration + impacts
     SEC_DEBRIS_SIM,    // debris particle physics (sim side)
     SEC_WAIT,          // vkWaitForFences (GPU backpressure)
-    SEC_MESH,          // flushDirtyMesh(): chunk remesh + upload
+    SEC_MESH,          // flushDirtyMesh(): chunk remesh + upload (the three below nest in it)
+    SEC_MESH_SNAPSHOT, //   sendChunkSnapshot for stale chunks (sim -> view copy)
+    SEC_MESH_BUILD,    //   meshChunk over the stale chunks (pure view work)
+    SEC_MESH_COPY,     //   memcpy into the mapped vertex buffer (incl. repack)
     SEC_UBO,           // per-frame UBO write
     SEC_SKY,           // moon/sky tile rebuild
     SEC_DEBRIS_MESH,   // debris + muzzle VBO write (view side)
@@ -552,7 +663,7 @@ enum SectionId {
 };
 static const char* kSectionName[SEC_COUNT] = {
     "health", "movement", "fire", "projectiles", "debris_sim",
-    "wait", "mesh", "ubo", "sky", "debris_mesh", "pickup", "inventory", "record"};
+    "wait", "mesh", "mesh_snapshot", "mesh_build", "mesh_copy", "ubo", "sky", "debris_mesh", "pickup", "inventory", "record"};
 static double g_secUsSum[SEC_COUNT] = {};
 static double g_secUsMax[SEC_COUNT] = {};
 static int g_secCount[SEC_COUNT] = {};
@@ -632,21 +743,9 @@ static void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
 // Water is painted as slightly larger *logical* cells (2x2x2 unit cubes) for volume/tide.
 static constexpr int WATER_CELL = 2;
 
-static MaterialId blockMaterial(Block b) {
-    switch (b) {
-    case Block::Dirt: return MaterialId::Dirt;
-    case Block::Concrete: return MaterialId::Concrete;
-    case Block::SheetMetal: return MaterialId::SheetMetal;
-    case Block::Girder: return MaterialId::Girder;
-    case Block::Wood: return MaterialId::Wood;
-    case Block::WoodDark: return MaterialId::BushBranch;
-    case Block::Water:
-    case Block::WaterCurrent: return MaterialId::Water;
-    case Block::Moon:
-    case Block::LightBulb: return MaterialId::Air; // emissive, no impact mass
-    default: return MaterialId::Air;
-    }
-}
+// Impact material of a block. Owned by the ballistics module, which is the
+// simulation code that asks the question most.
+using ballistics::blockMaterial;
 
 static bool isWaterBlock(Block b) {
     return b == Block::Water || b == Block::WaterCurrent;
@@ -663,22 +762,6 @@ static bool isSolidBlock(Block b) {
 // snapshot + mesh the view derived from it. Kept as one parallel vector pair so
 // chunkIndex() addresses both; the two are never merged into a single struct,
 // because that merge is the coupling this split removes.
-
-static Vec3 blockColor(Block b) {
-    switch (b) {
-    case Block::Dirt:         return {0.28f, 0.20f, 0.12f};
-    case Block::Concrete:     return {0.40f, 0.40f, 0.42f};
-    case Block::SheetMetal:   return {0.48f, 0.50f, 0.52f};
-    case Block::Girder:       return {0.28f, 0.10f, 0.08f};
-    case Block::Wood:         return {0.34f, 0.22f, 0.12f};
-    case Block::WoodDark:     return {0.32f, 0.18f, 0.08f};
-    case Block::Water:        return {0.12f, 0.28f, 0.42f};
-    case Block::WaterCurrent: return {0.10f, 0.35f, 0.48f};
-    case Block::Moon:         return {0.75f, 0.80f, 0.90f};
-    case Block::LightBulb:    return {1.00f, 0.75f, 0.45f};
-    default:                  return {1, 0, 1};
-    }
-}
 
 static inline int localIndex(int lx, int ly, int lz) {
     return sim::World::localIndex(lx, ly, lz);
@@ -698,136 +781,10 @@ static void setWorldBlock(sim::World& w, int x, int y, int z, Block b) {
     w.set(x, y, z, b);
 }
 
-// Harvest bulb lights by reading Block::LightBulb out of the grid, then folding
-// vertically adjacent cells into one light per fixture. The grid is the only
-// authority on where a light is: the map can be repainted or a painter edit can
-// move a fixture, and lighting follows without a second list to keep in sync.
-static void harvestBulbLights(const sim::World& world,
-                              std::vector<BulbLight>& out) {
-    out.clear();
-    std::vector<char> consumed(static_cast<size_t>(WORLD_W) * WORLD_H * WORLD_D, 0);
-    auto idx = [](int x, int y, int z) {
-        return (static_cast<size_t>(z) * WORLD_H + y) * WORLD_W + x;
-    };
-    for (int z = 0; z < WORLD_D; ++z) {
-        for (int y = 0; y < WORLD_H; ++y) {
-            for (int x = 0; x < WORLD_W; ++x) {
-                if (consumed[idx(x, y, z)]) continue;
-                if (getWorldBlock(world, x, y, z) != Block::LightBulb) continue;
-                // Absorb the whole vertical run so a two-cell fixture is one light.
-                int runTop = y;
-                int cells = 0;
-                float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
-                while (runTop < WORLD_H &&
-                       getWorldBlock(world, x, runTop, z) == Block::LightBulb) {
-                    consumed[idx(x, runTop, z)] = 1;
-                    sumX += (x + 0.5f) * VOXEL_SIZE;
-                    sumY += (runTop + 0.5f) * VOXEL_SIZE;
-                    sumZ += (z + 0.5f) * VOXEL_SIZE;
-                    ++cells;
-                    ++runTop;
-                }
-                if (cells <= 0) continue;
-                const float inv = 1.0f / static_cast<float>(cells);
-                BulbLight l;
-                l.pos = Vec3(sumX * inv, sumY * inv, sumZ * inv);
-                l.color = Vec3(1.00f, 0.75f, 0.45f);
-                // Brighter and wider for a taller fixture, capped at the slot count.
-                l.intensity = std::min(1.8f, 1.2f + 0.2f * static_cast<float>(cells));
-                l.radius = std::min(0.09f, 0.06f + 0.01f * static_cast<float>(cells));
-                out.push_back(l);
-            }
-        }
-    }
-}
 
 // Fill a solid axis-aligned box with unit voxels (inclusive).
-static void fillBox(sim::World& world, int x0, int y0, int z0,
-                    int x1, int y1, int z1, Block b) {
-    if (x0 > x1) std::swap(x0, x1);
-    if (y0 > y1) std::swap(y0, y1);
-    if (z0 > z1) std::swap(z0, z1);
-    for (int z = z0; z <= z1; ++z)
-        for (int y = y0; y <= y1; ++y)
-            for (int x = x0; x <= x1; ++x)
-                setWorldBlock(world, x, y, z, b);
-}
-
-// Vertical I-beam girder (unit voxels only): flanges + web.
-static void placeGirderColumn(sim::World& world, int cx, int zc,
-                              int y0, int y1) {
-    for (int y = y0; y <= y1; ++y) {
-        // web
-        setWorldBlock(world, cx, y, zc, Block::Girder);
-        setWorldBlock(world, cx, y, zc + 1, Block::Girder);
-        // flanges
-        for (int dx = -2; dx <= 2; ++dx) {
-            setWorldBlock(world, cx + dx, y, zc - 1, Block::Girder);
-            setWorldBlock(world, cx + dx, y, zc + 2, Block::Girder);
-        }
-    }
-}
-
-// Horizontal I-beam along X at fixed y,z.
-static void placeGirderBeamX(sim::World& world, int x0, int x1, int y, int zc) {
-    for (int x = x0; x <= x1; ++x) {
-        setWorldBlock(world, x, y, zc, Block::Girder);
-        setWorldBlock(world, x, y, zc + 1, Block::Girder);
-        for (int dy = -2; dy <= 2; ++dy) {
-            setWorldBlock(world, x, y + dy, zc - 1, Block::Girder);
-            setWorldBlock(world, x, y + dy, zc + 2, Block::Girder);
-        }
-    }
-}
-
-// Horizontal I-beam along Z.
-static void placeGirderBeamZ(sim::World& world, int z0, int z1, int y, int xc) {
-    for (int z = z0; z <= z1; ++z) {
-        setWorldBlock(world, xc, y, z, Block::Girder);
-        setWorldBlock(world, xc + 1, y, z, Block::Girder);
-        for (int dy = -2; dy <= 2; ++dy) {
-            setWorldBlock(world, xc - 1, y + dy, z, Block::Girder);
-            setWorldBlock(world, xc + 2, y + dy, z, Block::Girder);
-        }
-    }
-}
-
-// Sheet-metal wall panel: 1-voxel-thick unit cubes (corrugation via alternate offset).
-static void placeSheetWallX(sim::World& world, int x, int y0, int y1, int z0, int z1) {
-    for (int z = z0; z <= z1; ++z) {
-        for (int y = y0; y <= y1; ++y) {
-            int xo = x + ((z + y) & 1); // slight corrugation still unit voxels
-            setWorldBlock(world, xo, y, z, Block::SheetMetal);
-        }
-    }
-}
-
-static void placeSheetWallZ(sim::World& world, int z, int y0, int y1, int x0, int x1) {
-    for (int x = x0; x <= x1; ++x) {
-        for (int y = y0; y <= y1; ++y) {
-            int zo = z + ((x + y) & 1);
-            setWorldBlock(world, x, y, zo, Block::SheetMetal);
-        }
-    }
-}
-
-// Wooden crate made of unit voxels.
-static void placeCrate(sim::World& world, int x0, int y0, int z0, int s) {
-    fillBox(world, x0, y0, z0, x0 + s - 1, y0 + s - 1, z0 + s - 1, Block::Wood);
-    // darker edge frame
-    for (int i = 0; i < s; ++i) {
-        setWorldBlock(world, x0 + i, y0, z0, Block::WoodDark);
-        setWorldBlock(world, x0 + i, y0, z0 + s - 1, Block::WoodDark);
-        setWorldBlock(world, x0, y0, z0 + i, Block::WoodDark);
-        setWorldBlock(world, x0 + s - 1, y0, z0 + i, Block::WoodDark);
-        setWorldBlock(world, x0 + i, y0 + s - 1, z0, Block::WoodDark);
-        setWorldBlock(world, x0 + i, y0 + s - 1, z0 + s - 1, Block::WoodDark);
-    }
-}
-
-// Simple warehouse map: dirt apron, concrete slab, sheet-metal walls,
-// red-oxide girder frame — every element is unit voxels on the impact grid.
-static sim::World buildWarehouseMap() {
+// An all-Air world with every chunk allocated and placed.
+static sim::World makeEmptyWorld() {
     sim::World world;
     world.alloc();
     for (int cy = 0; cy < CHUNKS_Y; ++cy)
@@ -837,366 +794,15 @@ static sim::World buildWarehouseMap() {
                 c.cx = cx; c.cy = cy; c.cz = cz;
                 c.voxels.assign(VOXELS_PER_CHUNK, Block::Air);
             }
-
-    // 1) Dirt apron (single unit layer under map - keeps occupancy grid, fewer faces)
-    fillBox(world, 0, 0, 0, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
-
-    const int bx0 = DIRT_MARGIN;
-    const int bz0 = DIRT_MARGIN;
-    const int bx1 = WORLD_W - 1 - DIRT_MARGIN;
-    const int bz1 = WORLD_D - 1 - DIRT_MARGIN;
-    const int wallH = 40;          // wall height in unit voxels
-    const int roofY = 1 + wallH;   // underside of roof beams
-
-    // 2) Concrete slab (multi-voxel thick — not a stretched plane).
-    fillBox(world, bx0, 1, bz0, bx1, 1 + SLAB_THICK - 1, bz1, Block::Concrete);
-
-    // Outer dirt remains as apron (already filled); clear building footprint dirt top under slab already overwritten.
-
-    // 3) Girder columns at corners and mid-span (I-beam unit voxels).
-    const int colsX[] = { bx0 + 2, (bx0 + bx1) / 2, bx1 - 3 };
-    const int colsZ[] = { bz0 + 2, (bz0 + bz1) / 2, bz1 - 3 };
-    for (int ix = 0; ix < 3; ++ix)
-        for (int iz = 0; iz < 3; ++iz)
-            placeGirderColumn(world, colsX[ix], colsZ[iz], 1 + SLAB_THICK, roofY);
-
-    // 4) Roof girder grid (unit I-beams).
-    for (int iz = 0; iz < 3; ++iz)
-        placeGirderBeamX(world, bx0 + 2, bx1 - 2, roofY, colsZ[iz]);
-    for (int ix = 0; ix < 3; ++ix)
-        placeGirderBeamZ(world, bz0 + 2, bz1 - 2, roofY, colsX[ix]);
-
-    // 5) Sheet-metal walls — 1-voxel-thick unit panels (open bay on +Z front).
-    placeSheetWallX(world, bx0, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // -X wall
-    placeSheetWallX(world, bx1, 1 + SLAB_THICK, roofY - 1, bz0, bz1);           // +X wall
-    placeSheetWallZ(world, bz0, 1 + SLAB_THICK, roofY - 1, bx0, bx1);           // -Z back wall
-    // Front (+Z): partial side wings, open center doorway
-    placeSheetWallZ(world, bz1, 1 + SLAB_THICK, roofY - 1, bx0, bx0 + 35);
-    placeSheetWallZ(world, bz1, 1 + SLAB_THICK, roofY - 1, bx1 - 35, bx1);
-    // Door lintel strip of sheet metal
-    placeSheetWallZ(world, bz1, roofY - 8, roofY - 1, bx0 + 36, bx1 - 36);
-
-    // 6) Roof sheet deck: unit metal cubes on top of beams (not a single quad).
-    for (int z = bz0; z <= bz1; ++z)
-        for (int x = bx0; x <= bx1; ++x) {
-            // skip every other for light vents still unit cubes
-            if (((x + z) & 3) == 0) continue;
-            setWorldBlock(world, x, roofY + 3, z, Block::SheetMetal);
-        }
-
-    // 7) A few unit-voxel crates inside for material variety / targets.
-    placeCrate(world, bx0 + 20, 1 + SLAB_THICK, bz0 + 24, 8);
-    placeCrate(world, bx0 + 40, 1 + SLAB_THICK, bz0 + 30, 10);
-    placeCrate(world, bx1 - 30, 1 + SLAB_THICK, bz0 + 20, 8);
-
-    // 7b) Warm light bulbs inside (unit voxels hanging near roof girders).
-    {
-        const int by = roofY - 2;
-        auto bulb = [&](int x, int z) {
-            setWorldBlock(world, x, by, z, Block::LightBulb);
-            setWorldBlock(world, x, by - 1, z, Block::LightBulb);
-            // small cage
-            setWorldBlock(world, x + 1, by, z, Block::Girder);
-            setWorldBlock(world, x - 1, by, z, Block::Girder);
-        };
-        bulb((bx0 + bx1) / 2, (bz0 + bz1) / 2);
-        bulb(bx0 + 28, bz0 + 28);
-        bulb(bx1 - 28, bz0 + 32);
-        bulb((bx0 + bx1) / 2, bz1 - 18);
-    }
-
-    // 7c) Moon: one solid emissive unit voxel high on the -Z sky side.
-    // The billboard sprite and the light direction are view concerns derived from
-    // g_moonDirWorld in updateMoonSkyTile(); map construction must not write
-    // render state, so nothing here touches a view global.
-    {
-        const int mx = WORLD_W / 2 + 24;
-        const int mz = 6;
-        const int my = WORLD_H - 6;
-        setWorldBlock(world, mx, my, mz, Block::Moon);
-    }
-
-    // 8) River slice beyond +Z apron: WATER_CELL (2x2) unit cubes, deep channel with current.
-    // Dirt bank extends; carve channel and fill water/current.
-    {
-        const int riverZ0 = bz1 + 2;
-        const int riverZ1 = WORLD_D - 3;
-        const int riverX0 = 8;
-        const int riverX1 = WORLD_W - 9;
-        // Ensure dirt banks around river
-        fillBox(world, 0, 0, riverZ0 - 2, WORLD_W - 1, 0, WORLD_D - 1, Block::Dirt);
-        // Deep channel center (unit voxels stacked)
-        const int surfaceY = 4;
-        const int deepY0 = 0;
-        const int deepY1 = surfaceY; // depth includes surface
-        for (int z = riverZ0; z <= riverZ1; ++z) {
-            for (int x = riverX0; x <= riverX1; ++x) {
-                // banks stay dirt; channel interior
-                bool channel = (x > riverX0 + 4 && x < riverX1 - 4);
-                if (!channel) continue;
-                // deeper mid-stream trench
-                int localDeep = surfaceY;
-                int mid = (riverX0 + riverX1) / 2;
-                int dist = std::abs(x - mid);
-                if (dist < 6) localDeep = surfaceY + 5;      // deepest
-                else if (dist < 12) localDeep = surfaceY + 2;
-                for (int y = 0; y <= localDeep && y < WORLD_H; ++y) {
-                    // place as WATER_CELL clumps: still unit cubes on grid
-                    Block wb = (dist < 10 && y <= localDeep) ? Block::WaterCurrent : Block::Water;
-                    setWorldBlock(world, x, y, z, wb);
-                    // thicken visually with adjacent unit cells (larger water voxels)
-                    // WATER_CELL clumps only on even layers to cut fill-rate
-                    if ((y & 1) == 0 && (x % WATER_CELL) == 0 && (z % WATER_CELL) == 0) {
-                        for (int dz = 0; dz < WATER_CELL; ++dz)
-                            for (int dx = 0; dx < WATER_CELL; ++dx)
-                                if (dx || dz) setWorldBlock(world, x + dx, y, z + dz, wb);
-                    }
-                }
-            }
-        }
-    }
-
     return world;
 }
 
+
 // Skirt isolation tracking: assert that client-side meshing never attempts to
 // read outside the supplied visible skirt (RULES.md, "Visibility filtering").
-static uint64_t g_skirtAccessViolations = 0;
-
-// A block as read out of a sent snapshot. This is the ONLY way view-side code
-// learns occupancy — it has no other source.
-static Block sentBlockAt(const ViewChunk& vc, int lx, int ly, int lz) {
-    if (!view::SentCells::inSkirt(lx, ly, lz)) {
-        ++g_skirtAccessViolations;
-        return Block::Air;
-    }
-    // The wire enum and the sim enum are asserted equal in sim_world.hpp, so
-    // this is a checked reinterpretation, not a cast of convenience.
-    return static_cast<Block>(static_cast<uint8_t>(vc.sent.get(lx, ly, lz)));
-}
-
-static bool isVoxelSolidForAo(const ViewChunk& vc, int lx, int ly, int lz) {
-    const Block b = sentBlockAt(vc, lx, ly, lz);
-    return b != Block::Air && !isWaterBlock(b);
-}
-
-// Sharp vertex face emit: 6 unique verts/face (2 tris), hard face normals, no sharing.
-static void emitSharpFace(std::vector<ViewChunk::Vertex>& out, int ix, int iy, int iz,
-                          int face, const Vec3& color, float mat = 0.0f) {
-    // unit cube corners in voxel space, scaled to world by VOXEL_SIZE
-    static const float F[6][4][3] = {
-        {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
-        {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
-        {{0,1,0},{0,1,1},{1,1,1},{1,1,0}}, // +Y
-        {{0,0,1},{0,0,0},{1,0,0},{1,0,1}}, // -Y
-        {{1,0,1},{1,1,1},{0,1,1},{0,0,1}}, // +Z
-        {{0,0,0},{0,1,0},{1,1,0},{1,0,0}}, // -Z
-    };
-    static const float N[6][3] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
-    };
-    // CCW when viewed from outside, matching Vulkan front-face CCW + Y-flip proj
-    static const int IDX[6] = {0, 1, 2, 0, 2, 3};
-    static const float faceShade[6] = {0.82f, 0.68f, 1.0f, 0.52f, 0.90f, 0.74f};
-
-    const float ox = ix * VOXEL_SIZE;
-    const float oy = iy * VOXEL_SIZE;
-    const float oz = iz * VOXEL_SIZE;
-    Vec3 c = color * faceShade[face];
-
-    for (int i = 0; i < 6; ++i) {
-        const float* p = F[face][IDX[i]];
-        out.push_back(ViewChunk::Vertex{
-            ox + p[0] * VOXEL_SIZE,
-            oy + p[1] * VOXEL_SIZE,
-            oz + p[2] * VOXEL_SIZE,
-            N[face][0], N[face][1], N[face][2],
-            c.x, c.y, c.z,
-            mat
-        });
-    }
-}
-
-// Surface smoothing and Corner Ambient Occlusion (Milestone 4).
-// Computes Minecraft-style 3-neighbor corner AO and smooth vertex normals
-// from adjacent blocks in the 1-cell skirt, while occupancy remains strictly 1x1x1 cubes.
-static void emitSmoothedFace(ViewChunk& vc, int lx, int ly, int lz,
-                             int gx, int gy, int gz, int face,
-                             const Vec3& color, float mat = 0.0f) {
-    static const float F[6][4][3] = {
-        {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
-        {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
-        {{0,1,0},{0,1,1},{1,1,1},{1,1,0}}, // +Y
-        {{0,0,1},{0,0,0},{1,0,0},{1,0,1}}, // -Y
-        {{1,0,1},{1,1,1},{0,1,1},{0,0,1}}, // +Z
-        {{0,0,0},{0,1,0},{1,1,0},{1,0,0}}, // -Z
-    };
-    static const float N[6][3] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
-    };
-    static const float faceShade[6] = {0.82f, 0.68f, 1.0f, 0.52f, 0.90f, 0.74f};
-    static const float kAoCurve[4] = {0.58f, 0.72f, 0.86f, 1.0f};
-
-    const float ox = gx * VOXEL_SIZE;
-    const float oy = gy * VOXEL_SIZE;
-    const float oz = gz * VOXEL_SIZE;
-
-    const int nx = static_cast<int>(N[face][0]);
-    const int ny = static_cast<int>(N[face][1]);
-    const int nz = static_cast<int>(N[face][2]);
-    const int adjX = lx + nx;
-    const int adjY = ly + ny;
-    const int adjZ = lz + nz;
-
-    int aoVal[4] = {3, 3, 3, 3};
-    Vec3 cornerNorm[4];
-    Vec3 cornerCol[4];
-
-    for (int k = 0; k < 4; ++k) {
-        const float* p = F[face][k];
-        const int px = static_cast<int>(p[0]);
-        const int py = static_cast<int>(p[1]);
-        const int pz = static_cast<int>(p[2]);
-
-        const int dx = 2 * px - 1;
-        const int dy = 2 * py - 1;
-        const int dz = 2 * pz - 1;
-
-        int ux = 0, uy = 0, uz = 0;
-        int vx = 0, vy = 0, vz = 0;
-        if (nx != 0) {
-            uy = dy;
-            vz = dz;
-        } else if (ny != 0) {
-            ux = dx;
-            vz = dz;
-        } else {
-            ux = dx;
-            vy = dy;
-        }
-
-        // Corner Ambient Occlusion (Minecraft-style 3-neighbor test)
-        if (mat == 0.0f) {
-            bool s1 = isVoxelSolidForAo(vc, adjX + ux, adjY + uy, adjZ + uz);
-            bool s2 = isVoxelSolidForAo(vc, adjX + vx, adjY + vy, adjZ + vz);
-            bool sc = isVoxelSolidForAo(vc, adjX + ux + vx, adjY + uy + vy, adjZ + uz + vz);
-            aoVal[k] = (s1 && s2) ? 0 : 3 - (static_cast<int>(s1) + static_cast<int>(s2) + static_cast<int>(sc));
-        } else {
-            aoVal[k] = 3;
-        }
-        const float aoFactor = kAoCurve[aoVal[k]];
-        cornerCol[k] = color * faceShade[face] * aoFactor;
-
-        // Vertex normal smoothing: inspect 8 cubes around vertex in 1-cell skirt
-        if (mat == 0.0f) {
-            Vec3 vGrad(0.0f, 0.0f, 0.0f);
-            for (int dxi = 0; dxi < 2; ++dxi) {
-                int cdx = (dxi == 0) ? (px - 1) : px;
-                float offX = (cdx == px) ? 0.5f : -0.5f;
-                for (int dyi = 0; dyi < 2; ++dyi) {
-                    int cdy = (dyi == 0) ? (py - 1) : py;
-                    float offY = (cdy == py) ? 0.5f : -0.5f;
-                    for (int dzi = 0; dzi < 2; ++dzi) {
-                        int cdz = (dzi == 0) ? (pz - 1) : pz;
-                        float offZ = (cdz == pz) ? 0.5f : -0.5f;
-                        if (isVoxelSolidForAo(vc, lx + cdx, ly + cdy, lz + cdz)) {
-                            vGrad.x -= offX;
-                            vGrad.y -= offY;
-                            vGrad.z -= offZ;
-                        }
-                    }
-                }
-            }
-            if (vGrad.length() > 1e-4f) {
-                Vec3 vNorm = vGrad.normalized();
-                Vec3 fNorm(N[face][0], N[face][1], N[face][2]);
-                if (vNorm.dot(fNorm) > 0.15f) {
-                    cornerNorm[k] = (fNorm * 0.35f + vNorm * 0.65f).normalized();
-                } else {
-                    cornerNorm[k] = fNorm;
-                }
-            } else {
-                cornerNorm[k] = Vec3(N[face][0], N[face][1], N[face][2]);
-            }
-        } else {
-            cornerNorm[k] = Vec3(N[face][0], N[face][1], N[face][2]);
-        }
-    }
-
-    // Quad triangulation: flip diagonal if ao0 + ao2 > ao1 + ao3 to prevent anisotropic creasing
-    int indices[6];
-    if (aoVal[0] + aoVal[2] > aoVal[1] + aoVal[3]) {
-        indices[0] = 1; indices[1] = 2; indices[2] = 3;
-        indices[3] = 1; indices[4] = 3; indices[5] = 0;
-    } else {
-        indices[0] = 0; indices[1] = 1; indices[2] = 2;
-        indices[3] = 0; indices[4] = 2; indices[5] = 3;
-    }
-
-    for (int i = 0; i < 6; ++i) {
-        int ci = indices[i];
-        const float* p = F[face][ci];
-        vc.mesh.push_back(ViewChunk::Vertex{
-            ox + p[0] * VOXEL_SIZE,
-            oy + p[1] * VOXEL_SIZE,
-            oz + p[2] * VOXEL_SIZE,
-            cornerNorm[ci].x, cornerNorm[ci].y, cornerNorm[ci].z,
-            cornerCol[ci].x, cornerCol[ci].y, cornerCol[ci].z,
-            mat
-        });
-    }
-}
-
-// Build a chunk's mesh from the cells the sim SENT, and nothing else.
-//
-// Note the signature: there is no sim::World parameter. That absence is the
-// point. Every face-exposure question ("is my neighbour empty?") is answered
-// from the 1-cell skirt the sim included in the snapshot, so this function
-// physically cannot consult occupancy the client was not shown. A view client
-// given this struct and its SentCells can produce the identical mesh, and has
-// no path to anything else.
-static void meshChunk(ViewChunk& chunk) {
-    chunk.mesh.clear();
-    chunk.mesh.reserve(4096);
-
-    const int baseX = chunk.cx * CHUNK_SIZE;
-    const int baseY = chunk.cy * CHUNK_SIZE;
-    const int baseZ = chunk.cz * CHUNK_SIZE;
-
-    for (int ly = 0; ly < CHUNK_SIZE; ++ly) {
-        for (int lz = 0; lz < CHUNK_SIZE; ++lz) {
-            for (int lx = 0; lx < CHUNK_SIZE; ++lx) {
-                const Block b = sentBlockAt(chunk, lx, ly, lz);
-                if (b == Block::Air) continue;
-                const int x = baseX + lx, y = baseY + ly, z = baseZ + lz;
-                Vec3 col = blockColor(b);
-
-                for (int f = 0; f < 6; ++f) {
-                    // Read the neighbour out of the skirt. lx+1 == CHUNK_SIZE
-                    // is still inside the snapshot, so this never leaves the
-                    // data the sim sent.
-                    const Block nb = sentBlockAt(
-                        chunk, lx + sim::kFaceOX[f], ly + sim::kFaceOY[f], lz + sim::kFaceOZ[f]);
-                    // Unit-cube face exposed only against empty grid cells.
-                    bool expose = false;
-                    if (isWaterBlock(b)) {
-                        expose = (nb == Block::Air) || (!isWaterBlock(nb) && nb != Block::Air);
-                        // show water surface against air only for clearer tide paint
-                        expose = (nb == Block::Air);
-                    } else {
-                        expose = (nb == Block::Air) || isWaterBlock(nb);
-                    }
-                    if (!expose) continue;
-                    float mat = 0.0f;
-                    if (isWaterBlock(b)) mat = 1.0f;
-                    else if (b == Block::LightBulb) mat = 2.0f;
-                    else if (b == Block::Moon) mat = 3.0f;
-                    emitSmoothedFace(chunk, lx, ly, lz, x, y, z, f, col, mat);
-                }
-            }
-        }
-    }
-}
+// The view mesher now lives in mesh_view.hpp; this is its telemetry, shared by
+// every meshChunk call in this TU.
+static meshview::Stats g_meshStats;
 
 // ---- the send path: sim -> view ----
 // Everything the view will ever know about occupancy passes through here. This
@@ -1219,6 +825,7 @@ static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc, bool isVis
         // Anti-cheat: zero out snapshot so client memory contains no hidden world data
         for (auto& cell : vc.sent.cells) {
             cell.id = static_cast<uint8_t>(wire::BlockId::Air);
+            cell.appear = 0;
         }
         vc.hasSnapshot = true;
         return;
@@ -1231,6 +838,7 @@ static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc, bool isVis
             for (int lx = -view::kSkirt; lx < CHUNK_SIZE + view::kSkirt; ++lx) {
                 const Block b = world.get(baseX + lx, baseY + ly, baseZ + lz);
                 vc.sent.set(lx, ly, lz, static_cast<wire::BlockId>(static_cast<uint8_t>(b)));
+                vc.sent.setAppearance(lx, ly, lz, world.getAppearance(baseX + lx, baseY + ly, baseZ + lz));
             }
         }
     }
@@ -1241,42 +849,62 @@ static void sendChunkSnapshot(const sim::World& world, ViewChunk& vc, bool isVis
 // buffer, so a remesh copies only the chunks whose voxels actually changed
 // instead of rebuilding and re-uploading the whole world every time.
 
-// Re-mesh only chunks whose occupancy changed. Returns the chunks that were
-// rebuilt, so the caller uploads exactly those and nothing else.
-static std::vector<ViewChunk*> remeshStaleChunks(const sim::World& world,
-                                                 std::vector<ViewChunk>& views) {
+// Re-meshing a changed chunk is two phases, and they are split on purpose.
+//
+// Phase 1 (sendStaleSnapshots) is the sim side: it reads sim::World and
+// refreshes the snapshot of every chunk whose version moved. It must run on
+// the thread that owns the world, between ticks.
+//
+// Phase 2 (buildChunkMeshes) is pure view work: it meshes each of those
+// chunks from its own snapshot and touches nothing else, so it can fan out
+// across the mesh workers. Running phase 1 to completion first is what
+// keeps the mesh in step with the world, since meshChunk cannot see the world.
+
+// Refresh the snapshot of every chunk whose occupancy changed. Returns those
+// chunks, so the caller meshes and uploads exactly those and nothing else.
+static std::vector<ViewChunk*> sendStaleSnapshots(const sim::World& world,
+                                                  std::vector<ViewChunk>& views) {
     std::vector<ViewChunk*> touched;
     for (auto& c : views) {
         const sim::Chunk& sc = world.chunks[sim::World::chunkIndex(c.cx, c.cy, c.cz)];
         if (!c.snapshotStale(sc.version)) continue;
-        // Refresh the snapshot first, then mesh from it. meshChunk has no access
-        // to the world, so this ordering is what keeps the two in step.
         sendChunkSnapshot(world, c);
-        meshChunk(c);
-        c.vertexCount = static_cast<uint32_t>(c.mesh.size());
         c.meshedVersion = sc.version;
         touched.push_back(&c);
-        if (c.vertexCount > c.slotCapacity) {
-            // A chunk outgrew its reserved region: force a full repack so every
-            // chunk's offset is recomputed consistently before uploading.
-            g_needsFullMeshRepack = true;
-        }
     }
     return touched;
 }
+
+static meshview::Workers* g_meshWorkers = nullptr;
+static int g_meshWorkerHelpers = 0; // telemetry: size of the live pool
+
+// Mesh each touched chunk from its snapshot, then record its size.
+static void noteOccupancy(const ViewChunk& c); // shadow volume (see createOccupancyVolume)
+
+static void buildChunkMeshes(const std::vector<ViewChunk*>& touched) {
+    if (g_meshWorkers) g_meshWorkers->meshAll(touched, g_meshStats);
+    else for (ViewChunk* c : touched) meshview::meshChunk(*c, g_meshStats);
+    for (ViewChunk* c : touched) {
+        c->vertexCount = static_cast<uint32_t>(c->mesh.size());
+        noteOccupancy(*c);
+    }
+}
+
+// Slot size for a chunk mesh of `verts` vertices. The headroom means ordinary
+// destruction (which exposes new interior faces and grows the mesh) does not
+// immediately outgrow the slot. A chunk may still shrink freely.
+static uint32_t slotWant(uint32_t verts) { return verts + verts / 4 + 1024; }
 
 static void repackChunkSlots(std::vector<ViewChunk>& chunks) {
     uint32_t cursor = 0;
     for (auto& c : chunks) {
         c.firstVertex = cursor;
         c.vertexCount = static_cast<uint32_t>(c.mesh.size());
-        // Reserve headroom so ordinary destruction (which exposes new interior
-        // faces and grows the mesh) does not immediately force another repack.
-        // A chunk may still shrink freely; only growth past this cap repacks.
-        uint32_t want = c.vertexCount + c.vertexCount / 4 + 1024;
+        const uint32_t want = slotWant(c.vertexCount);
         if (c.slotCapacity < want) c.slotCapacity = want;
         cursor += c.slotCapacity;
     }
+    g_slotCursor = cursor;
     g_liveVertexCount = 0;
     for (const auto& c : chunks) g_liveVertexCount += c.vertexCount;
 }
@@ -1460,22 +1088,27 @@ static void emitUnitCube(Vertex* verts, uint32_t& wi, uint32_t maxVerts,
                axU * ((y0 + ((bits & 2) ? 1.0f : 0.0f)) * edge) +
                axF * ((z0 + ((bits & 4) ? 1.0f : 0.0f)) * edge);
     };
-    // face axis, sign, then the two in-plane corner bitmaps
-    struct Face { int axis; int sign; int a, b, c, d; };
+    // Face axis and sign, then its four corners counter-clockwise seen from
+    // outside (the same faces and winding as meshview::emitSharpFace).
+    // Corner bits: 1 = +x, 2 = +y, 4 = +z.
+    struct Face { int axis; int sign; int c[4]; };
     static const Face kFaces[6] = {
-        {0, +1, 6, 2, 3, 7}, // +x
-        {0, -1, 4, 0, 1, 5}, // -x
-        {1, +1, 5, 1, 3, 7}, // +y
-        {1, -1, 4, 0, 2, 6}, // -y
-        {2, +1, 7, 3, 1, 5}, // +z
-        {2, -1, 6, 0, 2, 4}, // -z
+        {0, +1, {1, 3, 7, 5}}, // +x
+        {0, -1, {4, 6, 2, 0}}, // -x
+        {1, +1, {2, 6, 7, 3}}, // +y
+        {1, -1, {4, 0, 1, 5}}, // -y
+        {2, +1, {5, 7, 6, 4}}, // +z
+        {2, -1, {0, 2, 3, 1}}, // -z
     };
+    // Two triangles per quad. (This used to be corner(order[t / 2]), i.e.
+    // a,a,b,b,c,c: two degenerate triangles per face, so every cube drawn
+    // through here rasterised nothing.)
+    static const int kTri[6] = {0, 1, 2, 0, 2, 3};
     for (const auto& f : kFaces) {
         const Vec3 nrm = (f.axis == 0 ? axR : (f.axis == 1 ? axU : axF)) * static_cast<float>(f.sign);
-        const int order[4] = {f.a, f.b, f.c, f.d};
         for (int t = 0; t < 6; ++t) {
             Vertex& v = verts[wi++];
-            const Vec3 p = corner(order[t / 2]);
+            const Vec3 p = corner(f.c[kTri[t]]);
             v.px = p.x;
             v.py = p.y;
             v.pz = p.z;
@@ -1486,6 +1119,9 @@ static void emitUnitCube(Vertex* verts, uint32_t& wi, uint32_t maxVerts,
             v.cg = cg;
             v.cb = cb;
             v.mat = matId;
+            v.texLayer = 0.0f;
+            v.painted = 0.0f;
+            v.shade = 1.0f;
         }
     }
 }
@@ -1509,6 +1145,12 @@ static constexpr int kHudHealthCells = 10;
 static constexpr int kHudHealthCols = 5;
 static constexpr int kHudBreathCells = 5;
 
+// How far overlay cubes sit from the eye, as a multiple of the original 6 mm.
+// Cells are fixed 1 mm cubes, so distance sets their on-screen size: at the
+// original 1x the health block was ~250 px wide (sized while emitUnitCube drew
+// nothing). Every anchor offset scales with it, so positions on screen are kept.
+static constexpr float kOverlayDepthScale = 2.5f;
+
 static uint32_t emitHealthHud(uint32_t wi) {
     if (!g_inventoryMapped) return wi;
     Vec3 fwd = cameraForward();
@@ -1518,8 +1160,9 @@ static uint32_t emitHealthHud(uint32_t wi) {
     const Vec3 up = right.cross(fwd).normalized();
     // Same distance as the lattice so both sit on one visual grid; the HUD is
     // anchored below the panel and to its left.
-    const float dist = 0.006f;
-    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0062f) + right * (0.0009f);
+    const float k = kOverlayDepthScale;
+    const float dist = 0.006f * k;
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0062f * k) + right * (0.0009f * k);
     const float matId = static_cast<float>(kInventoryMatId);
 
     const float frac = g_health.healthFraction();
@@ -1634,10 +1277,11 @@ static void updateInventoryMesh() {
     const Vec3 dFwd = (dFwdY * cp + dUpY * sp).normalized();
     const Vec3 dUp = (dUpY * cp - dFwdY * sp).normalized();
 
-    // Anchor: down and to the right of the eye, ~0.006 out. A 3x3x4 cell block
-    // is 0.003 x 0.003 x 0.004 world units at this distance.
-    const float dist = 0.006f;
-    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f) + right * (0.0046f);
+    // Anchor: down and to the right of the eye. A 3x3x4 cell block is
+    // 0.003 x 0.003 x 0.004 world units; the distance sets its screen size.
+    const float k = kOverlayDepthScale;
+    const float dist = 0.006f * k;
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f * k) + right * (0.0046f * k);
 
     g_invDisplay.origin = origin;
     g_invDisplay.right = dRight;
@@ -1925,41 +1569,58 @@ static void seedPickups() {
     g_pickups.clear();
     g_pickupTaken = 0;
     g_pickupRefused = 0;
-    struct Seed { const char* id; int dx, dz; };
-    // Spread across the bay the player spawns looking into. Ids must match the
-    // *.item.json files in data/items; an unknown id is skipped, not faked.
-    static const Seed kSeeds[] = {
-        {"supply_grenade",      -3, -6},
-        {"ammo_pouch_medium",   -1, -8},
-        {"weapon_sidearm_light", 2, -7},
-        {"weapon_starter_rifle", 3, -5},
-        {"armor_chest_plate",    0, -10},
-        {"armor_helmet",         5, -9},
-    };
-    for (const Seed& s : kSeeds) {
-        const int defIdx = itemIndexById(s.id);
-        if (defIdx < 0) continue;
-        const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
-        if (!d || !d->shape.valid()) continue;
-        WorldPickup p;
-        p.defIndex = defIdx;
-        p.rot = 0;
-        p.cx = g_spawnCellX + s.dx;
-        p.cz = g_spawnCellZ + s.dz;
-        // Drop onto whatever is under it: scan down for the first free cell so
-        // the item rests on the floor instead of hovering over a gap.
-        p.cy = g_spawnCellY;
-        if (g_world) {
-            for (int y = g_spawnCellY + 4; y >= 1; --y) {
-                if (isSolidBlock(g_world->get(p.cx, y - 1, p.cz))) {
-                    p.cy = y;
-                    break;
-                }
-            }
+    if (!g_mapPickups.empty()) {
+        // Map-authored placements: exact cells, no floor search. An unknown
+        // item id is skipped, not faked.
+        for (const auto& mp : g_mapPickups) {
+            const int defIdx = itemIndexById(mp.item.c_str());
+            if (defIdx < 0) continue;
+            const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+            if (!d || !d->shape.valid()) continue;
+            WorldPickup p;
+            p.defIndex = defIdx;
+            p.rot = mp.rot;
+            p.cx = mp.x; p.cy = mp.y; p.cz = mp.z;
+            g_pickups.push_back(p);
         }
-        g_pickups.push_back(p);
+        g_pickupMeshDirty = true;
+        return;
     }
+    // A map without "pickups" simply has none.
     g_pickupMeshDirty = true;
+}
+
+// Light fixtures (environment layer) are models, not occupancy: built once
+// from the map's lights and drawn in the main pass with the Bulb render class.
+// A "bulb" is a 1x2x1 stack of unit cubes centred on its light, the same
+// silhouette the old light_bulb cells had.
+static constexpr uint32_t kFixtureMaxVerts = 36u * 2u * 64u;
+static VkBuffer g_fixtureVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_fixtureMem = VK_NULL_HANDLE;
+static void* g_fixtureMapped = nullptr;
+static uint32_t g_fixtureVertexCount = 0;
+
+static void buildFixtureMesh() {
+    if (!g_fixtureVB) {
+        const VkDeviceSize size = sizeof(Vertex) * kFixtureMaxVerts;
+        createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_fixtureVB, g_fixtureMem);
+        vkMapMemory(g_device, g_fixtureMem, 0, size, 0, &g_fixtureMapped);
+    }
+    g_fixtureVertexCount = 0;
+    if (!g_fixtureMapped) return;
+    const Vec3 axR(1, 0, 0), axU(0, 1, 0), axF(0, 0, 1);
+    Vertex* verts = reinterpret_cast<Vertex*>(g_fixtureMapped);
+    uint32_t wi = 0;
+    const float cls = rc::attr(rc::RenderClass::Bulb);
+    for (const auto& l : g_mapLights) {
+        if (l.kind != "bulb") continue;
+        for (int k = 0; k < 2; ++k)
+            emitUnitCube(verts, wi, kFixtureMaxVerts, Vec3(0, 0, 0), axR, axU, axF, l.x - 0.5f,
+                         l.y - 1.0f + static_cast<float>(k), l.z - 0.5f, VOXEL_SIZE, l.r, l.g, l.b, cls);
+    }
+    g_fixtureVertexCount = wi;
 }
 
 static void updatePickupMesh() {
@@ -2094,6 +1755,9 @@ static void updateDebrisMesh() {
         v.nx = nx; v.ny = ny; v.nz = nz;
         v.cr = cr; v.cg = cg; v.cb = cb;
         v.mat = matId;
+        v.texLayer = 0.0f;
+        v.painted = 0.0f;
+        v.shade = 1.0f;
     };
 
     // Soft-cap drawn particles under load (36 verts each).
@@ -2184,7 +1848,10 @@ static void updateMoonSkyTile() {
         dst.nx = n.x; dst.ny = n.y; dst.nz = n.z;
         // cr/cg = local tile UV for pixel grid; cb packs sky elevation 0..1
         dst.cr = tileU; dst.cg = tileV; dst.cb = v;
-        dst.mat = 4.0f; // sky tile
+        dst.mat = rc::attr(rc::RenderClass::Sky);
+        dst.texLayer = 0.0f;
+        dst.painted = 0.0f;
+        dst.shade = 1.0f;
     };
 
     uint32_t wi = 0;
@@ -2208,7 +1875,7 @@ static void updateMoonSkyTile() {
         }
     }
 
-    // Moon light-source sprite (mat=3), camera-facing at moon bearing
+    // Moon light-source sprite (RenderClass::Moon), camera-facing at moon bearing
     Vec3 to = g_moonDirWorld;
     Vec3 worldUp(0, 1, 0);
     Vec3 right = to.cross(worldUp);
@@ -2226,7 +1893,10 @@ static void updateMoonSkyTile() {
         dst.px = p.x; dst.py = p.y; dst.pz = p.z;
         dst.nx = mn.x; dst.ny = mn.y; dst.nz = mn.z;
         dst.cr = u; dst.cg = v; dst.cb = 1.0f;
-        dst.mat = 3.0f;
+        dst.mat = rc::attr(rc::RenderClass::Moon);
+        dst.texLayer = 0.0f;
+        dst.painted = 0.0f;
+        dst.shade = 1.0f;
     };
     putMoon(verts[wi++], m0, 0, 0);
     putMoon(verts[wi++], m1, 1, 0);
@@ -2239,7 +1909,72 @@ static void updateMoonSkyTile() {
 
 
 // ---- Win32 ----
+// ---- window-side pause and mouse lock ----
+// Both are host/view state, never simulation state. Pausing stops the main
+// loop scheduling ticks: the simulation is not told anything, it is simply not
+// advanced. The lock only changes where look deltas come from (raw mouse input
+// instead of a drag); they still reach the simulation as SimInput::lookDx/Dy.
+static bool g_paused = false;
+static bool g_cursorLocked = false;
+static bool g_uiReady = false;     // ImGui context and backends exist
+static bool g_menuForced = false;  // capture harness: draw the menu without pausing
+static VkRenderPass g_uiRenderPass = VK_NULL_HANDLE;   // menu pass (see initUi)
+static std::vector<VkFramebuffer> g_uiFramebuffers;    // one per swapchain image
+static void createUiFramebuffers();
+
+static void updateWindowTitle() {
+    std::string t =
+        "Voxel FPS 0.0 — WASD walk | Space jump | Q/E lean | RMB/F fire | X ADS | 1-4 cal | "
+        "R ammo | V weapon | B mode | Tab pack";
+    if (g_paused) t += "  —  PAUSED: Esc to resume, Shift+Esc quits";
+    else if (g_cursorLocked) t += "  —  Esc pause";
+    else t += "  —  click to look, Esc pause";
+    SetWindowTextA(g_hwnd, t.c_str());
+}
+
+// Confine the cursor to the client area. Re-run whenever the window moves or
+// resizes while locked, since the clip rect is in screen coordinates.
+static void clipCursorToClient() {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
+    ClientToScreen(g_hwnd, &tl);
+    ClientToScreen(g_hwnd, &br);
+    const RECT screen{tl.x, tl.y, br.x, br.y};
+    ClipCursor(&screen);
+}
+
+static void setCursorLock(bool lock) {
+    // Smoke and stress run on someone's desktop; they must never take the mouse.
+    if (g_smoke) lock = false;
+    if (lock == g_cursorLocked) return;
+    g_cursorLocked = lock;
+    if (lock) {
+        clipCursorToClient();
+        ShowCursor(FALSE); // ShowCursor is a counter: called once per state change
+    } else {
+        ClipCursor(nullptr);
+        ShowCursor(TRUE);
+    }
+    updateWindowTitle();
+}
+
+static void setPaused(bool paused) {
+    if (paused == g_paused) return;
+    g_paused = paused;
+    // Nothing pressed while paused may reach the first tick after resume: a
+    // fire tap during the pause must not shoot the moment play continues.
+    simInputClearEdges(g_pendingInput);
+    g_pendingInput.fireHeld = false;
+    g_mouseDown = false;
+    ReleaseCapture();
+    if (paused) setCursorLock(false);
+    updateWindowTitle();
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // The menu sees every message first (it tracks the mouse even when closed).
+    if (g_uiReady && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return true;
     switch (msg) {
     case WM_CLOSE:
         g_running = false;
@@ -2254,13 +1989,49 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_height = std::max(1, static_cast<int>(HIWORD(lParam)));
             g_resized = true;
         }
+        if (g_cursorLocked) clipCursorToClient();
         return 0;
+    case WM_MOVE:
+        if (g_cursorLocked) clipCursorToClient();
+        return 0;
+    case WM_KILLFOCUS:
+        // Alt-Tab away: pause, free the mouse, and forget held keys (their
+        // key-up goes to whichever window has focus, so it would never arrive).
+        std::memset(g_keys, 0, sizeof(g_keys));
+        if (!g_smoke) setPaused(true);
+        return 0;
+    case WM_INPUT: {
+        // Raw mouse motion drives look while locked: unaccelerated counts, and
+        // no dependence on where the cursor is, so it never hits a screen edge.
+        // Every path returns through DefWindowProc, which must see WM_INPUT to
+        // release the raw input buffer.
+        if (g_cursorLocked && !g_paused && !g_inventoryOpen) {
+            RAWINPUT raw{};
+            UINT size = sizeof(raw);
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size,
+                                sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+                raw.header.dwType == RIM_TYPEMOUSE &&
+                (raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                g_pendingInput.lookDx += static_cast<float>(raw.data.mouse.lLastX);
+                g_pendingInput.lookDy += static_cast<float>(raw.data.mouse.lLastY);
+            }
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
     case WM_KEYDOWN:
         if (wParam < 256) g_keys[wParam] = true;
         if (wParam == VK_ESCAPE) {
-            g_running = false;
-            PostQuitMessage(0);
+            // Esc pauses; Shift+Esc quits. Smoke/stress keep Esc = quit so a run
+            // can be aborted (it then fails with smoke_complete=0, exit 7).
+            if (g_smoke || (GetKeyState(VK_SHIFT) & 0x8000)) {
+                g_running = false;
+                PostQuitMessage(0);
+            } else if ((lParam & (1 << 30)) == 0) { // ignore auto-repeat
+                setPaused(!g_paused);
+            }
+            return 0;
         }
+        if (g_paused) return 0; // nothing else is a request while paused
         // Everything below is a *request* to the simulation. The view does not
         // decide the active caliber, weapon, ammo, or fire mode itself; it says
         // what the player asked for and sim::tick() validates it against the
@@ -2281,8 +2052,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_mouseDown = false;
                 stowHeld(g_inventory, g_itemDefs);
                 g_inventoryHandRot = 0;
+                setCursorLock(false);
             } else {
-                SetCapture(hwnd);
+                setCursorLock(true);
             }
         }
         // R: rotate the held item while the lattice is up; otherwise cycle ammo.
@@ -2308,6 +2080,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == 'F') g_pendingInput.fireHeld = false;
         return 0;
     case WM_LBUTTONDOWN:
+        // While paused, clicks belong to the menu. A click while unlocked only
+        // locks the mouse; it is not also read as a look drag or a pick.
+        if (g_paused) return 0;
+        if (!g_cursorLocked && !g_inventoryOpen && !g_smoke) {
+            setCursorLock(true);
+            return 0;
+        }
         g_mouseDown = true;
         g_lastMouseX = static_cast<short>(LOWORD(lParam));
         g_lastMouseY = static_cast<short>(HIWORD(lParam));
@@ -2325,6 +2104,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
+        if (g_paused) return 0;
         if (g_inventoryOpen) {
             g_inventoryStow = true;
             return 0;
@@ -2340,7 +2120,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_mouseY = static_cast<short>(HIWORD(lParam));
         // While the inventory lattice is up, the cursor selects cells instead of
         // turning the camera, so the click is read as a pick/place, never a look.
-        if (g_mouseDown && !g_inventoryOpen) {
+        // Drag-look is the fallback when the mouse is not locked (raw input
+        // drives look while it is).
+        if (g_mouseDown && !g_inventoryOpen && !g_cursorLocked && !g_paused) {
             // Accumulate the raw pixel delta; sim::tick() applies it. Applying
             // yaw here instead would make aim depend on how often Windows
             // delivers WM_MOUSEMOVE, which is not reproducible across machines.
@@ -2378,11 +2160,19 @@ static void createWindow() {
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExA(
         0, wc.lpszClassName,
-"Voxel FPS 0.0 — WASD walk | Space jump | Q/E lean | LMB look | RMB/F fire | X ADS | 1-4 cal | R ammo | V weapon | B mode | Esc",
+"Voxel FPS 0.0",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
     if (!g_hwnd) fail("CreateWindowEx failed");
+    updateWindowTitle();
+    // Raw mouse input for locked look (HID generic desktop page, mouse usage).
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02;
+    rid.dwFlags = 0;
+    rid.hwndTarget = g_hwnd;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
 }
 
 // ---- Vulkan setup ----
@@ -2554,6 +2344,16 @@ static void createLogicalDevice() {
     }
     const char* exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkPhysicalDeviceFeatures feats{};
+    {
+        // Anisotropic filtering keeps textures on 1 mm cells readable at grazing
+        // angles; enabled only where the device supports it.
+        VkPhysicalDeviceFeatures avail{};
+        vkGetPhysicalDeviceFeatures(g_phys, &avail);
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(g_phys, &props);
+        feats.samplerAnisotropy = avail.samplerAnisotropy;
+        g_maxAnisotropy = avail.samplerAnisotropy ? std::min(8.0f, props.limits.maxSamplerAnisotropy) : 1.0f;
+    }
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.queueCreateInfoCount = static_cast<uint32_t>(qcis.size());
     ci.pQueueCreateInfos = qcis.data();
@@ -2600,6 +2400,7 @@ static VkPresentModeKHR choosePresentMode() {
 
 static void createDepthResources();
 static void destroySwapchainObjects() {
+    g_post.destroyTargets(); // its framebuffers reference the swapchain views
     if (g_depthView) vkDestroyImageView(g_device, g_depthView, nullptr);
     if (g_depthImage) vkDestroyImage(g_device, g_depthImage, nullptr);
     if (g_depthMem) vkFreeMemory(g_device, g_depthMem, nullptr);
@@ -2644,7 +2445,8 @@ static void createSwapchain() {
     ci.imageColorSpace = format.colorSpace;
     ci.imageExtent = g_extent;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // TRANSFER_SRC lets the capture harness copy a finished frame out (--capture).
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     uint32_t qfs[] = {static_cast<uint32_t>(g_qidx.graphics),
                       static_cast<uint32_t>(g_qidx.present)};
     if (g_qidx.graphics != g_qidx.present) {
@@ -2681,56 +2483,11 @@ static void createSwapchain() {
     }
 }
 
+// The world pass belongs to the post module: the world renders offscreen at the
+// menu's render scale and the post pass draws it to the window.
 static void createRenderPass() {
-    VkAttachmentDescription color{};
-    color.format = g_swapFormat;
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-    VkAttachmentDescription depth{};
-    depth.format = VK_FORMAT_D32_SFLOAT;
-    depth.samples = VK_SAMPLE_COUNT_1_BIT;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-
-    VkSubpassDescription sub{};
-    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &colorRef;
-    sub.pDepthStencilAttachment = &depthRef;
-
-    VkSubpassDependency dep{};
-    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-    VkAttachmentDescription atts[] = {color, depth};
-    VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    ci.attachmentCount = 2;
-    ci.pAttachments = atts;
-    ci.subpassCount = 1;
-    ci.pSubpasses = &sub;
-    ci.dependencyCount = 1;
-    ci.pDependencies = &dep;
-    if (vkCreateRenderPass(g_device, &ci, nullptr, &g_renderPass) != VK_SUCCESS)
-        fail("vkCreateRenderPass failed");
+    g_post.init(g_device, g_phys, g_swapFormat);
+    g_renderPass = g_post.worldPass;
 }
 
 // RULES.md rule 12 — the sanctioned "paint over map voxels" exception.
@@ -2762,7 +2519,11 @@ static void createOverlayRenderPass() {
     VkAttachmentDescription depth{};
     depth.format = VK_FORMAT_D32_SFLOAT;
     depth.samples = VK_SAMPLE_COUNT_1_BIT;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // fresh depth for the lattice
+    // Cleared, as rule 12 requires. This was DONT_CARE and only worked because
+    // the overlay shared the world pass's depth image, so the lattice was in
+    // fact depth-tested against leftover world depth. With the world rendered
+    // offscreen that image is never written, and DONT_CARE hid every cube.
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -2842,21 +2603,8 @@ static void createDepthResources() {
 }
 
 static void createFramebuffers() {
-    g_framebuffers.resize(g_swapViews.size());
-    for (size_t i = 0; i < g_swapViews.size(); ++i) {
-        VkImageView atts[] = {g_swapViews[i], g_depthView};
-        VkFramebufferCreateInfo ci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        ci.renderPass = g_renderPass;
-        ci.attachmentCount = 2;
-        ci.pAttachments = atts;
-        ci.width = g_extent.width;
-        ci.height = g_extent.height;
-        ci.layers = 1;
-        if (vkCreateFramebuffer(g_device, &ci, nullptr, &g_framebuffers[i]) != VK_SUCCESS)
-            fail("framebuffer failed");
-    }
-
-    // Same attachments, bound to the overlay pass (RULES.md rule 12).
+    // The world renders offscreen (g_post); only the overlay pass draws to the
+    // swapchain image with a full-window depth buffer (RULES.md rule 12).
     g_overlayFramebuffers.resize(g_swapViews.size());
     for (size_t i = 0; i < g_swapViews.size(); ++i) {
         VkImageView atts[] = {g_swapViews[i], g_depthView};
@@ -2883,16 +2631,264 @@ static VkShaderModule loadShader(const std::string& path) {
     return mod;
 }
 
+// Upload build/textures.bin as one RGBA8 2D array with a full mip chain (the
+// mips are what keep a texture on far 1 mm cells from shimmering). Without the
+// file a 1x1 white layer is bound so the descriptor is always valid, and
+// texturing stays off.
+static void uploadTextures() {
+    const tex::TextureSet set = tex::load(g_exeDir + "\\textures.bin");
+    const uint8_t white[4] = {255, 255, 255, 255};
+    const bool have = set.ok();
+    const uint32_t size = have ? static_cast<uint32_t>(set.size) : 1u;
+    const uint32_t layers = have ? static_cast<uint32_t>(set.keys.size()) : 1u;
+    const uint8_t* pixels = have ? set.rgba.data() : white;
+    uint32_t mips = 1;
+    while ((size >> mips) > 0) ++mips;
+    if (have) {
+        g_texTable = tex::resolve(set);
+        g_texLayerCount = static_cast<int>(layers);
+    }
+
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.extent = {size, size, 1};
+    ii.mipLevels = mips;
+    ii.arrayLayers = layers;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(g_device, &ii, nullptr, &g_texImage) != VK_SUCCESS) fail("texture image failed");
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_device, g_texImage, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(g_device, &mai, nullptr, &g_texMem) != VK_SUCCESS) fail("texture memory failed");
+    vkBindImageMemory(g_device, g_texImage, g_texMem, 0);
+
+    const VkDeviceSize bytes = VkDeviceSize(size) * size * 4 * layers;
+    VkBuffer stg = VK_NULL_HANDLE;
+    VkDeviceMemory stgMem = VK_NULL_HANDLE;
+    createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stg, stgMem);
+    void* mapped = nullptr;
+    vkMapMemory(g_device, stgMem, 0, bytes, 0, &mapped);
+    std::memcpy(mapped, pixels, static_cast<size_t>(bytes));
+    vkUnmapMemory(g_device, stgMem);
+
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g_cmdPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g_device, &cai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    auto barrier = [&](uint32_t level, uint32_t count, VkImageLayout from, VkImageLayout to,
+                       VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS,
+                       VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcAccessMask = srcA;
+        b.dstAccessMask = dstA;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = g_texImage;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, count, 0, layers};
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    barrier(0, mips, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+    region.imageExtent = {size, size, 1};
+    vkCmdCopyBufferToImage(cmd, stg, g_texImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    // Mip chain: each level is a linear blit of the one above it.
+    for (uint32_t m = 1; m < mips; ++m) {
+        barrier(m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const int32_t src = static_cast<int32_t>(std::max(1u, size >> (m - 1)));
+        const int32_t dst = static_cast<int32_t>(std::max(1u, size >> m));
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m - 1, 0, layers};
+        blit.srcOffsets[1] = {src, src, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, layers};
+        blit.dstOffsets[1] = {dst, dst, 1};
+        vkCmdBlitImage(cmd, g_texImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_texImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+    if (mips > 1)
+        barrier(0, mips - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(g_graphicsQueue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_graphicsQueue);
+    vkFreeCommandBuffers(g_device, g_cmdPool, 1, &cmd);
+    vkDestroyBuffer(g_device, stg, nullptr);
+    vkFreeMemory(g_device, stgMem, nullptr);
+
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = g_texImage;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+    if (vkCreateImageView(g_device, &vi, nullptr, &g_texView) != VK_SUCCESS) fail("texture view failed");
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod = static_cast<float>(mips);
+    sci.anisotropyEnable = g_maxAnisotropy > 1.0f ? VK_TRUE : VK_FALSE;
+    sci.maxAnisotropy = g_maxAnisotropy;
+    if (vkCreateSampler(g_device, &sci, nullptr, &g_texSampler) != VK_SUCCESS) fail("texture sampler failed");
+}
+
+static void createOccupancyVolume() {
+    g_occCpu.assign(static_cast<size_t>(WORLD_W) * WORLD_H * WORLD_D, 0);
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_3D;
+    ii.extent = {static_cast<uint32_t>(WORLD_W), static_cast<uint32_t>(WORLD_H), static_cast<uint32_t>(WORLD_D)};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.format = VK_FORMAT_R8_UNORM;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(g_device, &ii, nullptr, &g_occImage) != VK_SUCCESS) fail("occupancy image failed");
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_device, g_occImage, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(g_device, &mai, nullptr, &g_occMem) != VK_SUCCESS) fail("occupancy memory failed");
+    vkBindImageMemory(g_device, g_occImage, g_occMem, 0);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = g_occImage;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    vi.format = VK_FORMAT_R8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(g_device, &vi, nullptr, &g_occView) != VK_SUCCESS) fail("occupancy view failed");
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(g_device, &sci, nullptr, &g_occSampler) != VK_SUCCESS) fail("occupancy sampler failed");
+    for (int i = 0; i < MAX_FRAMES; ++i) {
+        createBuffer(g_occCpu.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_occStage[i], g_occStageMem[i]);
+        vkMapMemory(g_device, g_occStageMem[i], 0, g_occCpu.size(), 0, &g_occStageMapped[i]);
+        createBuffer(sizeof(float) * 8 * kMaxLights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_lightBuf[i], g_lightMem[i]);
+        vkMapMemory(g_device, g_lightMem[i], 0, sizeof(float) * 8 * kMaxLights, 0, &g_lightMapped[i]);
+    }
+}
+
+// Copy a remeshed chunk's sent occupancy into the CPU volume and queue it.
+static void noteOccupancy(const ViewChunk& c) {
+    if (g_occCpu.empty() || !c.hasSnapshot) return;
+    for (int lz = 0; lz < CHUNK_SIZE; ++lz)
+        for (int ly = 0; ly < CHUNK_SIZE; ++ly)
+            for (int lx = 0; lx < CHUNK_SIZE; ++lx) {
+                const wire::BlockId b = c.sent.get(lx, ly, lz);
+                const bool opaque = b != wire::BlockId::Air && b != wire::BlockId::Water &&
+                                    b != wire::BlockId::WaterCurrent;
+                const size_t x = size_t(c.cx * CHUNK_SIZE + lx), y = size_t(c.cy * CHUNK_SIZE + ly),
+                             z = size_t(c.cz * CHUNK_SIZE + lz);
+                g_occCpu[x + size_t(WORLD_W) * (y + size_t(WORLD_H) * z)] = opaque ? 255 : 0;
+            }
+    const int idx = sim::World::chunkIndex(c.cx, c.cy, c.cz);
+    if (std::find(g_occDirty.begin(), g_occDirty.end(), idx) == g_occDirty.end()) g_occDirty.push_back(idx);
+}
+
+// Record the pending chunk uploads into this frame's command buffer, before
+// the world pass. The staging buffer is this frame's own, so a frame still in
+// flight never sees it change.
+static void recordOccupancyUpload(VkCommandBuffer cmd, uint32_t frameIndex) {
+    if (g_occDirty.empty() || !g_occImage) return;
+    uint8_t* stage = static_cast<uint8_t*>(g_occStageMapped[frameIndex]);
+    std::vector<VkBufferImageCopy> regions;
+    for (int idx : g_occDirty) {
+        const int cx = idx % CHUNKS_X, cz = (idx / CHUNKS_X) % CHUNKS_Z, cy = idx / (CHUNKS_X * CHUNKS_Z);
+        const size_t x0 = size_t(cx) * CHUNK_SIZE, y0 = size_t(cy) * CHUNK_SIZE, z0 = size_t(cz) * CHUNK_SIZE;
+        for (int lz = 0; lz < CHUNK_SIZE; ++lz)
+            for (int ly = 0; ly < CHUNK_SIZE; ++ly) {
+                const size_t o = x0 + size_t(WORLD_W) * ((y0 + ly) + size_t(WORLD_H) * (z0 + lz));
+                std::memcpy(stage + o, g_occCpu.data() + o, CHUNK_SIZE);
+            }
+        VkBufferImageCopy r{};
+        r.bufferOffset = x0 + size_t(WORLD_W) * (y0 + size_t(WORLD_H) * z0);
+        r.bufferRowLength = WORLD_W;
+        r.bufferImageHeight = WORLD_H;
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageOffset = {int32_t(x0), int32_t(y0), int32_t(z0)};
+        r.imageExtent = {uint32_t(CHUNK_SIZE), uint32_t(CHUNK_SIZE), uint32_t(CHUNK_SIZE)};
+        regions.push_back(r);
+    }
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = g_occImageReady ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = g_occImageReady ? VK_ACCESS_SHADER_READ_BIT : 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = g_occImage;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // A partial upload must keep the rest, so only the very first upload may
+    // discard (UNDEFINED); it covers every chunk, as all start dirty.
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    vkCmdCopyBufferToImage(cmd, g_occStage[frameIndex], g_occImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           static_cast<uint32_t>(regions.size()), regions.data());
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+    g_occChunkUploads += regions.size();
+    g_occDirty.clear();
+    g_occImageReady = true;
+}
+
 static void createDescriptors() {
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    uploadTextures();
+    createOccupancyVolume();
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[2] = bindings[1];
+    bindings[2].binding = 2; // occupancy volume
+    bindings[3].binding = 3; // light list
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 1;
-    lci.pBindings = &binding;
+    lci.bindingCount = 4;
+    lci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(g_device, &lci, nullptr, &g_dsl) != VK_SUCCESS)
         fail("descriptor set layout failed");
 
@@ -2903,10 +2899,12 @@ static void createDescriptors() {
         vkMapMemory(g_device, g_uboMems[i], 0, sizeof(FrameUBO), 0, &g_uboMapped[i]);
     }
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES};
+    VkDescriptorPoolSize poolSizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES},
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * MAX_FRAMES},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAMES}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.poolSizeCount = 1;
-    pci.pPoolSizes = &poolSize;
+    pci.poolSizeCount = 3;
+    pci.pPoolSizes = poolSizes;
     pci.maxSets = MAX_FRAMES;
     if (vkCreateDescriptorPool(g_device, &pci, nullptr, &g_descPool) != VK_SUCCESS)
         fail("descriptor pool failed");
@@ -2930,7 +2928,26 @@ static void createDescriptors() {
         write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         write.descriptorCount = 1;
         write.pBufferInfo = &bi;
-        vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+        VkDescriptorImageInfo ti{g_texSampler, g_texView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet texWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        texWrite.dstSet = g_descSets[i];
+        texWrite.dstBinding = 1;
+        texWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        texWrite.descriptorCount = 1;
+        texWrite.pImageInfo = &ti;
+        VkDescriptorImageInfo oi{g_occSampler, g_occView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet occWrite = texWrite;
+        occWrite.dstBinding = 2;
+        occWrite.pImageInfo = &oi;
+        VkDescriptorBufferInfo li{g_lightBuf[i], 0, sizeof(float) * 8 * kMaxLights};
+        VkWriteDescriptorSet lightWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        lightWrite.dstSet = g_descSets[i];
+        lightWrite.dstBinding = 3;
+        lightWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        lightWrite.descriptorCount = 1;
+        lightWrite.pBufferInfo = &li;
+        VkWriteDescriptorSet writes[4] = {write, texWrite, occWrite, lightWrite};
+        vkUpdateDescriptorSets(g_device, 4, writes, 0, nullptr);
     }
 }
 
@@ -2966,6 +2983,10 @@ static bool createPipeline() {
     const std::string vertPath = resolveShaderPath("voxel.vert");
     const std::string fragPath = resolveShaderPath("voxel.frag");
     if (vertPath.empty() || fragPath.empty()) return false;
+    const std::string postVert = resolveShaderPath("post.vert");
+    const std::string postFrag = resolveShaderPath("post.frag");
+    if (postVert.empty() || postFrag.empty()) return false;
+    g_post.createPipeline(readFile(postVert), readFile(postFrag));
 
     VkShaderModule vert = loadShader(vertPath);
     VkShaderModule frag = loadShader(fragPath);
@@ -2985,16 +3006,17 @@ static bool createPipeline() {
     bind.stride = sizeof(Vertex);
     bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    VkVertexInputAttributeDescription attrs[4]{};
+    VkVertexInputAttributeDescription attrs[5]{};
     attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, px)};
     attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, nx)};
     attrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, cr)};
     attrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT, offsetof(Vertex, mat)};
+    attrs[4] = {4, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, texLayer)};
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &bind;
-    vi.vertexAttributeDescriptionCount = 4;
+    vi.vertexAttributeDescriptionCount = 5;
     vi.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -3128,6 +3150,16 @@ static bool ensureVertexCapacity(uint32_t verts) {
     // Grow with headroom so a small repack rarely reallocates.
     VkDeviceSize need = size + size / 8;
     if (need < size) need = size;
+    // The caller only waited on THIS frame's fence. With MAX_FRAMES in flight the
+    // other frame's command buffer may still bind the old buffer, so drain every
+    // in-flight frame before freeing it. Growth is rare (headroom above), so
+    // this stall is too.
+    VkFence live[MAX_FRAMES];
+    uint32_t liveCount = 0;
+    for (int i = 0; i < MAX_FRAMES; ++i)
+        if (g_inFlight[i]) live[liveCount++] = g_inFlight[i];
+    if (g_vertexBuffer && liveCount > 0)
+        vkWaitForFences(g_device, liveCount, live, VK_TRUE, UINT64_MAX);
     destroyWorldMeshBuffer();
     createBuffer(need, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -3138,71 +3170,37 @@ static bool ensureVertexCapacity(uint32_t verts) {
     return g_vertexMapped != nullptr;
 }
 
-static void destroyVoxelAt(int x, int y, int z) {
-    if (!g_world || !worldInBounds(x, y, z)) return;
-    Block b = getWorldBlock(*g_world, x, y, z);
-    if (b == Block::Air) return;
-    MaterialId mat = blockMaterial(b);
-    // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
-    g_debris.spawnFromVoxel(x, y, z, mat,
-                            g_lastImpactDx, g_lastImpactDy, g_lastImpactDz,
-                            g_lastImpactEnergy, VOXEL_SIZE, g_lastAoeScale);
-    setWorldBlock(*g_world, x, y, z, Block::Air);
-    g_meshDirty = true;
-    ++g_voxelsDestroyed;
-}
-
-static void applySplash(int cx, int cy, int cz, float radius, float energy,
-                        const ProjectileDef& def) {
-    if (!g_world || radius <= 0.0f) return;
-    // Expand splash by caliber/damage AOE, then density-scale per cell.
-    const float aoe = impactAoeScale(def);
-    float effectiveR = radius * std::max(0.5f, aoe);
-    int r = std::max(1, static_cast<int>(effectiveR / VOXEL_SIZE) + 1);
-    // Cap neighborhood for shotgun volleys (performance).
-    if (def.pellets > 1) r = std::min(r, 3);
-    else r = std::min(r, 6);
-    for (int dz = -r; dz <= r; ++dz)
-        for (int dy = -r; dy <= r; ++dy)
-            for (int dx = -r; dx <= r; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0) continue;
-                int x = cx + dx, y = cy + dy, z = cz + dz;
-                if (!worldInBounds(x, y, z)) continue;
-                float dist = std::sqrt(float(dx * dx + dy * dy + dz * dz)) * VOXEL_SIZE;
-                Block b = getWorldBlock(*g_world, x, y, z);
-    MaterialId mat = blockMaterial(b);
-    // Removing a fixture changes the light set, not just the surface mesh.
-    if (b == Block::LightBulb) g_bulbsDirty = true;
-                if (mat == MaterialId::Air || mat == MaterialId::Plexiglass) continue;
-                float cellR = densityScaledSplash(effectiveR, mat);
-                if (dist > cellR) continue;
-                float fall = std::pow(std::max(0.0f, 1.0f - dist / std::max(cellR, 1e-6f)), def.splashFalloff);
-                // Dense materials soak energy harder beyond threshold already.
-                float densMul = 1.0f / std::sqrt(std::max(0.2f, materialProps(mat).density));
-                float e = energy * fall * 0.65f * effectMultiplier(def.effect, mat) * densMul;
-                float thr = breakEnergyThreshold(mat);
-                g_lastAoeScale = aoe * densMul;
-                g_lastImpactEnergy = e;
-                if (e >= thr * 0.8f) destroyVoxelAt(x, y, z);
-            }
-
-    // Splash reaches bodies too. Self damage is ON, so the player's own grenade
-    // hurts them; the shooter is only excluded from their own bullet's
-    // *direct* hit (see ProjectileRuntime::ownerIsPlayer).
-    if (health::kSelfFireDamage) {
-        const float impactX = (static_cast<float>(cx) + 0.5f) * VOXEL_SIZE;
-        const float impactY = (static_cast<float>(cy) + 0.5f) * VOXEL_SIZE;
-        const float impactZ = (static_cast<float>(cz) + 0.5f) * VOXEL_SIZE;
-        const health::BodyCellOrigin org = health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
-        const float bodyDist = health::distanceToBody(org, impactX, impactY, impactZ);
-        if (bodyDist <= effectiveR) {
-            const float fall =
-                std::pow(std::max(0.0f, 1.0f - bodyDist / std::max(effectiveR, 1e-6f)), def.splashFalloff);
-            const ArmorZone zone = health::zoneNearestPoint(org, impactX, impactY, impactZ);
-            damagePlayerAtZone(energy * fall * 0.65f, def.effect, zone);
-        }
+// What ballistics does to the rest of this simulation: debris, remesh flags,
+// damage intake and telemetry. The module itself holds none of these.
+struct SimBallisticsHooks final : ballistics::Hooks {
+    void voxelDestroyed(int x, int y, int z, Block was, MaterialId mat,
+                        const ballistics::Impact& imp) override {
+        // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
+        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
+                                imp.aoeScale);
+        (void)was;
+        g_meshDirty = true;
+        ++g_voxelsDestroyed;
     }
-}
+    void ricochet(int x, int y, int z, MaterialId mat, const ballistics::Impact& imp) override {
+        ++g_debris.ricochets;
+        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
+                                imp.aoeScale);
+    }
+    ArmorZone bodySweep(float ax, float ay, float az, float bx, float by, float bz,
+                        float radiusCells) override {
+        return projectileHitZone(ax, ay, az, bx, by, bz, radiusCells);
+    }
+    float bodyDistance(float x, float y, float z, ArmorZone& nearest) override {
+        const health::BodyCellOrigin org = health::bodyCellOrigin(g_player.px, g_player.py, g_player.pz);
+        nearest = health::zoneNearestPoint(org, x, y, z);
+        return health::distanceToBody(org, x, y, z);
+    }
+    void damageBody(float energy, const std::string& effect, ArmorZone zone) override {
+        damagePlayerAtZone(energy, effect, zone);
+    }
+};
+static SimBallisticsHooks g_ballisticsHooks;
 
 static WeaponDef activeWeaponOrDefault() {
     if (!g_weapons.empty()) {
@@ -3281,166 +3279,6 @@ static Vec3 aimForward(const WeaponDef& w) {
     return (f + r * ox + u * oy).normalized();
 }
 
-// Unit-grid DDA ray (Amanatides & Woo). Hitscan/energy only — gravity_scale=0 path.
-static int fireHitscanRay(const ProjectileDef& def, float energyScale, const Vec3& aimDir) {
-    if (!g_world) return 0;
-    Vec3 fwd = aimDir.normalized();
-    // Start slightly forward of camera in world space.
-    float ox = (g_camPos.x + fwd.x * 0.02f) / VOXEL_SIZE;
-    float oy = (g_camPos.y + fwd.y * 0.02f) / VOXEL_SIZE;
-    float oz = (g_camPos.z + fwd.z * 0.02f) / VOXEL_SIZE;
-    float dx = fwd.x, dy = fwd.y, dz = fwd.z;
-    // Avoid zero-direction components for DDA.
-    const float eps = 1e-8f;
-    if (std::fabs(dx) < eps) dx = (dx < 0.0f ? -eps : eps);
-    if (std::fabs(dy) < eps) dy = (dy < 0.0f ? -eps : eps);
-    if (std::fabs(dz) < eps) dz = (dz < 0.0f ? -eps : eps);
-
-    int ix = static_cast<int>(std::floor(ox));
-    int iy = static_cast<int>(std::floor(oy));
-    int iz = static_cast<int>(std::floor(oz));
-
-    const int stepX = dx > 0.0f ? 1 : -1;
-    const int stepY = dy > 0.0f ? 1 : -1;
-    const int stepZ = dz > 0.0f ? 1 : -1;
-
-    // World-space distance to cross one unit voxel on each axis.
-    const float tDeltaX = VOXEL_SIZE / std::fabs(dx);
-    const float tDeltaY = VOXEL_SIZE / std::fabs(dy);
-    const float tDeltaZ = VOXEL_SIZE / std::fabs(dz);
-
-    // tMax: world distance along ray to next voxel boundary on each axis.
-    float tMaxX = (stepX > 0)
-        ? ((static_cast<float>(ix) + 1.0f - ox) / dx) * VOXEL_SIZE
-        : ((ox - static_cast<float>(ix)) / -dx) * VOXEL_SIZE;
-    float tMaxY = (stepY > 0)
-        ? ((static_cast<float>(iy) + 1.0f - oy) / dy) * VOXEL_SIZE
-        : ((oy - static_cast<float>(iy)) / -dy) * VOXEL_SIZE;
-    float tMaxZ = (stepZ > 0)
-        ? ((static_cast<float>(iz) + 1.0f - oz) / dz) * VOXEL_SIZE
-        : ((oz - static_cast<float>(iz)) / -dz) * VOXEL_SIZE;
-
-    float energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f) * energyScale;
-    // Energy beams still use kineticEnergy scale; mass is tiny but baseDamage carries power.
-    if (def.gravityScale <= 0.0f)
-        energy = std::max(energy, def.baseDamage * 1.5f * energyScale);
-
-    const float maxDist = 1.75f; // world units (~1750 unit voxels)
-    float traveled = 0.0f;
-    int breaks = 0;
-    const int maxSteps = static_cast<int>(maxDist / VOXEL_SIZE) + 2;
-    // One bullet, one body: the sweep is sampled per cell, and the 5-cell-wide
-    // player would otherwise be counted once per cell it spans. The shooter's
-    // own shot is excluded (the ray origin is inside their head); enemy fire
-    // will use the same path once it exists.
-    bool bodyHit = false;
-    const float radiusCells = std::max(0.5f, std::min(2.0f, def.radius / VOXEL_SIZE));
-    float prevWx = g_camPos.x + fwd.x * 0.02f;
-    float prevWy = g_camPos.y + fwd.y * 0.02f;
-    float prevWz = g_camPos.z + fwd.z * 0.02f;
-
-    for (int step = 0; step < maxSteps; ++step) {
-        // Body sweep for this cell, tested in cell space against the same box
-        // the armor zones tile.
-        {
-            const float curWx = (static_cast<float>(ix) + 0.5f) * VOXEL_SIZE;
-            const float curWy = (static_cast<float>(iy) + 0.5f) * VOXEL_SIZE;
-            const float curWz = (static_cast<float>(iz) + 0.5f) * VOXEL_SIZE;
-            if (!bodyHit) {
-                const ArmorZone zone =
-                    projectileHitZone(prevWx, prevWy, prevWz, curWx, curWy, curWz, radiusCells);
-                if (zone != ArmorZone::Count) {
-                    bodyHit = true;
-                    damagePlayerAtZone(energy, def.effect, zone);
-                    // Soft target: a penetrating round keeps going, weaker.
-                    energy *= (1.0f - std::min(0.95f, def.penetration));
-                    if (energy < 0.05f) break;
-                }
-            }
-            prevWx = curWx;
-            prevWy = curWy;
-            prevWz = curWz;
-        }
-        if (worldInBounds(ix, iy, iz)) {
-            Block b = getWorldBlock(*g_world, ix, iy, iz);
-            MaterialId mat = blockMaterial(b);
-            if (mat != MaterialId::Air) {
-                float e = energy * effectMultiplier(def.effect, mat);
-                g_lastImpactDx = dx; g_lastImpactDy = dy; g_lastImpactDz = dz;
-                g_lastImpactEnergy = e;
-                if (resolveVoxelHit(mat, e, def.penetration)) {
-                    destroyVoxelAt(ix, iy, iz);
-                    applySplash(ix, iy, iz, def.splashRadius, energy, def);
-                    energy = e;
-                    ++breaks;
-                    if (energy < 0.05f) break;
-                } else {
-                    // Ricochet / spark chips on tough surfaces (matrix reflection).
-                    float nx, ny, nz;
-                    faceNormalFromVelocity(dx, dy, dz, nx, ny, nz);
-                    float rvx = dx, rvy = dy, rvz = dz;
-                    const auto& mp = materialProps(mat);
-                    ricochetVelocity(rvx, rvy, rvz, nx, ny, nz,
-                                     0.15f + mp.damping * 0.2f, 0.35f + mp.density * 0.02f);
-                    g_debris.ricochets++;
-                    // Small chip burst without destroying occupancy
-                    g_lastAoeScale = impactAoeScale(def) * 0.5f;
-                    g_debris.spawnFromVoxel(ix, iy, iz, mat, dx, dy, dz, e * 0.35f, VOXEL_SIZE, g_lastAoeScale);
-                    energy = e;
-                    break;
-                }
-            }
-        } else if (traveled > 0.05f) {
-            // Left the map after traveling — end ray.
-            break;
-        }
-
-        // Step to next voxel face.
-        if (tMaxX < tMaxY) {
-            if (tMaxX < tMaxZ) {
-                traveled = tMaxX;
-                tMaxX += tDeltaX;
-                ix += stepX;
-            } else {
-                traveled = tMaxZ;
-                tMaxZ += tDeltaZ;
-                iz += stepZ;
-            }
-        } else {
-            if (tMaxY < tMaxZ) {
-                traveled = tMaxY;
-                tMaxY += tDeltaY;
-                iy += stepY;
-            } else {
-                traveled = tMaxZ;
-                tMaxZ += tDeltaZ;
-                iz += stepZ;
-            }
-        }
-        if (traveled > maxDist) break;
-    }
-    // Remesh deferred to drawFrame after GPU fence.
-    return breaks;
-}
-
-static void spawnBallisticProjectile(const ProjectileDef& def, const Vec3& aimDir) {
-    Vec3 fwd = aimDir.normalized();
-    ProjectileRuntime p;
-    p.def = def;
-    // Spawn just ahead of camera; subunit-sized projectiles use def.radius.
-    const float muzzle = std::max(0.02f, def.radius * 40.0f);
-    p.px = g_camPos.x + fwd.x * muzzle;
-    p.py = g_camPos.y + fwd.y * muzzle;
-    p.pz = g_camPos.z + fwd.z * muzzle;
-    p.vx = fwd.x * def.speed;
-    p.vy = fwd.y * def.speed;
-    p.vz = fwd.z * def.speed;
-    p.energy = kineticEnergy(def.mass, def.speed) * (def.baseDamage / 10.0f);
-    p.alive = true;
-    p.ownerIsPlayer = true; // never self-inflicted by the shooter's own bullet
-    g_projectiles.push_back(p);
-}
-
 // Spread aim direction within a cone (shotgun pellets).
 static Vec3 spreadAim(const Vec3& forward, float spreadDeg, int pelletIndex, int pelletCount) {
     if (spreadDeg <= 0.01f || pelletCount <= 1) return forward.normalized();
@@ -3495,7 +3333,7 @@ static void fireProjectile() {
         }
     }
     def = scaleProjectileForWeapon(def, fired);
-    g_lastAoeScale = impactAoeScale(def);
+    g_ballistics.last.aoeScale = impactAoeScale(def);
 
     bool useHitscan = fired.hitscan || def.hitscan || def.gravityScale <= 0.0f ||
                       fired.ammo.hitscan || fired.ammo.effect == "energy";
@@ -3514,7 +3352,8 @@ static void fireProjectile() {
     g_lastFireMode = fired.fireMode.empty() ? "semi" : fired.fireMode;
 
     if (useHitscan) {
-        fireHitscanRay(def, 1.0f, aim);
+        ballistics::fireHitscan(g_ballistics, *g_world, g_ballisticsHooks, def, 1.0f,
+                                g_camPos.x, g_camPos.y, g_camPos.z, aim.x, aim.y, aim.z);
         ++g_hitscanShots;
     } else {
         const int n = std::clamp(def.pellets, 1, 12);
@@ -3526,11 +3365,13 @@ static void fireProjectile() {
             const int spawnN = std::min(n, std::max(1, room));
             for (int i = 0; i < spawnN; ++i) {
                 Vec3 dir = spreadAim(aim, def.spreadDeg, i, spawnN);
-                spawnBallisticProjectile(def, dir);
+                ballistics::spawnProjectile(g_ballistics, def, g_camPos.x, g_camPos.y, g_camPos.z,
+                                            dir.x, dir.y, dir.z);
             }
             g_ballisticShots += spawnN;
         } else {
-            spawnBallisticProjectile(def, aim);
+            ballistics::spawnProjectile(g_ballistics, def, g_camPos.x, g_camPos.y, g_camPos.z,
+                                        aim.x, aim.y, aim.z);
             ++g_ballisticShots;
         }
     }
@@ -4222,6 +4063,9 @@ struct SimViewSmokeReport {
     bool cornerAoOk = false;
     bool normalSmoothingOk = false;
     bool cubicPreservedOk = false;
+    bool meshWorkersEquivOk = false; // pooled meshing == serial meshing, byte for byte
+    int meshWorkersHelpers = 0;
+    int meshWorkersChunks = 0;
 };
 
 static SimViewSmokeReport g_simViewSmoke;
@@ -4247,6 +4091,8 @@ struct MapVoxSmokeReport {
     bool countersRestoredOk = false; // evt==2, npc==2, route==2 on the fixture
     bool materialDropOk = false; // un-representable material is dropped, counted
     bool stampOk = false;        // 1024 cells written, all concrete, no leftovers
+    bool appearanceOk = false;   // painter rgb -> appearance -> wire -> mesh colour
+    bool prefabOk = false;       // v2 asset parse + quarter-turn stamp of cells and paint
     bool refusalVersionOk = false; // format_version 2 + non-unit docs refuse
     bool refusalUnitOk = false;
     bool refusalVoxelSizeOk = false;
@@ -4279,7 +4125,7 @@ static MapVoxSmokeReport runMapVoxSmoke() {
     }
     rep.fileFound = anyFound;
 
-    rep.formatOk = (doc.formatVersion == 1);
+    rep.formatOk = (doc.formatVersion == mapvox::kMaxFormatVersion); // the painter writes the current layout
     rep.modeOk = doc.modeMap;
     rep.unitOk = doc.unitOk;
     rep.voxelSizeOk = doc.voxelSizeOk;
@@ -4287,7 +4133,7 @@ static MapVoxSmokeReport runMapVoxSmoke() {
     rep.events = static_cast<int>(doc.events.size());
     rep.npcs = static_cast<int>(doc.npcs.size());
     rep.routes = static_cast<int>(doc.routes.size());
-    rep.voxels = static_cast<int>(doc.voxels.size());
+    rep.voxels = static_cast<int>(doc.voxels.size()) + doc.rleCells; // v1 list or v2 runs
     rep.dropped = doc.dropped;
     rep.docOk = doc.ok;
 
@@ -4339,7 +4185,7 @@ static MapVoxSmokeReport runMapVoxSmoke() {
     {
         mapvox::Doc d;
         rep.refusalVersionOk = !mapvox::parseMapVox(
-            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
+            "{\"format_version\":3,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
         rep.refusalUnitOk = !mapvox::parseMapVox(
             "{\"format_version\":1,\"unit\":2,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}", d);
         rep.refusalVoxelSizeOk = !mapvox::parseMapVox(
@@ -4386,6 +4232,599 @@ static MapVoxSmokeReport runMapVoxSmoke() {
         const bool allConcrete = (concrete == 1024);
         const bool aboveClear = (w.get(8, 1, 8) == Block::Air && w.get(39, 20, 39) == Block::Air);
         rep.stampOk = sr.written == 1024 && sr.skipped == 0 && allConcrete && aboveClear;
+
+        // Appearance layer. The fixture carries only its material's own colour,
+        // which v2 does not record as paint, so nothing is painted by it.
+        const bool stamped = sr.painted == doc.appearCells && w.getAppearance(8, 0, 8) == 0;
+        // Breaking a cell takes its paint with it.
+        sim::World broken = w;
+        broken.set(8, 0, 8, Block::Air);
+        broken.setAppearance(9, 0, 8, broken.paletteIndexFor(0x123456u));
+        broken.setAppearance(8, 0, 8, broken.paletteIndexFor(0x123456u));
+        broken.set(8, 0, 8, Block::Air);
+        const bool breakClears = broken.getAppearance(8, 0, 8) == 0 && broken.getAppearance(9, 0, 8) != 0;
+        // A cell painted pure red must reach the mesh as red, and only via the
+        // palette: the same snapshot meshed without one shows no red at all.
+        w.setAppearance(20, 0, 20, w.paletteIndexFor(0xFF0000u));
+        wire::Palette pal;
+        sendPalette(w, pal);
+        ViewChunk vc;
+        vc.cx = 0; vc.cy = 0; vc.cz = 0;
+        sendChunkSnapshot(w, vc);
+        meshview::Stats st;
+        auto redVerts = [](const ViewChunk& c) {
+            int n = 0;
+            for (const auto& v : c.mesh) n += (v.r > 0.3f && v.g < 0.05f && v.b < 0.05f) ? 1 : 0;
+            return n;
+        };
+        vc.palette = &pal;
+        meshview::meshChunk(vc, st);
+        const int withPalette = redVerts(vc);
+        vc.palette = nullptr;
+        meshview::meshChunk(vc, st);
+        const int withoutPalette = redVerts(vc);
+        rep.appearanceOk = stamped && breakClears && withPalette > 0 && withoutPalette == 0 &&
+                           vc.sent.appearance(20, 0, 20) == w.getAppearance(20, 0, 20);
+
+        // Prefab: a v2 asset (3x1x2 wood L, one cell painted red, plus a
+        // painter-only material that must be dropped) turned a quarter turn.
+        // Local (x, z) -> (sz-1-z, x) with sz = 2, stamped at (60, 5, 60).
+        mapvox::Doc pf;
+        const bool parsed = mapvox::parseAssetVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"model\",\"dims\":[3,1,2],"
+            "\"appearance\":{\"palette\":[[255,0,0]],\"runs\":[0,1,0,1,1]},"
+            "\"cells_rle\":{\"palette\":[\"wood\",\"plexiglass\"],\"runs\":[0,0,0,3,0,0,1,0,1,0,0,1,1,1,1]}}",
+            pf);
+        sim::World pw = makeEmptyWorld();
+        mapvox::stampMapVox(pf, pw, 60, 5, 60, 1);
+        const bool cellsOk = pw.get(61, 5, 60) == Block::Wood && pw.get(61, 5, 61) == Block::Wood &&
+                             pw.get(61, 5, 62) == Block::Wood && pw.get(60, 5, 60) == Block::Wood &&
+                             pw.get(60, 5, 61) == Block::Air;
+        const bool paintOk = pw.getAppearance(60, 5, 60) != 0 &&
+                             pw.palette[pw.getAppearance(60, 5, 60)] == 0xFF0000u &&
+                             pw.getAppearance(61, 5, 60) == 0;
+        rep.prefabOk = parsed && pf.dropped == 1 && pf.rleCells == 4 && cellsOk && paintOk;
+    }
+
+    return rep;
+}
+
+// The terrain gate: the generator's contract, on scratch worlds, so it never
+// touches the loaded map or the live fingerprint. Phase 8's rule is that
+// generation changes no existing fingerprint at all — a map with no terrain
+// section must generate nothing, byte for byte.
+struct TerrainSmokeReport {
+    bool determinismOk = false;   // same seed twice -> identical hash
+    bool seedSensitiveOk = false; // a different seed -> a different world
+    bool classSensitiveOk = false;// a different class -> a different world
+    bool classOk = false;         // every region's class is one of the profile table
+    bool surfaceOk = false;       // top cell is the class's own surface material
+    bool slopeOk = false;         // no column stands more than `slope` above a neighbour
+    bool roadOk = false;          // network planned, graded flat, rotations land on their sides
+    bool roadAltOk = false;       // the stamped surface sits ON the level, with no air under it
+    int roadShaped = 0, roadSpans = 0, roadFlat = 0, roadRot = 0;
+    int roadAltProbed = 0, roadAltSurface = 0, roadAltSolidUnder = 0;
+    bool prefabShapesOk = false;  // authored road tiles present the sides they claim
+    bool nonDestructiveOk = false;// authored structure survives generation
+    bool refusalClassOk = false;  // an unknown class refuses
+    bool refusalSeedOk = false;   // a missing seed refuses (never defaulted)
+    bool roundTripOk = false;     // section survives parse -> export -> parse
+    bool absentOk = false;        // a map with no section generates nothing
+    bool damageOk = false;        // generated ground is destructible like any occupancy
+    int slabIntact = 0;           // authored cells that survived generation
+    int slabExpected = 0;
+    int slabSkipped = 0;          // cells the height-field pass declined to overwrite
+    int slabPrefabDeclined = 0;   // cells the road/prop prefab passes declined
+    bool prefabSparesAuthoredOk = false;  // a prefab stamped over a block spares it, and
+                                          // the default stamp mode demonstrably would not
+    int slabPrefabCells = 0;
+    uint64_t golden = 0;
+    int regions = 0;
+    int roadNodes = 0;
+    int roadLevelY = -1;
+    int heightMin = 0;
+    int heightMax = 0;
+    bool ok() const {
+        return determinismOk && seedSensitiveOk && classSensitiveOk && classOk && surfaceOk &&
+               slopeOk && roadOk && roadAltOk && nonDestructiveOk && prefabSparesAuthoredOk &&
+               refusalClassOk && refusalSeedOk && roundTripOk && absentOk && damageOk;
+    }
+};
+
+static TerrainSmokeReport g_terrainSmoke;
+
+static TerrainSmokeReport runTerrainSmoke() {
+    TerrainSmokeReport rep;
+
+    terrain::Spec spec;
+    spec.present = true;
+    spec.family = "valley";
+    spec.seed = 20260930u;
+    const terrain::FamilyProfile* fam = terrain::familyByName(spec.family);
+
+    // 1. Determinism: the same class and seed must produce the same world
+    //    twice, in two independently built worlds. This is the whole promise,
+    //    so it is checked on the hash of the finished grid rather than on an
+    //    intermediate.
+    auto buildWorld = [](const terrain::Spec& s, const terrain::FamilyProfile* f, sim::World& w,
+                         terrain::Report* out) {
+        w = makeEmptyWorld();
+        const std::vector<int> h = terrain::heightField(s, *f, f->base);
+        terrain::Report repLocal;
+        terrain::fillTerrain(w, s, *f, h, repLocal);
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(s);
+        const int level = terrain::roadLevel(s, nodes, h);
+        terrain::gradeRoads(w, nodes, level, repLocal);
+        repLocal.roadNodes = static_cast<int>(nodes.size());
+        if (out) *out = repLocal;
+    };
+
+    sim::World a, b;
+    terrain::Report ra, rb;
+    buildWorld(spec, fam, a, &ra);
+    buildWorld(spec, fam, b, &rb);
+    const uint64_t ha = terrain::hashOccupancy(a), hb = terrain::hashOccupancy(b);
+    rep.golden = ha;
+    rep.determinismOk = (ha == hb) && ra.cells == rb.cells && ra.cells > 0;
+    rep.regions = ra.regions;
+    rep.roadNodes = ra.roadNodes;
+    rep.roadLevelY = ra.roadLevelY;
+    rep.heightMin = ra.heightMin;
+    rep.heightMax = ra.heightMax;
+
+    // 2. Seed sensitivity: a world that ignored the seed would pass the test
+    //    above and still be wrong, so a changed seed must move the ground.
+    {
+        terrain::Spec other = spec;
+        other.seed = spec.seed + 1u;
+        sim::World c;
+        buildWorld(other, fam, c, nullptr);
+        rep.seedSensitiveOk = (terrain::hashOccupancy(c) != ha);
+    }
+
+    // 3. Class sensitivity: another family's class mix is another world.
+    {
+        terrain::Spec other = spec;
+        other.family = "dunes";
+        sim::World c;
+        buildWorld(other, terrain::familyByName("dunes"), c, nullptr);
+        rep.classSensitiveOk = (terrain::hashOccupancy(c) != ha);
+    }
+
+    // 4. Every region is classified from the profile table, and the topmost
+    //    generated cell is that class's own surface material. A mismatch would
+    //    mean the height field and the material pass disagreed about a column.
+    {
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        bool classesOk = ra.regions == terrain::regionCountX() * terrain::regionCountZ();
+        bool surfaceOk = true;
+        for (int z = 0; z < sim::kWorldD && surfaceOk; ++z)
+            for (int x = 0; x < sim::kWorldW; ++x) {
+                const int cls = terrain::classForRegion(spec, *fam, terrain::regionOfX(x),
+                                                        terrain::regionOfZ(z));
+                if (cls < 0 || cls >= terrain::kClassCount) { classesOk = false; surfaceOk = false; break; }
+                const int top = h[static_cast<size_t>(z) * sim::kWorldW + x];
+                // Outside a road corridor the top cell is the class surface; a
+                // road corridor is graded to Dirt and the prefab is stamped
+                // above it, so it is checked separately.
+                if (top >= 1 && a.get(x, top, z) == sim::Block::Air) { surfaceOk = false; break; }
+            }
+        rep.classOk = classesOk;
+        rep.surfaceOk = surfaceOk;
+    }
+
+    // 5. No cliffs: a column may not stand more than its class's slope above
+    //    any neighbour. Without this the world has unwalkable walls between
+    //    regions and the movement smoke would be testing a different world.
+    {
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        bool ok = true;
+        for (int z = 0; z < sim::kWorldD && ok; ++z)
+            for (int x = 0; x < sim::kWorldW && ok; ++x) {
+                const int hi = h[static_cast<size_t>(z) * sim::kWorldW + x];
+                const int cls = terrain::classForRegion(spec, *fam, terrain::regionOfX(x),
+                                                        terrain::regionOfZ(z));
+                const int maxSlope = terrain::kClasses[cls].slope;
+                // A step is allowed only up to the gentler of the two classes'
+                // allowance, which is the rule the talus pass enforces.
+                const auto stepOk = [&](int nx, int nz) {
+                    const int there = terrain::classForRegion(spec, *fam, terrain::regionOfX(nx),
+                                                             terrain::regionOfZ(nz));
+                    return hi - h[static_cast<size_t>(nz) * sim::kWorldW + nx] <=
+                           std::min(maxSlope, terrain::kClasses[there].slope);
+                };
+                if (x + 1 < sim::kWorldW && !stepOk(x + 1, z)) ok = false;
+                if (z + 1 < sim::kWorldD && !stepOk(x, z + 1)) ok = false;
+            }
+        rep.slopeOk = ok;
+    }
+
+    // 6. The road network. Three claims, checked in turn: every node resolved to
+    //    a prefab and a rotation; the rotation actually lands the asset on the
+    //    sides the node claims (a wrong quarter turn is a road pointing at
+    //    nothing); and the graded corridor is flat at one level, so the
+    //    stamped surface is continuous across the network.
+    {
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+        bool shaped = !nodes.empty();
+        for (const auto& n : nodes) {
+            if (n.prefab[0] == '\0' || n.rot < 0 || n.rot > 3) { shaped = false; break; }
+            // The rotation must reproduce the node's own sides, and every kind's
+            // canonical asset must be the one chosen. Without this a road can
+            // be stamped on its side, which is the same bug as a missing one.
+            const terrain::RoadKind kind = terrain::kindForMask(n.mask);
+            if (std::string(terrain::roadPrefabForKind(kind)) != n.prefab) { shaped = false; break; }
+            if (terrain::rotateMask(terrain::canonicalMask(kind), n.rot) != n.mask) { shaped = false; break; }
+        }
+        // The network is continuous: the row runs the full width and the column
+        // the full depth, with no gap between two regions that both carry a
+        // road. A stub pointing at open terrain would be a road that goes
+        // nowhere, and a hole would be a road that stops in mid-air.
+        bool spans = shaped;
+        for (int rx = 0; rx < terrain::regionCountX() && spans; ++rx) {
+            const terrain::RoadNode* node = nullptr;
+            for (const auto& n : nodes) if (n.rz == terrain::regionCountZ() / 2 && n.rx == rx) node = &n;
+            if (!node) { spans = false; break; }
+            if (rx == 0 && !(node->mask & terrain::kSideE)) spans = false;
+            if (rx == terrain::regionCountX() - 1 && !(node->mask & terrain::kSideW)) spans = false;
+            if (rx > 0 && rx < terrain::regionCountX() - 1 &&
+                !((node->mask & terrain::kSideW) && (node->mask & terrain::kSideE))) spans = false;
+        }
+        const int level = terrain::roadLevel(spec, nodes, h);
+        bool flat = level > 0;
+        for (const auto& n : nodes)
+            for (int z = n.z0; z < n.z0 + terrain::kRegionCells && z < sim::kWorldD && flat; ++z)
+                for (int x = n.x0; x < n.x0 + terrain::kRegionCells && x < sim::kWorldW; ++x) {
+                    if (!terrain::inRoadCorridor(n, x, z)) continue;
+                    // The corridor is graded to one level and then the prefab
+                    // is stamped on top, so below the surface it is uniform.
+                    if (a.get(x, level - 2, z) == sim::Block::Air) { flat = false; break; }
+                }
+        // Set before the tile loop below, and only ever cleared: a missing or
+        // unreadable tile is a failure, not a skip.
+        rep.prefabShapesOk = true;
+        // The authored road prefabs must present exactly the sides their kind
+        // claims. This is what makes scripts/build_terrain_prefabs.py and
+        // src/terrain.hpp one contract rather than two descriptions of the same
+        // idea: read the asset's own cells back off the grid and work out which
+        // of the tile's four edges the asphalt actually reaches. A tile that
+        // reads back as a different shape is a road pointing at open terrain,
+        // and no amount of correct rotation arithmetic in the generator shows it.
+        for (const auto& kind :
+             {std::pair<const char*, terrain::RoadKind>{"road_end", terrain::kRoadEnd},
+              {"road_straight", terrain::kRoadStraight},
+              {"road_corner", terrain::kRoadCorner},
+              {"road_tee", terrain::kRoadTee},
+              {"road_cross", terrain::kRoadCross}}) {
+            mapvox::Doc asset;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + kind.first + ".vox.json", asset)) {
+                rep.prefabShapesOk = false;
+                continue;
+            }
+            sim::World aw = makeEmptyWorld();
+            mapvox::stampMapVox(asset, aw, 0, 0, 0, 0);
+            int present = 0;
+            for (int side = 0; side < 4; ++side) {
+                const terrain::Side& sd = terrain::kSideDirs[side];
+                const int ex = sd.dx < 0 ? 0 : (sd.dx > 0 ? asset.sx - 1 : asset.sx / 2);
+                const int ez = sd.dz < 0 ? 0 : (sd.dz > 0 ? asset.sz - 1 : asset.sz / 2);
+                bool reaches = false;
+                for (int o = -terrain::kRoadCutHalfWidth; o <= terrain::kRoadCutHalfWidth && !reaches; ++o) {
+                    const int x = sd.dx != 0 ? ex : asset.sx / 2 + o;
+                    const int z = sd.dz != 0 ? ez : asset.sz / 2 + o;
+                    if (x < 0 || z < 0 || x >= asset.sx || z >= asset.sz) continue;
+                    if (aw.get(x, asset.sy - 1, z) == sim::Block::Asphalt) reaches = true;
+                }
+                if (reaches) present |= sd.bit;
+            }
+            const bool centreDrivable =
+                aw.get(asset.sx / 2, asset.sy - 1, asset.sz / 2) == sim::Block::Asphalt;
+            if (present != terrain::canonicalMask(kind.second) || !centreDrivable) {
+                rep.prefabShapesOk = false;
+            }
+        }
+        // rotateMask must agree with the transform mapvox::stampMapVox really
+        // applies, or a rotated road prefab points the wrong way while every
+        // generated surface still looks flat. Proved by stamping one cell and
+        // reading back where it landed, rather than by restating the rotation
+        // in the test (which is how it was wrong once already).
+        bool rotationAgrees = true;
+        for (int rot = 0; rot < 4 && rotationAgrees; ++rot) {
+            for (int side = 0; side < 4 && rotationAgrees; ++side) {
+                const terrain::Side& sd = terrain::kSideDirs[side];
+                sim::World w1 = makeEmptyWorld();
+                mapvox::Doc one;
+                // A run is (y, z, x, length, palette): the probe cell sits one
+                // step along the side's own direction from the 9x9 centre, on
+                // the footprint's own floor (local y 0) so that stamping it at
+                // oy 4 lands it at the single world layer probed below.
+                const std::string runs =
+                    "0," + std::to_string(4 + sd.dz) + "," + std::to_string(4 + sd.dx) + ",1,0";
+                mapvox::parseMapVox(
+                    "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+                    "\"dims\":[9,9,9],\"cells_rle\":{\"palette\":[\"concrete\"],\"runs\":[" +
+                    runs + "]}}",
+                    one);
+                mapvox::stampMapVox(one, w1, 20, 4, 20, rot);
+                int foundX = -1, foundZ = -1;
+                for (int z = 0; z < 9 && foundX < 0; ++z)
+                    for (int x = 0; x < 9; ++x)
+                        if (w1.get(20 + x, 4, 20 + z) == sim::Block::Concrete) {
+                            foundX = x; foundZ = z;
+                            break;
+                        }
+                if (foundX < 0) { rotationAgrees = false; break; }
+                int actual = 0;
+                for (int t = 0; t < 4; ++t)
+                    if (terrain::kSideDirs[t].dx == foundX - 4 && terrain::kSideDirs[t].dz == foundZ - 4)
+                        actual = terrain::kSideDirs[t].bit;
+                if (terrain::rotateMask(sd.bit, rot) != actual) rotationAgrees = false;
+            }
+        }
+        rep.roadShaped = shaped ? 1 : 0;
+        rep.roadSpans = spans ? 1 : 0;
+        rep.roadFlat = flat ? 1 : 0;
+        rep.roadRot = rotationAgrees ? 1 : 0;
+        rep.roadOk = shaped && spans && flat && rotationAgrees && rep.prefabShapesOk;
+    }
+
+    // 7. Non-destructive: a warehouse-sized block of authored structure must
+    //    come through generation untouched, and the generator must not claim to
+    //    have refused anything. A terrain section is allowed to land around a
+    //    map, never through it.
+    {
+        sim::World w = makeEmptyWorld();
+        // A full-height 8x8x8 block, so the terrain must meet it wherever its
+        // own surface happens to be: a slab placed above the ground would never
+        // be tested at all, which is how a fill-only generator could look
+        // correct while still being destructive. The runs are built rather than
+        // written out, because a hand-written list of 64 quintuples is exactly
+        // the kind of fixture that quietly stamps a fraction of what it claims
+        // (it did, once, which is why the expected count is compared too).
+        std::string slabRuns;
+        for (int y = 0; y < 8; ++y)
+            for (int z = 0; z < 8; ++z) {
+                slabRuns += (slabRuns.empty() ? "" : ",") + std::to_string(y) + "," +
+                            std::to_string(z) + ",0,8,0";
+            }
+        mapvox::Doc slab;
+        const bool slabParsed = mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[8,8,8],"
+            "\"cells_rle\":{\"palette\":[\"concrete\"],\"runs\":[" + slabRuns + "]}}",
+            slab);
+        const mapvox::StampResult slabStamp = mapvox::stampMapVox(slab, w, 96, 0, 80);
+        terrain::Report r3;
+        const std::vector<int> h3 = terrain::heightField(spec, *fam, fam->base);
+        terrain::fillTerrain(w, spec, *fam, h3, r3);
+        // The height field is only the first of the generator's four passes. A
+        // contract that held for fillTerrain and broke for the road and prop
+        // prefabs would still be a broken contract, so the same slab is run
+        // through the rest of the pipeline here. The prefab passes are the
+        // interesting ones: they place authored assets over the world, and
+        // stampMapVox in its default mode replaces whatever is under it.
+        const std::vector<terrain::RoadNode> slabNodes = terrain::planRoads(spec);
+        const int slabLevel = terrain::roadLevel(spec, slabNodes, h3);
+        terrain::gradeRoads(w, slabNodes, slabLevel, r3);
+        for (const auto& n : slabNodes) {
+            mapvox::Doc rd;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + n.prefab + ".vox.json", rd) &&
+                !mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" + n.prefab + ".vox.json", rd))
+                continue;
+            const mapvox::StampResult rr = mapvox::stampMapVox(rd, w, n.x0, slabLevel - 1, n.z0,
+                                                               n.rot, /*fillOnly=*/true);
+            r3.prefabDeclined += rr.declined;
+        }
+        for (const auto& p : terrain::planProps(spec, *fam, h3, slabNodes)) {
+            mapvox::Doc pd;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + p.prefab + ".vox.json", pd) &&
+                !mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" + p.prefab + ".vox.json", pd))
+                continue;
+            const mapvox::StampResult pr = mapvox::stampMapVox(pd, w, p.x, p.y, p.z, p.rot,
+                                                              /*fillOnly=*/true);
+            r3.prefabDeclined += pr.declined;
+        }
+        int intact = 0, expected = 0;
+        for (int y = 0; y < 8; ++y)
+            for (int z = 0; z < 8; ++z)
+                for (int x = 0; x < 8; ++x) {
+                    ++expected;
+                    if (w.get(96 + x, y, 80 + z) == sim::Block::Concrete) ++intact;
+                }
+        rep.slabIntact = intact;
+        rep.slabExpected = expected;
+        rep.slabSkipped = r3.authoredSkipped;
+        rep.slabPrefabDeclined = r3.prefabDeclined;
+        // The fixture must have stamped every cell it claims, or the survival
+        // check below is testing a partial block and would pass for the wrong
+        // reason.
+        const bool fixtureOk = slabParsed && slab.rleCells == 512 && slabStamp.written == 512;
+        // The generator must have met the slab and stepped around it, not
+        // missed it: `authoredSkipped` is the count of cells it declined to
+        // overwrite, and the terrain under the slab proves it ran there.
+        //
+        // `prefabDeclined` is the load-bearing half now. It is required to be
+        // non-zero, so the slab has to sit where a road or a prop actually
+        // wanted to be: the gate is proving the prefab passes stepped around
+        // authored cells, not merely that they ran without incident. A prefab
+        // pass that stamped over the slab would leave the count at zero and
+        // fail here, which is the point.
+        rep.nonDestructiveOk = fixtureOk && (intact == expected) && r3.authoredSkipped > 0 &&
+                               r3.prefabDeclined > 0;
+    }
+
+    // 7a. Altitude: the stamped surface must sit ON the network's level, with
+    //     no air under it. The shape check above proves which SIDES the asphalt
+    //     reaches and nothing about its height, so a tile that was one cell too
+    //     tall, or stamped one cell too low, produced a road floating over a
+    //     one-cell gap and every other check still passed. That is exactly what
+    //     a 3-cell tile did.
+    {
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        const int level = terrain::roadLevel(spec, nodes, h);
+        sim::World w = makeEmptyWorld();
+        terrain::Report rr;
+        terrain::fillTerrain(w, spec, *fam, h, rr);
+        terrain::gradeRoads(w, nodes, level, rr);
+        for (const auto& n : nodes) {
+            mapvox::Doc rd;
+            if (!mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + n.prefab + ".vox.json", rd) &&
+                !mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" + n.prefab + ".vox.json", rd))
+                continue;
+            mapvox::stampMapVox(rd, w, n.x0, level - 1, n.z0, n.rot, /*fillOnly=*/true);
+        }
+        // Walk out from each node's centre along every side its mask actually
+        // claims, plus the centre itself. Probing a fixed line instead would
+        // walk off a dead end's single arm and find its kerb, which is correct
+        // road and would read as a failure.
+        int probed = 0, surfaceAtLevel = 0, solidUnder = 0;
+        for (const auto& n : nodes) {
+            const int cx = n.x0 + terrain::kRegionCells / 2;
+            const int cz = n.z0 + terrain::kRegionCells / 2;
+            auto check = [&](int x, int z) {
+                if (!sim::World::inBounds(x, level, z)) return;
+                ++probed;
+                if (w.get(x, level, z) == sim::Block::Asphalt) ++surfaceAtLevel;
+                if (w.get(x, level - 1, z) != sim::Block::Air) ++solidUnder;
+            };
+            check(cx, cz);
+            for (int side = 0; side < 4; ++side) {
+                const terrain::Side& sd = terrain::kSideDirs[side];
+                if (!(n.mask & sd.bit)) continue;
+                for (int o = 1; o <= terrain::kRoadCutHalfWidth; ++o)
+                    check(cx + sd.dx * o, cz + sd.dz * o);
+            }
+        }
+        rep.roadAltProbed = probed;
+        rep.roadAltSurface = surfaceAtLevel;
+        rep.roadAltSolidUnder = solidUnder;
+        rep.roadAltOk = probed > 0 && surfaceAtLevel == probed && solidUnder == probed;
+    }
+
+    // 7b. The same contract, aimed straight at the prefab pass. The check above
+    //     proves the prefab passes declined something; this proves that what
+    //     they declined was the AUTHORED cell, and that the default stamp mode
+    //     would have taken it. Without this the count could be satisfied by
+    //     declining cells that were already generator ground, and the road
+    //     could be quietly demolishing a warehouse with the gate still green.
+    //
+    //     The fixture is placed at the first road node's own origin, filling
+    //     the height the prefab will be stamped at, so the prefab genuinely
+    //     wants those cells.
+    {
+        const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        const int level = terrain::roadLevel(spec, nodes, h);
+        mapvox::Doc rd;
+        bool haveRoad = !nodes.empty() &&
+                        (mapvox::loadAssetVox(g_exeDir + "\\prefabs\\" + nodes[0].prefab + ".vox.json",
+                                              rd) ||
+                         mapvox::loadAssetVox(g_exeDir + "\\..\\data\\prefabs\\" +
+                                                  nodes[0].prefab + ".vox.json",
+                                              rd));
+        bool spared = false, overwriteWouldWin = false, someDeclined = false;
+        if (haveRoad) {
+            // A concrete block exactly where the road surface goes: the prefab's
+            // own floor and the two layers above it, over its origin cell.
+            const int ox = nodes[0].x0, oz = nodes[0].z0, oy = level - 1;
+            auto fillBlock = [&](sim::World& w) {
+                for (int dz = 0; dz < 8; ++dz)
+                    for (int dx = 0; dx < 8; ++dx)
+                        for (int dy = 0; dy < 3; ++dy)
+                            w.set(ox + dx, oy + dy, oz + dz, sim::Block::Concrete);
+            };
+            auto blockIntact = [&](const sim::World& w) {
+                int n = 0;
+                for (int dz = 0; dz < 8; ++dz)
+                    for (int dx = 0; dx < 8; ++dx)
+                        for (int dy = 0; dy < 3; ++dy)
+                            if (w.get(ox + dx, oy + dy, oz + dz) == sim::Block::Concrete) ++n;
+                return n;
+            };
+            const int total = 8 * 8 * 3;
+
+            // The authored block, then the road stamped fill-only over it.
+            sim::World kept = makeEmptyWorld();
+            fillBlock(kept);
+            const mapvox::StampResult r1 =
+                mapvox::stampMapVox(rd, kept, ox, oy, oz, nodes[0].rot, /*fillOnly=*/true);
+            someDeclined = r1.declined > 0;
+            spared = (blockIntact(kept) == total);
+
+            // The same two operations in the map-prefab mode. This must NOT
+            // spare the block; if it did, the fill-only assertion above would be
+            // proving nothing at all.
+            sim::World clobbered = makeEmptyWorld();
+            fillBlock(clobbered);
+            mapvox::stampMapVox(rd, clobbered, ox, oy, oz, nodes[0].rot, /*fillOnly=*/false);
+            overwriteWouldWin = (blockIntact(clobbered) < total);
+        }
+        rep.prefabSparesAuthoredOk = haveRoad && spared && overwriteWouldWin && someDeclined;
+        rep.slabPrefabCells = someDeclined ? 1 : 0;
+    }
+
+    // 8. Refusals. A section that names a class the engine does not have, or
+    //    omits the seed, must be refused rather than quietly defaulted — a
+    //    defaulted seed is a silent clock, which is exactly what the
+    //    determinism rule forbids.
+    {
+        mapvox::Doc d;
+        rep.refusalClassOk = !mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4],"
+            "\"terrain\":{\"class\":\"lava\",\"seed\":7}}",
+            d);
+        rep.refusalSeedOk = !mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4],"
+            "\"terrain\":{\"class\":\"valley\"}}",
+            d);
+        // A map with no section at all is ordinary: no generation, no refusal.
+        mapvox::Doc plain;
+        const bool parsed = mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\",\"dims\":[4,4,4]}",
+            plain);
+        rep.absentOk = parsed && plain.ok && !plain.terrain.present;
+    }
+
+    // 9. The section round-trips through the exporter, so a generated world
+    //    re-exports as a map that regenerates it instead of a baked grid.
+    {
+        mapvox::Doc d;
+        mapvox::parseMapVox(
+            "{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+            "\"dims\":[192,64,160],"
+            "\"terrain\":{\"class\":\"tundra\",\"seed\":424242,\"base\":21,\"props\":false,\"road_x\":2}}",
+            d);
+        const std::string json = mapvox::terrainJson(d.terrain);
+        mapvox::Doc back;
+        const bool parsed = mapvox::parseMapVox(
+            std::string("{\"format_version\":2,\"unit\":1,\"voxel_size\":0.001,\"mode\":\"map\","
+                        "\"dims\":[192,64,160],") + json + "}",
+            back);
+        rep.roundTripOk = parsed && back.terrain.present && back.terrain.family == "tundra" &&
+                          back.terrain.seed == 424242u && back.terrain.base == 21 &&
+                          !back.terrain.props && back.terrain.roadX == 2;
+    }
+
+    // 10. Generated ground is ordinary occupancy, not a special material: it
+    //     must break under a hit and leave Air behind. Terrain that could not
+    //     be destroyed would be a cheat surface.
+    {
+        sim::World w = makeEmptyWorld();
+        const std::vector<int> h = terrain::heightField(spec, *fam, fam->base);
+        terrain::Report r4;
+        terrain::fillTerrain(w, spec, *fam, h, r4);
+        int destroyed = 0;
+        for (int z = 0; z < sim::kWorldD; ++z)
+            for (int x = 0; x < sim::kWorldW; ++x) {
+                const int top = h[static_cast<size_t>(z) * sim::kWorldW + x];
+                if (top < 1 || top >= sim::kWorldH - 4) continue;
+                const sim::Block before = w.get(x, top, z);
+                if (before == sim::Block::Air) continue;
+                w.set(x, top, z, sim::Block::Air);
+                if (w.get(x, top, z) == sim::Block::Air) ++destroyed;
+            }
+        rep.damageOk = destroyed > 0;
     }
 
     return rep;
@@ -4417,12 +4856,12 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
                 break;
             }
         }
-        meshChunk(testVc);
+        meshview::meshChunk(testVc, g_meshStats);
         const bool zeroVerts = testVc.mesh.empty();
 
         // When visible, non-air data is sent and faces are generated
         sendChunkSnapshot(world, testVc, true);
-        meshChunk(testVc);
+        meshview::meshChunk(testVc, g_meshStats);
         const bool hasVerts = !testVc.mesh.empty();
 
         rep.antiCheatGatingOk = allAir && zeroVerts && hasVerts;
@@ -4430,7 +4869,7 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
 
     // 3. Skirt isolation: no out-of-skirt access occurred during meshing
     {
-        rep.skirtIsolationOk = (g_skirtAccessViolations == 0);
+        rep.skirtIsolationOk = (g_meshStats.skirtAccessViolations == 0);
     }
 
     // 4. Corner Ambient Occlusion (AO): corner touching an adjacent solid block receives darker shade (Milestone 4)
@@ -4440,13 +4879,13 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
         // Create an inside corner: floor block at (5, 5, 5), wall block at (6, 6, 5)
         testAo.sent.set(5, 5, 5, wire::BlockId::Concrete);
         testAo.sent.set(6, 6, 5, wire::BlockId::Concrete);
-        meshChunk(testAo);
+        meshview::meshChunk(testAo, g_meshStats);
 
         bool foundAoDarkening = false;
         // Search vertices of floor block (5, 5, 5) on top face (+Y)
         for (const auto& v : testAo.mesh) {
             if (std::fabs(v.ny - 1.0f) < 0.2f && v.y > (5.0f * VOXEL_SIZE)) {
-                const float unoccludedR = blockColor(Block::Concrete).x * 1.0f; // faceShade[2] = 1.0
+                const float unoccludedR = meshview::blockColor(wire::BlockId::Concrete).x * 1.0f; // faceShade[2] = 1.0
                 if (v.r < unoccludedR * 0.95f) {
                     foundAoDarkening = true;
                     break;
@@ -4461,7 +4900,7 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
         ViewChunk testNorm;
         testNorm.sent.alloc();
         testNorm.sent.set(5, 5, 5, wire::BlockId::Concrete);
-        meshChunk(testNorm);
+        meshview::meshChunk(testNorm, g_meshStats);
 
         bool foundSmoothedNormal = false;
         for (const auto& v : testNorm.mesh) {
@@ -4476,6 +4915,46 @@ static SimViewSmokeReport runSimViewSmoke(const sim::World& world) {
     // 6. Cubic grid preservation (RULES.md): VOXEL_SIZE is strictly 0.001
     {
         rep.cubicPreservedOk = (std::fabs(VOXEL_SIZE - 0.001f) < 1e-7f);
+    }
+
+    // 7. Mesh workers: meshing every chunk through the pool must produce the
+    // same vertices as meshing them one by one, byte for byte, and the same
+    // skirt telemetry. The pool is forced to 3 helpers so the threaded path
+    // runs even on a machine where the live pool would be smaller, and the
+    // batch runs twice so a reused pool is covered, not just a fresh one.
+    {
+        const int n = sim::World::chunkCount();
+        std::vector<ViewChunk> serial(n), pooled(n);
+        for (int cy = 0; cy < CHUNKS_Y; ++cy)
+            for (int cz = 0; cz < CHUNKS_Z; ++cz)
+                for (int cx = 0; cx < CHUNKS_X; ++cx) {
+                    const int i = sim::World::chunkIndex(cx, cy, cz);
+                    for (ViewChunk* c : {&serial[i], &pooled[i]}) {
+                        c->cx = cx; c->cy = cy; c->cz = cz;
+                        sendChunkSnapshot(world, *c);
+                    }
+                }
+        meshview::Stats serialStats, pooledStats;
+        for (auto& c : serial) meshview::meshChunk(c, serialStats);
+
+        std::vector<ViewChunk*> batch;
+        for (auto& c : pooled) batch.push_back(&c);
+        meshview::Workers pool(3);
+        bool same = true;
+        for (int pass = 0; pass < 2 && same; ++pass) {
+            pooledStats = meshview::Stats{};
+            pool.meshAll(batch, pooledStats);
+            for (int i = 0; i < n && same; ++i) {
+                const auto& a = serial[i].mesh;
+                const auto& b = pooled[i].mesh;
+                same = a.size() == b.size() &&
+                       (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+            }
+            same = same && pooledStats.skirtAccessViolations == serialStats.skirtAccessViolations;
+        }
+        rep.meshWorkersEquivOk = same && pool.helpers() == 3;
+        rep.meshWorkersHelpers = static_cast<int>(pool.helpers());
+        rep.meshWorkersChunks = n;
     }
 
     return rep;
@@ -4837,83 +5316,7 @@ static InventorySmokeReport runInventorySmoke() {
 
 static void updateProjectiles(float dt) {
     if (!g_world) return;
-    for (auto& p : g_projectiles) {
-        if (!p.alive) continue;
-        // Gravity (matches Python WORLD_GRAVITY * gravity_scale)
-        p.vy -= kWorldGravity * p.def.gravityScale * dt;
-
-        const int steps = 4;
-        const float sdt = dt / static_cast<float>(steps);
-        const float radiusCells = std::max(0.5f, std::min(2.0f, p.def.radius / VOXEL_SIZE));
-        for (int s = 0; s < steps && p.alive; ++s) {
-            const float prevWx = p.px, prevWy = p.py, prevWz = p.pz;
-            p.px += p.vx * sdt;
-            p.py += p.vy * sdt;
-            p.pz += p.vz * sdt;
-
-            // Body sweep first, so a body is hit before the voxel it stands in.
-            // One bullet, one body (player::ownerIsPlayer excludes the shooter).
-            if (!p.ownerIsPlayer && health::kSelfFireDamage) {
-                const ArmorZone zone =
-                    projectileHitZone(prevWx, prevWy, prevWz, p.px, p.py, p.pz, radiusCells);
-                if (zone != ArmorZone::Count) {
-                    damagePlayerAtZone(p.energy, p.def.effect, zone);
-                    p.energy *= (1.0f - std::min(0.95f, p.def.penetration));
-                    if (p.energy < 0.05f) p.alive = false;
-                }
-            }
-
-            int ix = static_cast<int>(std::floor(p.px / VOXEL_SIZE));
-            int iy = static_cast<int>(std::floor(p.py / VOXEL_SIZE));
-            int iz = static_cast<int>(std::floor(p.pz / VOXEL_SIZE));
-            if (!worldInBounds(ix, iy, iz)) {
-                // allow mild overshoot above world; kill if far
-                if (p.py < -0.5f || p.py > 2.0f ||
-                    p.px < -0.5f || p.px > WORLD_W * VOXEL_SIZE + 0.5f ||
-                    p.pz < -0.5f || p.pz > WORLD_D * VOXEL_SIZE + 0.5f) {
-                    p.alive = false;
-                }
-                continue;
-            }
-
-            Block b = getWorldBlock(*g_world, ix, iy, iz);
-            MaterialId mat = blockMaterial(b);
-            if (mat == MaterialId::Air) continue;
-
-            float e = p.energy * effectMultiplier(p.def.effect, mat);
-            g_lastImpactDx = p.vx; g_lastImpactDy = p.vy; g_lastImpactDz = p.vz;
-            g_lastImpactEnergy = e;
-            if (resolveVoxelHit(mat, e, p.def.penetration)) {
-                destroyVoxelAt(ix, iy, iz);
-                applySplash(ix, iy, iz, p.def.splashRadius, p.energy, p.def);
-                p.energy = e;
-                if (p.def.effect == "explosive" || p.energy < 0.05f) p.alive = false;
-            } else {
-                // Matrix ricochet — bounce off without destroying occupancy.
-                float nx, ny, nz;
-                faceNormalFromVelocity(p.vx, p.vy, p.vz, nx, ny, nz);
-                const auto& mp = materialProps(mat);
-                ricochetVelocity(p.vx, p.vy, p.vz, nx, ny, nz,
-                                 0.20f + (1.0f - mp.fragility) * 0.25f,
-                                 0.30f + mp.damping * 0.3f);
-                p.energy = e * (1.0f - mp.damping * 0.5f);
-                g_debris.ricochets++;
-                g_lastAoeScale = impactAoeScale(p.def) * 0.55f;
-                g_debris.spawnFromVoxel(ix, iy, iz, mat, g_lastImpactDx, g_lastImpactDy, g_lastImpactDz,
-                                        e * 0.4f, VOXEL_SIZE, g_lastAoeScale);
-                // Nudge out of cell to avoid re-hit same voxel
-                p.px += nx * VOXEL_SIZE * 0.6f;
-                p.py += ny * VOXEL_SIZE * 0.6f;
-                p.pz += nz * VOXEL_SIZE * 0.6f;
-                if (p.energy < 0.08f || (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz) < 1e-5f)
-                    p.alive = false;
-            }
-        }
-    }
-    g_projectiles.erase(
-        std::remove_if(g_projectiles.begin(), g_projectiles.end(),
-                       [](const ProjectileRuntime& p) { return !p.alive; }),
-        g_projectiles.end());
+    ballistics::stepProjectiles(g_ballistics, *g_world, g_ballisticsHooks, dt);
     // Remesh deferred to drawFrame after GPU fence (see flushDirtyMesh).
 }
 
@@ -4923,6 +5326,285 @@ static void recreateSwapchain() {
     createSwapchain();
     createDepthResources();
     createFramebuffers();
+    g_post.createTargets(g_extent, g_vis.renderScale, g_swapViews);
+    if (g_uiRenderPass) createUiFramebuffers();
+}
+
+// ---- frame capture (view-only test harness) ----
+// --capture <dir> runs the smoke, stops ticking, then renders a fixed list of
+// camera shots and writes each finished frame to <dir>/<shot>.ppm. Golden
+// images of those shots are how visual changes are checked: a change that is
+// meant to be invisible must reproduce them, and one that is meant to be
+// visible can be looked at. The copy is recorded into the same command buffer
+// that draws the frame, while the image is still ours, i.e. before present.
+static std::string g_captureDir;
+static bool g_captureActive = false;    // shots are rendering; the sim is no longer ticking
+static bool g_captureThisFrame = false; // record a copy of this frame's swapchain image
+static VkBuffer g_captureBuf = VK_NULL_HANDLE;
+static VkDeviceMemory g_captureMem = VK_NULL_HANDLE;
+static void* g_captureMapped = nullptr;
+static VkDeviceSize g_captureSize = 0;
+
+static bool ensureCaptureBuffer() {
+    const VkDeviceSize need = VkDeviceSize(g_extent.width) * g_extent.height * 4;
+    if (g_captureBuf && g_captureSize >= need) return true;
+    if (g_captureBuf) {
+        vkUnmapMemory(g_device, g_captureMem);
+        vkDestroyBuffer(g_device, g_captureBuf, nullptr);
+        vkFreeMemory(g_device, g_captureMem, nullptr);
+        g_captureBuf = VK_NULL_HANDLE;
+        g_captureMem = VK_NULL_HANDLE;
+    }
+    createBuffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_captureBuf, g_captureMem);
+    vkMapMemory(g_device, g_captureMem, 0, need, 0, &g_captureMapped);
+    g_captureSize = need;
+    return g_captureMapped != nullptr;
+}
+
+// Both render passes leave the image in PRESENT_SRC_KHR; borrow it for a copy
+// and hand it back in the same layout, so presentation is unaffected.
+static void recordCaptureCopy(VkCommandBuffer cmd, uint32_t imageIndex) {
+    VkImageMemoryBarrier toSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image = g_swapImages[imageIndex];
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {g_extent.width, g_extent.height, 1};
+    vkCmdCopyImageToBuffer(cmd, g_swapImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           g_captureBuf, 1, &region);
+
+    VkImageMemoryBarrier back = toSrc;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    back.dstAccessMask = 0;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkBufferMemoryBarrier toHost{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHost.buffer = g_captureBuf;
+    toHost.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                         nullptr, 1, &toHost, 1, &back);
+}
+
+// Write the captured frame as binary PPM (RGB). Callers wait for the GPU first.
+static bool writeCapturePpm(const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const uint32_t w = g_extent.width, h = g_extent.height;
+    f << "P6\n" << w << " " << h << "\n255\n";
+    const bool bgr = g_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || g_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
+    const auto* px = static_cast<const uint8_t*>(g_captureMapped);
+    std::vector<uint8_t> row(size_t(w) * 3);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = px + (size_t(y) * w + x) * 4;
+            row[x * 3 + 0] = bgr ? p[2] : p[0];
+            row[x * 3 + 1] = p[1];
+            row[x * 3 + 2] = bgr ? p[0] : p[2];
+        }
+        f.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+    }
+    return static_cast<bool>(f);
+}
+
+// ---- in-engine menu (Dear ImGui) ----
+// Drawn in its own pass on the swapchain image after the overlay pass, with
+// its own pipeline and no world state bound (RULES.md, "Menus, HUD and other
+// view overlays"). It is the pause menu: Esc opens it, and it holds the
+// visuals panel built from the parameter registry.
+static bool g_uiDrawPending = false; // this frame built draw data to record
+static int g_uiFrames = 0;           // frames that drew the menu (telemetry)
+static std::string g_uiStatus;       // last save/load result, shown in the menu
+
+static void createUiFramebuffers() {
+    for (VkFramebuffer fb : g_uiFramebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
+    g_uiFramebuffers.assign(g_swapViews.size(), VK_NULL_HANDLE);
+    for (size_t i = 0; i < g_swapViews.size(); ++i) {
+        VkFramebufferCreateInfo ci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        ci.renderPass = g_uiRenderPass;
+        ci.attachmentCount = 1;
+        ci.pAttachments = &g_swapViews[i];
+        ci.width = g_extent.width;
+        ci.height = g_extent.height;
+        ci.layers = 1;
+        if (vkCreateFramebuffer(g_device, &ci, nullptr, &g_uiFramebuffers[i]) != VK_SUCCESS)
+            fail("ui framebuffer failed");
+    }
+}
+
+static void initUi() {
+    VkAttachmentDescription color{};
+    color.format = g_swapFormat;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rci.attachmentCount = 1;
+    rci.pAttachments = &color;
+    rci.subpassCount = 1;
+    rci.pSubpasses = &sub;
+    rci.dependencyCount = 1;
+    rci.pDependencies = &dep;
+    if (vkCreateRenderPass(g_device, &rci, nullptr, &g_uiRenderPass) != VK_SUCCESS)
+        fail("ui render pass failed");
+    createUiFramebuffers();
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // window layout is not persisted; settings are
+    ImGui::StyleColorsDark();
+    ImGui_ImplWin32_Init(g_hwnd);
+    ImGui_ImplVulkan_InitInfo ii{};
+    ii.ApiVersion = VK_API_VERSION_1_2;
+    ii.Instance = g_instance;
+    ii.PhysicalDevice = g_phys;
+    ii.Device = g_device;
+    ii.QueueFamily = static_cast<uint32_t>(g_qidx.graphics);
+    ii.Queue = g_graphicsQueue;
+    ii.DescriptorPoolSize = 64; // the backend makes its own pool
+    ii.MinImageCount = 2;
+    ii.ImageCount = static_cast<uint32_t>(std::max<size_t>(2, g_swapImages.size()));
+    ii.PipelineInfoMain.RenderPass = g_uiRenderPass;
+    ii.PipelineInfoMain.Subpass = 0;
+    ii.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    if (!ImGui_ImplVulkan_Init(&ii)) fail("ImGui Vulkan backend init failed");
+    g_uiReady = true;
+}
+
+static void shutdownUi() {
+    if (!g_device) return;
+    if (g_uiReady) {
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        g_uiReady = false;
+    }
+    for (VkFramebuffer fb : g_uiFramebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
+    g_uiFramebuffers.clear();
+    if (g_uiRenderPass) vkDestroyRenderPass(g_device, g_uiRenderPass, nullptr);
+    g_uiRenderPass = VK_NULL_HANDLE;
+}
+
+// One widget per registered parameter, grouped in declaration order. A new
+// effect appears here by registering its parameters; nothing below changes.
+static void drawVisualsPanel() {
+    const std::string settingsPath = g_exeDir + "\\visual_settings.json";
+    ImGui::TextUnformatted("Presets");
+    for (const auto& pr : g_visReg.presets()) {
+        if (ImGui::Button(pr.name)) g_visReg.applyPreset(pr.name);
+        ImGui::SameLine();
+    }
+    if (ImGui::Button("Defaults")) g_visReg.resetDefaults();
+    if (ImGui::Button("Save")) {
+        std::ofstream f(settingsPath, std::ios::binary);
+        f << g_visReg.toJson();
+        g_uiStatus = f ? "Saved " + settingsPath : "Could not write " + settingsPath;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load")) {
+        bool readable = false;
+        const std::string text = jsonReadText(settingsPath, &readable);
+        g_uiStatus = readable ? "Loaded " + std::to_string(g_visReg.fromJson(text)) + " settings"
+                              : "No saved settings yet";
+    }
+    if (!g_uiStatus.empty()) ImGui::TextDisabled("%s", g_uiStatus.c_str());
+
+    std::vector<std::string> groups;
+    for (const auto& p : g_visReg.params())
+        if (std::find(groups.begin(), groups.end(), p.group) == groups.end()) groups.push_back(p.group);
+    for (const std::string& g : groups) {
+        if (!ImGui::CollapsingHeader(g.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) continue;
+        for (auto& p : g_visReg.params()) {
+            if (g != p.group) continue;
+            bool changed = false;
+            switch (p.type) {
+            case vis::ParamType::Float:
+                changed = ImGui::SliderFloat(p.label, p.f, p.minV, p.maxV, "%.2f");
+                break;
+            case vis::ParamType::Int:
+                changed = ImGui::SliderInt(p.label, p.i, static_cast<int>(p.minV), static_cast<int>(p.maxV));
+                break;
+            case vis::ParamType::Bool:
+                changed = ImGui::Checkbox(p.label, p.b);
+                break;
+            }
+            if (p.help && *p.help && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.help);
+            if (changed) {
+                p.set(p.get()); // re-clamp (Ctrl+click lets a slider be typed past its range)
+                g_visReg.touch();
+            }
+        }
+    }
+}
+
+// Build this frame's menu, if it is showing. Recorded later in the UI pass.
+static void buildUiFrame() {
+    g_uiDrawPending = false;
+    if (!g_uiReady || !(g_paused || g_menuForced)) return;
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Always);
+    ImGui::Begin("Paused", nullptr,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoSavedSettings);
+    if (ImGui::Button("Resume")) setPaused(false);
+    ImGui::SameLine();
+    if (ImGui::Button("Quit")) {
+        g_running = false;
+        PostQuitMessage(0);
+    }
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) drawVisualsPanel();
+    ImGui::End();
+    ImGui::Render();
+    g_uiDrawPending = true;
+}
+
+static void recordUiPass(VkCommandBuffer cmd, uint32_t imageIndex) {
+    if (!g_uiDrawPending) return;
+    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp.renderPass = g_uiRenderPass;
+    rp.framebuffer = g_uiFramebuffers[imageIndex];
+    rp.renderArea.extent = g_extent;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+    vkCmdEndRenderPass(cmd);
+    ++g_uiFrames;
 }
 
 static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
@@ -4931,22 +5613,24 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd, &bi);
 
+    recordOccupancyUpload(cmd, frameIndex);
+
     VkClearValue clears[2]{};
     clears[0].color = {{0.03f, 0.035f, 0.05f, 1.0f}}; // night sky
     clears[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rp.renderPass = g_renderPass;
-    rp.framebuffer = g_framebuffers[imageIndex];
-    rp.renderArea.extent = g_extent;
+    rp.framebuffer = g_post.worldFb;
+    rp.renderArea.extent = g_post.extent;
     rp.clearValueCount = 2;
     rp.pClearValues = clears;
 
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 
-    // Full swapchain viewport. Bitcrush in fragment shader provides the downscale/crunch look
-    // without a second pass; RENDER_SCALE documents intended internal scale for future offscreen RT.
+    // Full-window viewport for the overlay pass; the world pass uses the
+    // offscreen target's own size (render scale) below.
     VkViewport viewport{};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
@@ -4954,12 +5638,19 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     viewport.height = static_cast<float>(g_extent.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-
     VkRect2D scissor{};
     scissor.offset = {0, 0};
     scissor.extent = g_extent;
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    // The world pass draws into the offscreen target at the render scale; the
+    // overlay pass below uses the full-window viewport/scissor above.
+    {
+        VkViewport wv = viewport;
+        wv.width = static_cast<float>(g_post.extent.width);
+        wv.height = static_cast<float>(g_post.extent.height);
+        VkRect2D ws{{0, 0}, g_post.extent};
+        vkCmdSetViewport(cmd, 0, 1, &wv);
+        vkCmdSetScissor(cmd, 0, 1, &ws);
+    }
 
     VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexBuffer, &off);
@@ -4992,6 +5683,12 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     // World item pickups (mat 8) live in the main pass so they depth-test against
     // the map and cast/receive light like the world does. Only the player's own
     // lattice is overlay-only.
+    // Light fixtures (environment layer): same pass, same pipeline.
+    if (g_fixtureVB != VK_NULL_HANDLE && g_fixtureVertexCount > 0) {
+        VkDeviceSize fOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_fixtureVB, &fOff);
+        vkCmdDraw(cmd, g_fixtureVertexCount, 1, 0, 0);
+    }
     if (g_pickupVB != VK_NULL_HANDLE && g_pickupVertexCount > 0) {
         VkDeviceSize pOff = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &g_pickupVB, &pOff);
@@ -5014,6 +5711,16 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
 
     vkCmdEndRenderPass(cmd);
 
+    // Post chain: the world image onto the swapchain (src/post_fx.hpp).
+    {
+        postfx::PostParams pp;
+        pp.posterize = static_cast<float>(g_vis.posterizeLevels);
+        pp.dither = g_vis.dither;
+        pp.crush = g_vis.crush;
+        pp.time = static_cast<float>(g_tick) * static_cast<float>(TICK_DT);
+        g_post.record(cmd, imageIndex, g_extent, g_vis.upscaleNearest, pp);
+    }
+
     // Inventory + HUD overlay (RULES.md rule 12/15): second pass, color LOAD +
     // depth DONT_CARE, so the lattice paints over the map while still
     // self-occluding against a fresh depth buffer. The pass runs when either the
@@ -5024,8 +5731,10 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         ovp.renderPass = g_overlayRenderPass;
         ovp.framebuffer = g_overlayFramebuffers[imageIndex];
         ovp.renderArea.extent = g_extent;
-        ovp.clearValueCount = 0;
-        ovp.pClearValues = nullptr;
+        VkClearValue ovClears[2]{};
+        ovClears[1].depthStencil = {1.0f, 0}; // colour is LOAD; only depth clears
+        ovp.clearValueCount = 2;
+        ovp.pClearValues = ovClears;
         vkCmdBeginRenderPass(cmd, &ovp, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_overlayPipeline);
         vkCmdSetViewport(cmd, 0, 1, &viewport);
@@ -5037,6 +5746,10 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         vkCmdDraw(cmd, g_inventoryVertexCount, 1, 0, 0);
         vkCmdEndRenderPass(cmd);
     }
+
+    recordUiPass(cmd, imageIndex);
+
+    if (g_captureThisFrame && g_captureBuf) recordCaptureCopy(cmd, imageIndex);
 
     vkEndCommandBuffer(cmd);
 }
@@ -5108,30 +5821,197 @@ static bool playerHitsSolid(float px, float py, float pz) {
     return false;
 }
 
-static void spawnPlayerOnMap(const sim::World& world) {
-    // Stand on the concrete apron just inside the open bay, looking -Z into the warehouse.
-    const int sx = WORLD_W / 2;
-    const int sz = WORLD_D - DIRT_MARGIN - 18;
-    int gy = 1 + SLAB_THICK; // default slab top
-    // Stand on the concrete slab (or whatever solids remain under it) — looking
-    // for the first solid from the sky would spawn the player on the roof deck.
-    for (int y = 1 + SLAB_THICK; y >= 0; --y) {
-        Block b = getWorldBlock(world, sx, y, sz);
-        if (isSolidBlock(b)) { gy = y + 1; break; }
+// Stamp a prefab by id, looking beside the exe and in data/prefabs. Shared by
+// the map's own prefab list and by generated terrain, which places roads and
+// decorations the same way: a prefab is a prefab, whoever asked for it.
+//
+// `fillOnly` separates the two callers, and the difference matters. A map's own
+// prefabs stamp over the grid on purpose — that is what placing a prefab by
+// hand means. Generated terrain is bound by the other half of the contract in
+// RULES.md, "Generated terrain": it only fills Air, so a road tile or a shrub
+// that lands on hand-authored structure declines the cell instead of demolishing
+// it. The generator's other two passes (fillTerrain, gradeRoads) already worked
+// this way; without this flag the prefab pass was the one loophole left in a
+// promise the schema and RULES both state outright.
+static bool stampPrefabById(const std::string& id, sim::World& world, int x, int y, int z,
+                            int rot, bool fillOnly = false, int* written = nullptr,
+                            int* declined = nullptr) {
+    mapvox::Doc pd;
+    bool found = false;
+    for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                  g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+        if (mapvox::loadAssetVox(dir + id + ".vox.json", pd)) { found = true; break; }
     }
-    g_spawnCellX = sx;
-    g_spawnCellY = gy;
-    g_spawnCellZ = sz;
-    g_player.px = (sx + 0.5f) * VOXEL_SIZE;
-    g_player.py = gy * VOXEL_SIZE + 0.0002f;
-    g_player.pz = (sz + 0.5f) * VOXEL_SIZE;
-    g_player.vx = g_player.vy = g_player.vz = 0.0f;
-    g_player.onGround = true;
-    g_player.lean = 0.0f;
-    g_player.leanTarget = 0.0f;
-    g_yaw = 0.0f;          // look toward -Z into bay
-    g_pitch = -0.08f;
-    g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+    if (!found) return false;
+    const mapvox::StampResult r = mapvox::stampMapVox(pd, world, x, y, z, rot, fillOnly);
+    if (written) *written += r.written;
+    if (declined) *declined += r.declined;
+    return true;
+}
+
+// A road tile's height is a contract, not a convention: the stamp is placed at
+// `level - kRoadLayers`, so a tile that is not exactly kRoadLayers tall either
+// floats above a hole or sinks its surface below the level the network, the
+// spawn and the gate all agree on. The terrain gate (see the altitude probe)
+// proves the generated assets, but a gate only runs when someone runs it -- a
+// hand-edited or stale prefab would otherwise load and quietly produce a road
+// with an air gap under it, which is the exact defect kRoadLayers exists to
+// prevent. So the load path checks it too, and refuses the asset.
+//
+// The height is measured the way stampMapVox would actually write the tile, over
+// both cell forms: an explicit `voxels` list and the run-length `cells_rle`.
+// A run counts only if its palette entry is a real block and was not dropped as
+// painter-only, which is the same condition the stamp applies -- measuring the
+// runs with a looser rule would let a dropped material inflate the height.
+static bool roadPrefabHeightOk(const mapvox::Doc& pd, int& outHeight) {
+    int lo = -1, hi = -1;
+    auto note = [&](int y) {
+        if (lo < 0 || y < lo) lo = y;
+        if (hi < 0 || y > hi) hi = y;
+    };
+    for (const auto& v : pd.voxels) {
+        if (v.block != sim::Block::Air) note(v.y);
+    }
+    const auto& runs = pd.rleRuns;
+    for (size_t i = 0; i + 4 < runs.size(); i += 5) {
+        const int pi = runs[i + 4];
+        if (pi < 0 || static_cast<size_t>(pi) >= pd.rlePalette.size()) continue;
+        if (static_cast<size_t>(pi) < pd.rleDropped.size() && pd.rleDropped[pi]) continue;
+        if (pd.rlePalette[pi] == sim::Block::Air) continue;
+        if (runs[i + 3] <= 0) continue; // an empty run writes nothing
+        note(runs[i]);
+    }
+    if (lo < 0) { outHeight = 0; return false; } // an empty tile is not a road
+    outHeight = hi - lo + 1;
+    return outHeight == terrain::kRoadLayers;
+}
+
+// Generate the map's terrain section, if it has one. Runs after the map and its
+// prefabs are stamped and before the player is placed, so the spawn cell is
+// chosen against the finished ground rather than the empty grid.
+//
+// The generator only fills Air (see src/terrain.hpp), so it can never demolish
+// authored structure: a map can gain a terrain section without losing the map.
+// Everything it writes is ordinary occupancy, so the mesher, the physics and
+// the sim fingerprint see nothing special.
+static void generateMapTerrain(sim::World& world, const terrain::Spec& spec) {
+    if (!spec.present) return;
+    const terrain::FamilyProfile* fam = terrain::familyByName(spec.family);
+    if (!fam) fail("terrain class \"" + spec.family + "\" is unknown");
+    const int base = spec.base >= 0 ? spec.base : fam->base;
+
+    const std::vector<int> heights = terrain::heightField(spec, *fam, base);
+    terrain::Report rep;
+    terrain::fillTerrain(world, spec, *fam, heights, rep);
+
+    const std::vector<terrain::RoadNode> nodes = terrain::planRoads(spec);
+    rep.roadNodes = static_cast<int>(nodes.size());
+    const int level = terrain::roadLevel(spec, nodes, heights);
+    terrain::gradeRoads(world, nodes, level, rep);
+
+    // Roads and decorations are prefabs, stamped at the placement the seeded
+    // plan gives. A missing asset is a refusal, not a silent omission: a road
+    // that failed to stamp would leave the network broken with no sign of it.
+    // Both passes are fill-only, for the same reason fillTerrain is.
+    //
+    // A road also has to be exactly kRoadLayers tall, or the stamp lands its
+    // surface off the level every other consumer uses. That is checked here, at
+    // load, not only by the gate -- see roadPrefabHeightOk.
+    for (const auto& n : nodes) {
+        mapvox::Doc rd;
+        bool found = false;
+        for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                      g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+            if (mapvox::loadAssetVox(dir + n.prefab + ".vox.json", rd)) { found = true; break; }
+        }
+        if (!found)
+            fail("terrain road prefab \"" + std::string(n.prefab) + "\" not found or invalid");
+        int height = 0;
+        if (!roadPrefabHeightOk(rd, height))
+            fail("terrain road prefab \"" + std::string(n.prefab) + "\" is " +
+                 std::to_string(height) + " cell(s) tall; a road tile must be exactly " +
+                 std::to_string(terrain::kRoadLayers) + " (base course plus surface), or its " +
+                 "surface lands off the network level and leaves an air gap under the road");
+        const mapvox::StampResult r =
+            mapvox::stampMapVox(rd, world, n.x0, level - 1, n.z0, n.rot, /*fillOnly=*/true);
+        rep.prefabDeclined += r.declined;
+    }
+    for (const auto& p : terrain::planProps(spec, *fam, heights, nodes)) {
+        // A decoration that will not stamp is counted, not fatal: it is scenery,
+        // and refusing to load a world over a missing shrub would be worse than
+        // a world with one fewer shrub. Roads are held to the strict rule
+        // above, because a broken road is a broken world.
+        if (!stampPrefabById(p.prefab, world, p.x, p.y, p.z, p.rot, true, nullptr,
+                             &rep.prefabDeclined))
+            ++rep.propsMissing;
+        else
+            ++rep.props;
+    }
+    g_terrainReport = rep;
+}
+
+static void spawnPlayerOnMap(const sim::World& world) {
+    if (g_mapSpawn.present) {
+        // The map says where the player stands; respawn uses the same cell.
+        g_spawnCellX = g_mapSpawn.x;
+        g_spawnCellY = g_mapSpawn.y;
+        g_spawnCellZ = g_mapSpawn.z;
+        g_player.px = (g_mapSpawn.x + 0.5f) * VOXEL_SIZE;
+        g_player.py = g_mapSpawn.y * VOXEL_SIZE + 0.0002f;
+        g_player.pz = (g_mapSpawn.z + 0.5f) * VOXEL_SIZE;
+        g_player.vx = g_player.vy = g_player.vz = 0.0f;
+        g_player.onGround = true;
+        g_player.lean = 0.0f;
+        g_player.leanTarget = 0.0f;
+        g_yaw = g_mapSpawn.yaw;
+        g_pitch = g_mapSpawn.pitch;
+        g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+        return;
+    }
+    // No authored spawn, but a terrain section: stand on the generated ground.
+    // A terrain-only map has no floor of its own, so refusing here would make
+    // the whole feature unloadable, and searching from the sky down is the same
+    // rule the old warehouse spawn used.
+    if (g_mapTerrain.present) {
+        int bestX = -1, bestY = -1, bestZ = -1;
+        // Scan down at a few spread-out columns and take the highest ground
+        // found. Searching one column only would fail whenever the seed happens
+        // to put that column on a slope's low side.
+        for (int probe = 0; probe < 4 && bestY < 0; ++probe) {
+            const int x = (WORLD_W / 2) + (probe - 1) * (WORLD_W / 8);
+            const int z = (WORLD_D / 2) + (probe & 1 ? 1 : -1) * (WORLD_D / 8);
+            for (int y = WORLD_H - 2; y >= 0; --y) {
+                if (!isSolidBlock(world.get(x, y, z))) continue;
+                if (isSolidBlock(world.get(x, y + 1, z))) continue;  // need headroom
+                bestX = x; bestY = y + 1; bestZ = z;
+                break;
+            }
+        }
+        if (bestY < 0) fail("terrain map has no player_spawn and no standable ground");
+        g_mapSpawn.present = true;
+        g_mapSpawn.x = bestX;
+        g_mapSpawn.y = bestY;
+        g_mapSpawn.z = bestZ;
+        g_mapSpawn.yaw = 0.0f;
+        g_mapSpawn.pitch = 0.0f;
+    } else {
+        fail("the map has no player_spawn");
+    }
+    if (g_mapSpawn.present) {
+        g_spawnCellX = g_mapSpawn.x;
+        g_spawnCellY = g_mapSpawn.y;
+        g_spawnCellZ = g_mapSpawn.z;
+        g_player.px = (g_mapSpawn.x + 0.5f) * VOXEL_SIZE;
+        g_player.py = g_mapSpawn.y * VOXEL_SIZE + 0.0002f;
+        g_player.pz = (g_mapSpawn.z + 0.5f) * VOXEL_SIZE;
+        g_player.vx = g_player.vy = g_player.vz = 0.0f;
+        g_player.onGround = true;
+        g_player.lean = 0.0f;
+        g_player.leanTarget = 0.0f;
+        g_yaw = g_mapSpawn.yaw;
+        g_pitch = g_mapSpawn.pitch;
+        g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+    }
 }
 
 // Water current + weight sampling from physics feet (not free-fly camera).
@@ -5407,9 +6287,31 @@ static void updatePlayerAndEye(float dt, const SimInput& in) {
     }
 }
 
+// The eye as rendered, between the previous tick's eye and this tick's by how
+// far wall time has run into the next tick. The simulation runs at a fixed 120
+// Hz and the display at whatever it manages, so drawing the latest tick's eye
+// as-is judders whenever the two disagree. Interpolating costs under one tick
+// of positional lag; orientation is not interpolated, so aim stays immediate.
+//
+// View-only: g_camPos (the sim's eye, which is also the fire origin) is never
+// written here, so this cannot change what a shot hits.
+static constexpr float kEyeSnapDist = 0.02f; // world units per tick; beyond it is a teleport
+
+static Vec3 lerpEye(const Vec3& a, const Vec3& b, float t) {
+    const Vec3 d = b - a;
+    if (d.dot(d) > kEyeSnapDist * kEyeSnapDist) return b; // respawn/teleport: snap, never sweep
+    return a + d * t;
+}
+
+static Vec3 renderEye() {
+    if (g_paused || g_captureActive) return g_camPos;
+    const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+    return lerpEye(g_camPosPrevTick, g_camPos, alpha);
+}
+
 static void updateUBO(uint32_t frameIndex, float timeSec) {
-    Vec3 eye = g_camPos;
-    Vec3 center = g_camPos + cameraForward();
+    const Vec3 eye = renderEye();
+    Vec3 center = eye + cameraForward();
     float aspect = g_extent.height > 0
                        ? static_cast<float>(g_extent.width) / static_cast<float>(g_extent.height)
                        : 1.0f;
@@ -5453,23 +6355,30 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
                          ? std::clamp((0.35f - hpFrac) / 0.35f, 0.0f, 1.0f)
                          : (g_health.dead ? 1.0f : 0.0f);
 
-    // Warm bulbs harvested from Block::LightBulb occupancy. Unknown slots are
-    // zeroed so the shader's fixed loop sees intensity 0 and skips them.
-    if (g_bulbsDirty && g_world) {
-        harvestBulbLights(*g_world, g_bulbs);
-        g_bulbsDirty = false;
+    // Lights from the map (environment layer) into this frame's light buffer.
+    const int lightCount = std::min(static_cast<int>(g_bulbs.size()), kMaxLights);
+    if (g_lightMapped[frameIndex]) {
+        float* dst = static_cast<float*>(g_lightMapped[frameIndex]);
+        for (int i = 0; i < lightCount; ++i) {
+            const BulbLight& l = g_bulbs[i];
+            const float v[8] = {l.pos.x, l.pos.y, l.pos.z, l.intensity, l.color.x, l.color.y, l.color.z, l.radius};
+            std::memcpy(dst + i * 8, v, sizeof(v));
+        }
     }
-    std::memset(ubo.bulbPos, 0, sizeof(ubo.bulbPos));
-    std::memset(ubo.bulbColor, 0, sizeof(ubo.bulbColor));
-    for (int i = 0; i < kMaxBulbs; ++i) {
-        if (i >= static_cast<int>(g_bulbs.size())) break;
-        const BulbLight& l = g_bulbs[i];
-        ubo.bulbPos[i][0] = l.pos.x; ubo.bulbPos[i][1] = l.pos.y; ubo.bulbPos[i][2] = l.pos.z;
-        ubo.bulbPos[i][3] = l.intensity;
-        ubo.bulbColor[i][0] = l.color.x; ubo.bulbColor[i][1] = l.color.y; ubo.bulbColor[i][2] = l.color.z;
-        ubo.bulbColor[i][3] = l.radius;
-    }
+    ubo.lightInfo[0] = static_cast<float>(lightCount);
+    ubo.occDims[0] = static_cast<float>(WORLD_W);
+    ubo.occDims[1] = static_cast<float>(WORLD_H);
+    ubo.occDims[2] = static_cast<float>(WORLD_D);
+    ubo.occDims[3] = (g_vis.shadows && g_occImageReady) ? 1.0f : 0.0f;
+    ubo.shadowParams[0] = static_cast<float>(g_vis.shadowSteps);
+    ubo.shadowParams[1] = 1.0f; // cells per budget unit (exact DDA visits every cell)
 
+    ubo.fisheyeScale = g_vis.fisheye;
+    ubo.banding = g_vis.banding;
+    std::memcpy(ubo.texParams, g_texTable.params, sizeof(ubo.texParams));
+    ubo.texGlobal[0] = (g_vis.textures && g_texLayerCount > 0) ? 1.0f : 0.0f;
+    ubo.texGlobal[1] = g_vis.textureStrength;
+    ubo.texGlobal[2] = g_vis.textureScale;
     std::memcpy(g_uboMapped[frameIndex], &ubo, sizeof(ubo));
 }
 
@@ -5491,42 +6400,51 @@ static void flushDirtyMesh() {
     QueryPerformanceCounter(&t0);
 
     // Push fresh snapshots for stale chunks, then mesh each one purely from the
-    // snapshot it was sent. This is the whole sim->view contract in one call.
-    auto touched = remeshStaleChunks(*g_world, *g_views);
+    // snapshot it was sent. This is the whole sim->view contract.
+    std::vector<ViewChunk*> touched;
+    {
+        ScopedSection s(SEC_MESH_SNAPSHOT);
+        touched = sendStaleSnapshots(*g_world, *g_views);
+    }
+    {
+        ScopedSection s(SEC_MESH_BUILD);
+        buildChunkMeshes(touched);
+    }
+    ScopedSection copySection(SEC_MESH_COPY);
+    g_meshTouchedSum += touched.size();
+    g_meshTouchedMax = std::max(g_meshTouchedMax, static_cast<int>(touched.size()));
 
-    // A chunk outgrew its slot, or the buffer was never sized: repack everything
-    // and re-upload. This is the rare path; normal impacts only touch their chunk.
-    uint32_t needed = 0;
-    for (const auto& c : *g_views) needed += c.slotCapacity;
-    const bool repack = g_needsFullMeshRepack || needed > (g_vertexCapacity / sizeof(Vertex));
-    g_needsFullMeshRepack = false;
-
+    // Copy each touched chunk into its slot. Slots are stable, so every other
+    // chunk's offset stays valid and is not copied.
+    //
+    // A chunk that outgrew its slot moves to fresh space past the last slot
+    // instead of forcing a full repack: chunks are drawn one by one from their
+    // own firstVertex, so nothing else has to move. Only that chunk is copied,
+    // and its old slot is left dead until the next repack reclaims it. Only
+    // when the free tail runs out does everything repack, which compacts the
+    // dead space and grows the buffer. That full copy is the one expensive
+    // path (tens of MB), so it should be rare.
+    const uint32_t capacityVerts = static_cast<uint32_t>(g_vertexCapacity / sizeof(Vertex));
+    bool repack = (g_vertexBuffer == VK_NULL_HANDLE);
+    for (ViewChunk* c : touched) {
+        if (repack) break;
+        if (c->vertexCount > c->slotCapacity) {
+            const uint32_t want = slotWant(c->vertexCount);
+            if (g_slotCursor + want > capacityVerts) { repack = true; break; }
+            c->firstVertex = g_slotCursor;
+            c->slotCapacity = want;
+            g_slotCursor += want;
+            ++g_meshRelocateCount;
+        }
+        if (!uploadChunkRange(*c)) repack = true;
+    }
     if (repack) {
         repackChunkSlots(*g_views);
-        uint32_t total = 0;
-        for (const auto& c : *g_views) total += c.slotCapacity;
-        if (!ensureVertexCapacity(total)) return;
+        if (!ensureVertexCapacity(g_slotCursor)) return;
         for (const auto& c : *g_views) uploadChunkRange(c);
-        g_vertexCount = total;
         ++g_meshRepackCount;
-    } else {
-        // Incremental: copy only the chunks whose occupancy changed. Slots are
-        // stable, so offsets recorded at the last repack remain valid.
-        bool ok = true;
-        for (const ViewChunk* c : touched) {
-            if (!uploadChunkRange(*c)) { ok = false; break; }
-        }
-        if (!ok) {
-            // Should not happen: ensureVertexCapacity sized the buffer above.
-            repackChunkSlots(*g_views);
-            uint32_t total = 0;
-            for (const auto& c : *g_views) total += c.slotCapacity;
-            if (!ensureVertexCapacity(total)) return;
-            for (const auto& c : *g_views) uploadChunkRange(c);
-            g_vertexCount = total;
-            ++g_meshRepackCount;
-        }
     }
+    g_vertexCount = g_slotCursor;
     g_liveVertexCount = 0;
     for (const auto& c : *g_views) g_liveVertexCount += c.vertexCount;
 
@@ -5546,6 +6464,12 @@ static void drawFrame(float timeSec) {
     {
         ScopedSection s(SEC_WAIT);
         vkWaitForFences(g_device, 1, &g_inFlight[g_frame], VK_TRUE, UINT64_MAX);
+    }
+
+    // The render scale changed (visuals menu): rebuild the offscreen target.
+    if (std::fabs(g_vis.renderScale - g_post.scale) > 1e-4f) {
+        vkDeviceWaitIdle(g_device);
+        g_post.createTargets(g_extent, g_vis.renderScale, g_swapViews);
     }
 
     // Safe to rebuild world VB now (no device-wide idle).
@@ -5591,6 +6515,7 @@ static void drawFrame(float timeSec) {
         updateInventoryMesh();
         drainInventoryInput();
     }
+    buildUiFrame();
     {
         ScopedSection s(SEC_RECORD);
         recordCommandBuffer(imageIndex, static_cast<uint32_t>(g_frame));
@@ -5625,15 +6550,206 @@ static void drawFrame(float timeSec) {
     paceFrame120();
 }
 
+// Fixed camera shots for --capture, in cell coordinates on the current map.
+// The sim has stopped ticking when these run; placing the camera here is a test
+// harness posing a view, and nothing is simulated afterwards.
+// Extras stage view content a shot needs so every render class is on camera:
+// the inventory overlay, and a burst of debris chips plus a muzzle flash.
+enum CaptureExtras : int { kShotPlain = 0, kShotInventory = 1, kShotEffects = 2, kShotDebris = 4, kShotMenu = 8 };
+struct CaptureShot {
+    const char* name;
+    float cx, cy, cz; // eye position, in cells
+    float yaw, pitch;
+    int extras;
+    const char* preset = nullptr; // visuals preset for this shot (defaults restored after)
+};
+static const CaptureShot kCaptureShots[] = {
+    {"bay_inward",      96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotPlain},
+    {"interior_crates", 150.0f, 18.0f, 110.0f, -0.90f, -0.20f, kShotPlain},
+    {"back_corner",     20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain},
+    {"exterior_river",  186.0f, 46.0f, 158.0f, -0.85f, -0.42f, kShotPlain},
+    {"inventory_open",  96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotInventory},
+    {"effects_crate",   34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotEffects},
+    {"debris_crate",    34.0f, 13.0f, 58.0f, 0.00f, -0.30f, kShotDebris},
+    {"pause_menu",      96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotMenu},
+    {"preset_retro",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Retro"},
+    {"preset_clean",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Clean"},
+};
+
+// Shots for a generated-terrain world. The list above is fixed to the
+// warehouse's own coordinates and heights, which say nothing about terrain: on a
+// generated world those eyes are usually underground or staring at sky, and a
+// capture that cannot tell a road from open ground is not a check.
+//
+// These are placed from the world that was actually generated -- the spawn cell
+// the loader chose, and the network's own level -- so they frame real ground
+// whatever the class or seed. They only run when a terrain section is present,
+// so the warehouse's golden capture set is untouched.
+static std::vector<CaptureShot> terrainCaptureShots() {
+    std::vector<CaptureShot> shots;
+    const int level = g_terrainReport.roadLevelY > 0 ? g_terrainReport.roadLevelY : 8;
+    // Stand on the spawn the loader picked and look along the road.
+    const float sx = static_cast<float>(g_spawnCellX) + 0.5f;
+    const float sz = static_cast<float>(g_spawnCellZ) + 0.5f;
+    const float eye = static_cast<float>(g_spawnCellY) + 1.6f;
+    shots.push_back({"terrain_spawn", sx, eye, sz, 0.0f, -0.10f, kShotPlain});
+    // A high three-quarter view, the way the height field actually reads.
+    shots.push_back({"terrain_aerial", 48.0f, static_cast<float>(level) + 26.0f, 40.0f, 0.85f,
+                     -0.45f, kShotPlain});
+    // Down at road level, from the side, so the surface and kerbs are on camera.
+    shots.push_back({"terrain_road", sx + 10.0f, static_cast<float>(level) + 2.2f, sz - 6.0f, -1.2f,
+                     -0.12f, kShotPlain});
+    // One terrain preset pass, so the post chain is exercised on generated
+    // materials as well as on the warehouse's.
+    shots.push_back({"terrain_preset", sx, eye, sz, 0.0f, -0.10f, kShotPlain, "Retro"});
+    return shots;
+}
+
+static int runCaptureShots(float timeSec) {
+    int written = 0;
+    g_captureActive = true;
+    g_recoilPitch = g_recoilYaw = 0.0f;
+    // A generated world gets shots framed on its own ground; the warehouse keeps
+    // the fixed set, so its golden captures do not move.
+    std::vector<CaptureShot> terrainShots;
+    const CaptureShot* shots = kCaptureShots;
+    size_t shotCount = sizeof(kCaptureShots) / sizeof(kCaptureShots[0]);
+    if (g_mapTerrain.present) {
+        terrainShots = terrainCaptureShots();
+        shots = terrainShots.data();
+        shotCount = terrainShots.size();
+    }
+    for (size_t si = 0; si < shotCount; ++si) {
+        const CaptureShot& shot = shots[si];
+        g_camPos = Vec3(shot.cx * VOXEL_SIZE, shot.cy * VOXEL_SIZE, shot.cz * VOXEL_SIZE);
+        g_yaw = shot.yaw;
+        g_pitch = shot.pitch;
+        g_inventoryOpen = (shot.extras & kShotInventory) != 0;
+        g_menuForced = (shot.extras & kShotMenu) != 0;
+        if (shot.preset) g_visReg.applyPreset(shot.preset);
+        if (shot.extras & (kShotEffects | kShotDebris)) {
+            // Chips thrown off the top edge of the first crate (see
+            // data/maps/warehouse_v1). The sim is not ticking, so they hold still.
+            for (int x = 32; x <= 35; ++x)
+                g_debris.spawnFromVoxel(x, 10, 41, MaterialId::Wood, 0.0f, 0.4f, 1.0f, 6.0f,
+                                        VOXEL_SIZE, 1.0f);
+            g_debris.meshDirty = true;
+        }
+        if (shot.extras & kShotEffects) g_muzzleFlash = 1.0f;
+        // Two frames per shot: per-frame view state (sky dome around the eye,
+        // pickup hover) settles on the first, the second is the one kept.
+        for (int i = 0; i < 2; ++i) {
+            vkDeviceWaitIdle(g_device);
+            g_captureThisFrame = (i == 1) && ensureCaptureBuffer();
+            drawFrame(timeSec);
+        }
+        vkDeviceWaitIdle(g_device);
+        if (g_captureThisFrame &&
+            writeCapturePpm(g_captureDir + "\\" + shot.name + ".ppm"))
+            ++written;
+        g_captureThisFrame = false;
+        g_inventoryOpen = false;
+        g_muzzleFlash = 0.0f;
+        g_menuForced = false;
+        if (shot.preset) g_visReg.resetDefaults();
+    }
+    g_captureActive = false;
+    return written;
+}
+
+// --export-map <path>: write the loaded world, with its spawn and pickups, as a
+// run-length map document. This is how the procedural warehouse became
+// data/maps/warehouse_v1.map.vox.json; the fingerprints proved the round trip.
+static bool exportMapDocument(const sim::World& world, const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    // A generated world exports its section, so reloading the file regenerates
+    // the same terrain instead of baking it in as if it had been authored.
+    char buf[256];
+    f << "{\n";
+    f << "  \"format_version\": " << mapvox::kMaxFormatVersion
+      << ",\n  \"unit\": 1,\n  \"voxel_size\": 0.001,\n  \"mode\": \"map\",\n";
+    f << "  \"dims\": [" << WORLD_W << ", " << WORLD_H << ", " << WORLD_D << "],\n";
+    std::snprintf(buf, sizeof(buf),
+                  "  \"player_spawn\": {\"x\": %d, \"y\": %d, \"z\": %d, \"yaw\": %.4f, \"pitch\": %.4f},\n",
+                  g_spawnCellX, g_spawnCellY, g_spawnCellZ, g_yaw, g_pitch);
+    f << buf;
+    f << "  \"pickups\": [";
+    for (size_t i = 0; i < g_pickups.size(); ++i) {
+        const ItemDef* d = itemDefAt(g_itemDefs, g_pickups[i].defIndex);
+        std::snprintf(buf, sizeof(buf), "%s\n    {\"item\": \"%s\", \"x\": %d, \"y\": %d, \"z\": %d, \"rot\": %d}",
+                      i ? "," : "", d ? d->id.c_str() : "", g_pickups[i].cx, g_pickups[i].cy,
+                      g_pickups[i].cz, g_pickups[i].rot);
+        f << buf;
+    }
+    f << "\n  ],\n";
+    f << "  \"lights\": [";
+    for (size_t i = 0; i < g_mapLights.size(); ++i) {
+        const auto& l = g_mapLights[i];
+        std::snprintf(buf, sizeof(buf),
+                      "%s\n    {\"kind\": \"%s\", \"x\": %.4f, \"y\": %.4f, \"z\": %.4f, "
+                      "\"color\": [%.4f, %.4f, %.4f], \"intensity\": %.4f, \"radius\": %.4f}",
+                      i ? "," : "", l.kind.c_str(), l.x, l.y, l.z, l.r, l.g, l.b, l.intensity, l.radius);
+        f << buf;
+    }
+    f << "\n  ],\n";
+    // The moon bearing as the FILE wrote it, not as the renderer left it.
+    // g_moonDirWorld is normalized in place every frame by the sky pass, and the
+    // loader normalizes on the way in, so exporting that global wrote a value
+    // one rounding step away from the authored one: re-exporting a map drifted
+    // its moon_dir each time. View state is not map data, so the authored
+    // direction is kept here and only the renderer gets a normalized copy.
+    const mapvox::Environment& env = g_mapEnvironment;
+    std::snprintf(buf, sizeof(buf), "  \"environment\": {\"moon_dir\": [%.4f, %.4f, %.4f]},\n",
+                  env.moonDir[0], env.moonDir[1], env.moonDir[2]);
+    f << buf;
+    const std::string appearance = mapvox::worldAppearanceRle(world);
+    if (!appearance.empty()) f << "  \"appearance\": " << appearance << ",\n";
+    const std::string section = mapvox::terrainJson(g_mapTerrain);
+    if (!section.empty()) f << "  " << section << ",\n";
+    f << "  \"cells_rle\": " << mapvox::worldToRle(world) << "\n}\n";
+    return static_cast<bool>(f);
+}
+
 static void cleanup() {
     if (g_device) vkDeviceWaitIdle(g_device);
+    shutdownUi();
+    if (g_fixtureVB) {
+        vkUnmapMemory(g_device, g_fixtureMem);
+        vkDestroyBuffer(g_device, g_fixtureVB, nullptr);
+        vkFreeMemory(g_device, g_fixtureMem, nullptr);
+        g_fixtureVB = VK_NULL_HANDLE;
+        g_fixtureMem = VK_NULL_HANDLE;
+    }
+    if (g_captureBuf) {
+        vkUnmapMemory(g_device, g_captureMem);
+        vkDestroyBuffer(g_device, g_captureBuf, nullptr);
+        vkFreeMemory(g_device, g_captureMem, nullptr);
+        g_captureBuf = VK_NULL_HANDLE;
+        g_captureMem = VK_NULL_HANDLE;
+    }
     destroySwapchainObjects();
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, nullptr);
     if (g_overlayPipeline) vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
     if (g_pipelineLayout) vkDestroyPipelineLayout(g_device, g_pipelineLayout, nullptr);
-    if (g_renderPass) vkDestroyRenderPass(g_device, g_renderPass, nullptr);
+    g_post.destroy(); // owns the world render pass (g_renderPass)
+    g_renderPass = VK_NULL_HANDLE;
     if (g_overlayRenderPass) vkDestroyRenderPass(g_device, g_overlayRenderPass, nullptr);
     if (g_descPool) vkDestroyDescriptorPool(g_device, g_descPool, nullptr);
+    if (g_texSampler) vkDestroySampler(g_device, g_texSampler, nullptr);
+    if (g_occSampler) vkDestroySampler(g_device, g_occSampler, nullptr);
+    if (g_occView) vkDestroyImageView(g_device, g_occView, nullptr);
+    if (g_occImage) vkDestroyImage(g_device, g_occImage, nullptr);
+    if (g_occMem) vkFreeMemory(g_device, g_occMem, nullptr);
+    for (int i = 0; i < MAX_FRAMES; ++i) {
+        if (g_occStage[i]) vkDestroyBuffer(g_device, g_occStage[i], nullptr);
+        if (g_occStageMem[i]) vkFreeMemory(g_device, g_occStageMem[i], nullptr);
+        if (g_lightBuf[i]) vkDestroyBuffer(g_device, g_lightBuf[i], nullptr);
+        if (g_lightMem[i]) vkFreeMemory(g_device, g_lightMem[i], nullptr);
+    }
+    if (g_texView) vkDestroyImageView(g_device, g_texView, nullptr);
+    if (g_texImage) vkDestroyImage(g_device, g_texImage, nullptr);
+    if (g_texMem) vkFreeMemory(g_device, g_texMem, nullptr);
     if (g_dsl) vkDestroyDescriptorSetLayout(g_device, g_dsl, nullptr);
     for (int i = 0; i < MAX_FRAMES; ++i) {
         if (g_uboBuffers[i]) vkDestroyBuffer(g_device, g_uboBuffers[i], nullptr);
@@ -5817,6 +6933,46 @@ static SimInput buildSimInput() {
     return in;
 }
 
+// Fingerprint of the simulation's end state, for refactors that must not change
+// behaviour. It folds in every cell of the authoritative world, every debris
+// particle, live projectiles, the player body and health. The sim is fixed-step
+// and seeded by nothing, so two runs of the same build must agree, and a
+// behaviour-preserving refactor must reproduce the value exactly. Fields are
+// hashed one by one (never whole structs) so padding bytes cannot leak in.
+struct Fnv64 {
+    uint64_t h = 1469598103934665603ull;
+    void bytes(const void* p, size_t n) {
+        const auto* b = static_cast<const unsigned char*>(p);
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    }
+    template <class T> void add(const T& v) { bytes(&v, sizeof(v)); }
+};
+
+static uint64_t simFingerprint() {
+    Fnv64 f;
+    if (g_world)
+        for (const auto& c : g_world->chunks)
+            if (!c.voxels.empty()) f.bytes(c.voxels.data(), c.voxels.size() * sizeof(c.voxels[0]));
+    for (const auto& d : g_debris.particles) {
+        f.add(d.alive);
+        if (!d.alive) continue;
+        f.add(d.px); f.add(d.py); f.add(d.pz);
+        f.add(d.vx); f.add(d.vy); f.add(d.vz);
+        f.add(d.life); f.add(d.bounces);
+    }
+    f.add(g_debris.ricochets);
+    for (const auto& p : g_projectiles) {
+        f.add(p.px); f.add(p.py); f.add(p.pz);
+        f.add(p.vx); f.add(p.vy); f.add(p.vz);
+        f.add(p.energy); f.add(p.alive);
+    }
+    f.add(g_player.px); f.add(g_player.py); f.add(g_player.pz);
+    f.add(g_player.vx); f.add(g_player.vy); f.add(g_player.vz);
+    f.add(g_health.health); f.add(g_health.dead);
+    f.add(g_voxelsDestroyed);
+    return f.h;
+}
+
 static void simulateOnce(float dt, const SimInput& in) {
     // Health tick (RULES.md rule 15), ahead of input so a dead player is
     // frozen out of every control on the same frame.
@@ -5946,9 +7102,75 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         g_smoke = true; // reuse headless quit path
         g_smokeTicks = 600; // longer soak
     }
+    // --mesh-helpers N overrides the mesh pool size (0 = serial), so the pooled
+    // and serial mesher can be timed back to back on the same machine state.
+    {
+        // --capture <dir>: run the smoke, then write the fixed camera shots there.
+        const std::string flag = "--capture";
+        const size_t at = cmd.find(flag + " ");
+        if (at != std::string::npos) {
+            size_t b = at + flag.size() + 1;
+            while (b < cmd.size() && cmd[b] == ' ') ++b;
+            size_t e = b;
+            if (b < cmd.size() && cmd[b] == '"') { ++b; e = cmd.find('"', b); }
+            else e = cmd.find(' ', b);
+            g_captureDir = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+            g_smoke = true;
+        }
+    }
+    std::string exportMapPath; // --export-map <path>: write the world as a map and exit
+    {
+        const std::string flag = "--export-map ";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos) {
+            size_t b = at + flag.size();
+            while (b < cmd.size() && cmd[b] == ' ') ++b;
+            size_t e = b;
+            if (b < cmd.size() && cmd[b] == '"') { ++b; e = cmd.find('"', b); }
+            else e = cmd.find(' ', b);
+            exportMapPath = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+        }
+    }
+    int meshHelpersOverride = -1;
+    {
+        const std::string flag = "--mesh-helpers";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos)
+            meshHelpersOverride = std::clamp(std::atoi(cmd.c_str() + at + flag.size()), 0, 15);
+    }
+    // --map <path>: load this document instead of data/maps/warehouse_v1. Taken
+    // literally, with no search-beside-the-exe fallback, so a typo fails loudly
+    // instead of quietly running a different world.
+    {
+        const std::string flag = "--map ";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos) {
+            size_t b = at + flag.size();
+            while (b < cmd.size() && cmd[b] == ' ') ++b;
+            size_t e = b;
+            if (b < cmd.size() && cmd[b] == '"') { ++b; e = cmd.find('"', b); }
+            else e = cmd.find(' ', b);
+            g_mapOverridePath = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+        }
+    }
+    {
+        const std::string flag = "--mesh-helpers";
+        const size_t at = cmd.find(flag);
+        if (at != std::string::npos)
+            meshHelpersOverride = std::clamp(std::atoi(cmd.c_str() + at + flag.size()), 0, 15);
+    }
 
     try {
         g_exeDir = getExeDir();
+        // Visual settings: declare every parameter, then apply the saved file.
+        // Smoke/stress always run on defaults so their captures and timings
+        // do not depend on whatever a player last chose.
+        vis::registerEngineParams(g_visReg, g_vis);
+        if (!g_smoke) {
+            bool readable = false;
+            const std::string saved = jsonReadText(g_exeDir + "\\visual_settings.json", &readable);
+            if (readable) g_visReg.fromJson(saved);
+        }
         createWindow();
         createInstance();
         createSurface();
@@ -5960,6 +7182,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createOverlayRenderPass(); // must exist before createPipeline binds it
         createDepthResources();
         createFramebuffers();
+        g_post.createTargets(g_extent, g_vis.renderScale, g_swapViews);
         createDescriptors();
         if (!createPipeline()) {
             // Shader assets are missing; bail out cleanly instead of running a
@@ -5970,8 +7193,85 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             return 1;
         }
         createSync();
+        initUi();
 
-        sim::World world = buildWarehouseMap();
+        // The world comes from data/maps/warehouse_v1.map.vox.json (exported
+        // from the old procedural builder, with fingerprint parity, then the
+        // builder was deleted). --export-map re-saves whatever world loaded.
+        sim::World world;
+        {
+            mapvox::Doc mapDoc;
+            // --map <path> loads that document instead of the default, so a
+            // terrain world can be run without renaming it over warehouse_v1.
+            // A path is taken literally: no "search beside the exe" fallback,
+            // because silently loading a different world than the one named is
+            // exactly the kind of substitution a flag must not do.
+            std::vector<std::string> candidates;
+            if (g_mapOverridePath.empty()) {
+                candidates = {
+                    g_exeDir + "\\maps\\warehouse_v1.map.vox.json",
+                    g_exeDir + "\\..\\data\\maps\\warehouse_v1.map.vox.json",
+                    g_exeDir + "\\..\\..\\data\\maps\\warehouse_v1.map.vox.json",
+                };
+            } else {
+                candidates = {g_mapOverridePath};
+            }
+            bool loaded = false;
+            {
+                for (const auto& path : candidates) {
+                    if (!mapvox::loadMapVox(path, mapDoc)) {
+                        if (g_mapOverridePath.empty()) continue;
+                        fail("map not loaded: " + path + " (" + mapDoc.error + ")");
+                    }
+                    if (mapDoc.sx != WORLD_W || mapDoc.sy != WORLD_H || mapDoc.sz != WORLD_D)
+                        fail("map " + path + " does not match the world size");
+                    world = makeEmptyWorld();
+                    mapvox::stampMapVox(mapDoc, world, 0, 0, 0);
+                    // Prefab instances: data/prefabs/<id>.vox.json, stamped in
+                    // list order (a later prefab overwrites an earlier one).
+                    for (const auto& pf : mapDoc.prefabs) {
+                        if (!stampPrefabById(pf.id, world, pf.x, pf.y, pf.z, pf.rot))
+                            fail("map " + path + ": prefab \"" + pf.id + "\" not found or invalid");
+                        ++g_mapPrefabsStamped;
+                    }
+                    // Terrain, after the authored map and its prefabs: the
+                    // generator fills only Air, so it lands around structure
+                    // rather than through it, and the spawn below is placed
+                    // against the finished ground.
+                    g_mapTerrain = mapDoc.terrain;
+                    generateMapTerrain(world, g_mapTerrain);
+                    g_mapSpawn = mapDoc.spawn;
+                    g_mapPickups = mapDoc.pickups;
+                    g_mapLights = mapDoc.lights;
+                    g_bulbs.clear();
+                    for (const auto& ml : mapDoc.lights) {
+                        BulbLight l;
+                        l.pos = Vec3(ml.x * VOXEL_SIZE, ml.y * VOXEL_SIZE, ml.z * VOXEL_SIZE);
+                        l.color = Vec3(ml.r, ml.g, ml.b);
+                        l.intensity = ml.intensity;
+                        l.radius = ml.radius;
+                        g_bulbs.push_back(l);
+                    }
+                    if (mapDoc.environment.present) {
+                        // Keep the authored direction for export, and hand the
+                        // renderer its own normalized copy.
+                        g_mapEnvironment = mapDoc.environment;
+                        g_moonDirWorld = Vec3(mapDoc.environment.moonDir[0],
+                                              mapDoc.environment.moonDir[1],
+                                              mapDoc.environment.moonDir[2])
+                                             .normalized();
+                    }
+                    g_mapPath = path;
+                    loaded = true;
+                    break;
+                }
+            }
+            if (!loaded) {
+                if (g_mapOverridePath.empty())
+                    fail("map not found: data\\maps\\warehouse_v1.map.vox.json");
+                fail("map not loaded: " + g_mapOverridePath);
+            }
+        }
         g_world = &world;
         spawnPlayerOnMap(world);
 
@@ -5983,8 +7283,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                 for (int cx = 0; cx < CHUNKS_X; ++cx) {
                     ViewChunk& c = views[sim::World::chunkIndex(cx, cy, cz)];
                     c.cx = cx; c.cy = cy; c.cz = cz;
+                    c.palette = &g_viewPalette;
+                    c.texLayerPlus1 = g_texTable.layerPlus1;
                 }
         g_views = &views;
+        sendPalette(world, g_viewPalette);
 
         // Load Python-exported projectile + ammo defs (gravity + effects)
         const std::string projCandidates[] = {
@@ -6012,11 +7315,31 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         // on the apron in front of the player.
         seedPickups();
         ensurePickupBuffer();
+        buildFixtureMesh();
+
+        if (!exportMapPath.empty()) {
+            const bool ok = exportMapDocument(world, exportMapPath);
+            g_world = nullptr;
+            g_views = nullptr;
+            cleanup();
+            return ok ? 0 : 1;
+        }
 
         // Initial build: send every chunk's snapshot, mesh each one from that
         // snapshot, then lay out stable per-chunk slots so later impacts only
         // re-upload the chunk they damaged.
-        remeshStaleChunks(world, views);
+        // Mesh workers: helpers beside the main thread, capped so the pool never
+        // crowds out the OS on a small machine. They sleep between batches.
+        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned helpers = meshHelpersOverride >= 0
+            ? static_cast<unsigned>(meshHelpersOverride)
+            : (hw > 1 ? std::min(hw - 1, 3u) : 0u);
+        meshview::Workers meshWorkers(helpers);
+        g_meshWorkers = &meshWorkers;
+        g_meshWorkerHelpers = static_cast<int>(meshWorkers.helpers());
+        struct ClearMeshWorkers { ~ClearMeshWorkers() { g_meshWorkers = nullptr; } } clearMeshWorkers;
+
+        buildChunkMeshes(sendStaleSnapshots(world, views));
         repackChunkSlots(views);
         uint32_t slotTotal = 0;
         for (const auto& c : views) slotTotal += c.slotCapacity;
@@ -6059,10 +7382,34 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             if (wall > 0.25) wall = 0.25; // cap catch-up after a long stall
             g_tickAccum += wall;
 
+            // Smoke pause probe: pause for a stretch mid-run. No tick may run
+            // while paused, and the end state must still match an unpaused run
+            // (sim_fingerprint), which is what proves pause is view-only.
+            if (g_smoke && !g_stress) {
+                if (!g_smokePauseDone && !g_paused && g_tick >= 150) {
+                    setPaused(true);
+                    g_smokePauseTick = g_tick;
+                }
+                if (g_paused && ++g_smokePausedFrames >= 30) {
+                    // Ticks frozen, and the pause menu drew while paused.
+                    g_smokePauseFrozenOk = (g_tick == g_smokePauseTick) && g_uiFrames > 0;
+                    setPaused(false);
+                    g_smokePauseDone = true;
+                }
+            }
+            // Paused: the host schedules no ticks and banks no time to catch up.
+            if (g_paused) g_tickAccum = 0.0;
+
             int steps = 0;
-            while (g_tickAccum >= TICK_DT && steps < MAX_TICKS_PER_FRAME) {
+            // A smoke/stress run is exactly g_smokeTicks ticks however the
+            // frames fall: without this cap a slow last frame running two
+            // ticks overshot to 601, and the end state (and sim_fingerprint)
+            // depended on frame timing.
+            while (g_tickAccum >= TICK_DT && steps < MAX_TICKS_PER_FRAME &&
+                   !(g_smoke && g_tick >= g_smokeTicks)) {
                 g_tickAccum -= TICK_DT;
                 ++g_tick;
+                g_camPosPrevTick = g_camPos;
                 ++g_ticksSinceRemesh;
                 // One tick of intent, produced by whichever client is driving:
                 // the local window, the scripted smoke harness, or (later) a
@@ -6098,12 +7445,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             }
         }
 
+        // The simulation's end state, fingerprinted before anything else runs:
+        // capture shots stage view content and the self-tests poke player state.
+        const uint64_t simPrint = simFingerprint();
+
+        // Capture harness: the smoke ticks are done; pose and capture the shots.
+        int captureShots = 0;
+        if (!g_captureDir.empty() && g_running == false && g_tick >= g_smokeTicks) {
+            CreateDirectoryA(g_captureDir.c_str(), nullptr);
+            captureShots = runCaptureShots(static_cast<float>(g_tick) * static_cast<float>(TICK_DT));
+        }
+
         vkDeviceWaitIdle(g_device);
 
         // Write success marker for smoke / stress tests
         if (g_smoke) {
             const bool jsonxOk = jsonxSelfTest();
+            const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
+            const bool visualParamsOk = vis::selfTest();
+            // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
+            bool eyeInterpOk = false;
+            {
+                const Vec3 a(0.10f, 0.02f, 0.30f), b(0.1004f, 0.0203f, 0.2997f);
+                const Vec3 m = lerpEye(a, b, 0.5f), snapped = lerpEye(a, Vec3(0.5f, 0.02f, 0.3f), 0.25f);
+                const Vec3 e0 = lerpEye(a, b, 0.0f), e1 = lerpEye(a, b, 1.0f);
+                eyeInterpOk = e0.x == a.x && e0.y == a.y && e0.z == a.z &&
+                              std::fabs(e1.x - b.x) < 1e-7f && std::fabs(e1.y - b.y) < 1e-7f &&
+                              std::fabs(e1.z - b.z) < 1e-7f &&
+                              std::fabs(m.x - 0.1002f) < 1e-6f && snapped.x == 0.5f;
+            }
             g_simViewSmoke = runSimViewSmoke(world);
+            g_terrainSmoke = runTerrainSmoke();
             g_invSmoke = runInventorySmoke();
             g_healthSmoke = runHealthSmoke();
             g_moveSmoke = runMovementSmoke();
@@ -6111,10 +7483,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             std::string outPath = g_exeDir + (g_stress ? "\\stress_ok.txt" : "\\smoke_ok.txt");
             std::ofstream out(outPath);
 out << "ticks=" << g_tick << "\nframes=" << frames
+                << "\nsmoke_complete=" << (g_tick >= g_smokeTicks ? 1 : 0)
                 << "\nsim_hz=" << TICK_HZ
                 << "\nvertices=" << g_liveVertexCount
                 << "\nvertex_slots=" << g_vertexCount
+                << "\nsim_fingerprint=" << std::hex << simPrint << std::dec
+                << "\nmap_source=" << (g_mapPath.empty() ? std::string("procedural") : g_mapPath)
+                << "\nmap_prefabs_stamped=" << g_mapPrefabsStamped
                 << "\nmesh_repacks=" << g_meshRepackCount
+                << "\nmesh_relocations=" << g_meshRelocateCount
+                << "\nmesh_touched_avg=" << (g_meshUploadSamples > 0 ? double(g_meshTouchedSum) / g_meshUploadSamples : 0.0)
+                << "\nmesh_touched_max=" << g_meshTouchedMax
                 << "\ncam=" << g_camPos.x << "," << g_camPos.y << "," << g_camPos.z
                 << "\nplayer=" << g_player.px << "," << g_player.py << "," << g_player.pz
                 << "\non_ground=" << (g_player.onGround ? 1 : 0)
@@ -6165,12 +7544,20 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\ngravity=" << kWorldGravity
                 << "\nvoxels_destroyed=" << g_voxelsDestroyed
                 << "\nbulbs=" << g_bulbs.size()
+                << "\nmap_lights=" << g_mapLights.size()
+                << "\ntextures_loaded=" << g_texLayerCount
+                << "\nocc_chunk_uploads=" << g_occChunkUploads
+                << "\nshadow_volume_ready=" << (g_occImageReady ? 1 : 0)
+                << "\nmax_anisotropy=" << g_maxAnisotropy
+                << "\nfixture_verts=" << g_fixtureVertexCount
                 << "\nwater_touch=" << g_touchingWaterUnits << "/" << g_characterUnitCount
                 << "\ncurrent=" << (g_currentTriggered ? 1 : 0)
                 << "\nsubmerged=" << (g_fullySubmerged ? 1 : 0)
                 << "\nweight=" << g_playerWeight
                 << "\ncurrent_force=" << g_currentForce
-                << "\nrender_scale=" << RENDER_SCALE
+                << "\nrender_scale=" << g_post.scale
+                << "\nrender_target=" << g_post.extent.width << "x" << g_post.extent.height
+                << "\nwindow=" << g_extent.width << "x" << g_extent.height
                 << "\ndrawn_chunks=" << g_drawnChunks
                 << "\nculled_chunks=" << g_culledChunks
                 << "\nfisheye_visible_radius=" << fisheyeVisibleNdcRadius(kFisheyeStrengthWorld)
@@ -6186,7 +7573,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 // the avg/max microseconds a subsystem took per sample plus the
                 // sample count; section sums nest under avg_frame_ms because the
                 // frame is serial. Reading these is the input to the Phase 2 split.
-                << "\nsections=health,movement,fire,projectiles,debris_sim,wait,mesh,ubo,sky,debris_mesh,pickup,inventory,record";
+                << "\nsections=";
+            for (int i = 0; i < SEC_COUNT; ++i) out << (i ? "," : "") << kSectionName[i];
             out << std::fixed << std::setprecision(2);
             for (int i = 0; i < SEC_COUNT; ++i) {
                 out << "\nsec_" << kSectionName[i] << "_us_avg="
@@ -6326,6 +7714,23 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nskirt_isolation_ok=" << (g_simViewSmoke.skirtIsolationOk ? 1 : 0)
                 << "\nview_smoothing_ok=" << ((g_simViewSmoke.cornerAoOk && g_simViewSmoke.normalSmoothingOk) ? 1 : 0)
                 << "\nao_corners_ok=" << (g_simViewSmoke.cornerAoOk ? 1 : 0)
+                << "\nballistics_hitscan_breaks_ok=" << (ballisticsRep.hitscanBreaksSoft ? 1 : 0)
+                << "\nballistics_ricochet_keeps_cell_ok=" << (ballisticsRep.ricochetKeepsCell ? 1 : 0)
+                << "\nballistics_one_bullet_one_body_ok=" << (ballisticsRep.oneBulletOneBody ? 1 : 0)
+                << "\nballistics_projectile_breaks_ok=" << (ballisticsRep.projectileBreaks ? 1 : 0)
+                << "\nballistics_shooter_not_swept_ok=" << (ballisticsRep.shooterNotSwept ? 1 : 0)
+                << "\nballistics_ok=" << (ballisticsRep.ok() ? 1 : 0)
+                << "\nvisual_params_ok=" << (visualParamsOk ? 1 : 0)
+                << "\npause_probe_done=" << (g_smokePauseDone ? 1 : 0)
+                << "\npause_frames=" << g_smokePausedFrames
+                << "\npause_ticks_frozen_ok=" << (g_smokePauseFrozenOk ? 1 : 0)
+                << "\nmenu_frames=" << g_uiFrames
+                << "\neye_interp_ok=" << (eyeInterpOk ? 1 : 0)
+                << "\ncapture_shots=" << captureShots
+                << "\nmesh_workers_equiv_ok=" << (g_simViewSmoke.meshWorkersEquivOk ? 1 : 0)
+                << "\nmesh_workers_test_helpers=" << g_simViewSmoke.meshWorkersHelpers
+                << "\nmesh_workers_test_chunks=" << g_simViewSmoke.meshWorkersChunks
+                << "\nmesh_workers_live_helpers=" << g_meshWorkerHelpers
                 // MAP-mode loader (Phase 2b): fixture parse + field fidelity +
                 // counter restore + unit-cube stamp, all in one gate.
                 << "\nmap_file_found=" << (g_mapSmoke.fileFound ? 1 : 0)
@@ -6346,11 +7751,62 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nmap_counters_restored_ok=" << (g_mapSmoke.countersRestoredOk ? 1 : 0)
                 << "\nmap_material_drop_ok=" << (g_mapSmoke.materialDropOk ? 1 : 0)
                 << "\nmap_stamp_ok=" << (g_mapSmoke.stampOk ? 1 : 0)
+                << "\nmap_appearance_ok=" << (g_mapSmoke.appearanceOk ? 1 : 0)
+                << "\nmap_prefab_ok=" << (g_mapSmoke.prefabOk ? 1 : 0)
                 << "\nmap_stamp_written=" << g_mapSmoke.stampWritten
                 << "\nmap_stamp_skipped=" << g_mapSmoke.stampSkipped
                 << "\nmap_refusal_version_ok=" << (g_mapSmoke.refusalVersionOk ? 1 : 0)
                 << "\nmap_refusal_unit_ok=" << (g_mapSmoke.refusalUnitOk ? 1 : 0)
                 << "\nmap_refusal_voxel_size_ok=" << (g_mapSmoke.refusalVoxelSizeOk ? 1 : 0)
+                << "\nterrain_live_present=" << (g_mapTerrain.present ? 1 : 0)
+                << "\nterrain_live_class=" << (g_mapTerrain.present ? g_mapTerrain.family : std::string("none"))
+                << "\nterrain_live_seed=" << g_mapTerrain.seed
+                << "\nterrain_live_columns=" << g_terrainReport.columns
+                << "\nterrain_live_cells=" << g_terrainReport.cells
+                << "\nterrain_live_road_cells=" << g_terrainReport.roadCells
+                << "\nterrain_live_regions=" << g_terrainReport.regions
+                << "\nterrain_live_road_nodes=" << g_terrainReport.roadNodes
+                << "\nterrain_live_road_level=" << g_terrainReport.roadLevelY
+                << "\nterrain_live_height_min=" << g_terrainReport.heightMin
+                << "\nterrain_live_height_max=" << g_terrainReport.heightMax
+                << "\nterrain_live_props=" << g_terrainReport.props
+                << "\nterrain_live_authored_skipped=" << g_terrainReport.authoredSkipped
+                << "\nterrain_live_props_missing=" << g_terrainReport.propsMissing
+                << "\nterrain_golden=" << std::hex << g_terrainSmoke.golden << std::dec
+                << "\nterrain_gate_regions=" << g_terrainSmoke.regions
+                << "\nterrain_gate_road_nodes=" << g_terrainSmoke.roadNodes
+                << "\nterrain_gate_road_level=" << g_terrainSmoke.roadLevelY
+                << "\nterrain_gate_height_min=" << g_terrainSmoke.heightMin
+                << "\nterrain_gate_height_max=" << g_terrainSmoke.heightMax
+                << "\nterrain_determinism_ok=" << (g_terrainSmoke.determinismOk ? 1 : 0)
+                << "\nterrain_seed_sensitive_ok=" << (g_terrainSmoke.seedSensitiveOk ? 1 : 0)
+                << "\nterrain_class_sensitive_ok=" << (g_terrainSmoke.classSensitiveOk ? 1 : 0)
+                << "\nterrain_class_ok=" << (g_terrainSmoke.classOk ? 1 : 0)
+                << "\nterrain_surface_ok=" << (g_terrainSmoke.surfaceOk ? 1 : 0)
+                << "\nterrain_slope_ok=" << (g_terrainSmoke.slopeOk ? 1 : 0)
+                << "\nterrain_road_ok=" << (g_terrainSmoke.roadOk ? 1 : 0)
+                << "\nterrain_road_shaped=" << g_terrainSmoke.roadShaped
+                << "\nterrain_road_spans=" << g_terrainSmoke.roadSpans
+                << "\nterrain_road_flat=" << g_terrainSmoke.roadFlat
+                << "\nterrain_road_rot=" << g_terrainSmoke.roadRot
+                << "\nterrain_road_alt_ok=" << (g_terrainSmoke.roadAltOk ? 1 : 0)
+                << "\nterrain_road_alt_probed=" << g_terrainSmoke.roadAltProbed
+                << "\nterrain_road_alt_surface=" << g_terrainSmoke.roadAltSurface
+                << "\nterrain_road_alt_solid_under=" << g_terrainSmoke.roadAltSolidUnder
+                << "\nterrain_prefab_shapes_ok=" << (g_terrainSmoke.prefabShapesOk ? 1 : 0)
+                << "\nterrain_nondestructive_ok=" << (g_terrainSmoke.nonDestructiveOk ? 1 : 0)
+                << "\nterrain_refusal_class_ok=" << (g_terrainSmoke.refusalClassOk ? 1 : 0)
+                << "\nterrain_refusal_seed_ok=" << (g_terrainSmoke.refusalSeedOk ? 1 : 0)
+                << "\nterrain_roundtrip_ok=" << (g_terrainSmoke.roundTripOk ? 1 : 0)
+                << "\nterrain_absent_ok=" << (g_terrainSmoke.absentOk ? 1 : 0)
+                << "\nterrain_damage_ok=" << (g_terrainSmoke.damageOk ? 1 : 0)
+                << "\nterrain_slab_intact=" << g_terrainSmoke.slabIntact
+                << "\nterrain_slab_expected=" << g_terrainSmoke.slabExpected
+                << "\nterrain_slab_skipped=" << g_terrainSmoke.slabSkipped
+                << "\nterrain_slab_prefab_declined=" << g_terrainSmoke.slabPrefabDeclined
+                << "\nterrain_prefab_spares_authored_ok="
+                << (g_terrainSmoke.prefabSparesAuthoredOk ? 1 : 0)
+                << "\nterrain_ok=" << (g_terrainSmoke.ok() ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -6359,7 +7815,8 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                      g_mapSmoke.voxels == 1024 && g_mapSmoke.dropped == 0 &&
                      g_mapSmoke.eventFieldOk && g_mapSmoke.npcFieldOk &&
                      g_mapSmoke.routeFieldOk && g_mapSmoke.countersRestoredOk &&
-                     g_mapSmoke.materialDropOk && g_mapSmoke.stampOk &&
+                     g_mapSmoke.materialDropOk && g_mapSmoke.stampOk && g_mapSmoke.appearanceOk &&
+                     g_mapSmoke.prefabOk &&
                      g_mapSmoke.refusalVersionOk && g_mapSmoke.refusalUnitOk &&
                      g_mapSmoke.refusalVoxelSizeOk)
                         ? 1
@@ -6408,6 +7865,19 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 if (!moveAllOk) { cleanup(); return 2; }
             }
             if (!jsonxOk) { cleanup(); return 3; }
+            // A run cut short (Esc, window closed) still writes its report, and
+            // every count in it is then too small but self-consistent. Refuse it
+            // rather than let an interrupted smoke read as a pass.
+            if (g_tick < g_smokeTicks) { cleanup(); return 7; }
+            // Pooled meshing must be indistinguishable from serial meshing.
+            if (!g_simViewSmoke.meshWorkersEquivOk) { cleanup(); return 5; }
+            // The ballistics module's own contract, independent of the map.
+            if (!ballisticsRep.ok()) { cleanup(); return 6; }
+            // Visual parameter registry: presets, save/load round trip, clamping.
+            if (!visualParamsOk) { cleanup(); return 9; }
+            // View-side pause and camera: pause froze the ticks, interpolation holds.
+            const bool pauseOk = g_stress || (g_smokePauseDone && g_smokePauseFrozenOk);
+            if (!pauseOk || !eyeInterpOk) { cleanup(); return 8; }
             // MAP loader gate (Phase 2b): the painter-exported fixture must
             // parse, restore counters, and stamp as unit cubes, and refusals
             // must refuse. Exit 4 lets CI triage the map contract separately.
@@ -6418,14 +7888,31 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 g_mapSmoke.dropped != 0 || !g_mapSmoke.eventFieldOk ||
                 !g_mapSmoke.npcFieldOk || !g_mapSmoke.routeFieldOk ||
                 !g_mapSmoke.countersRestoredOk || !g_mapSmoke.materialDropOk ||
-                !g_mapSmoke.stampOk || !g_mapSmoke.refusalVersionOk ||
+                !g_mapSmoke.stampOk || !g_mapSmoke.appearanceOk || !g_mapSmoke.prefabOk ||
+                !g_mapSmoke.refusalVersionOk ||
                 !g_mapSmoke.refusalUnitOk || !g_mapSmoke.refusalVoxelSizeOk) {
                 cleanup();
                 return 4;
             }
+            // Terrain generation contract (Phase 8): same seed same world, a
+            // changed seed a changed world, no cliffs, a connected road network,
+            // authored structure untouched, and refusals that refuse. Exit 10
+            // keeps this triageable on its own, and it is checked on scratch
+            // worlds, so it cannot make the map fingerprints move.
+            if (!g_terrainSmoke.ok()) { cleanup(); return 10; }
         }
     } catch (const std::exception& e) {
-        MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);
+        // Every automated run here is headless -- smoke, stress, capture, export --
+        // so a MessageBox is a message nobody can read: the process just exits 1
+        // with an empty log and the real reason is lost. That is how a broken
+        // launcher gate can sit there looking fine. Always echo the reason, and
+        // only pop the box for an interactive run.
+        std::fputs(e.what(), stderr);
+        std::fputc('\n', stderr);
+        std::fflush(stderr);
+        if (!g_smoke && !g_captureActive && exportMapPath.empty()) {
+            MessageBoxA(nullptr, e.what(), "Voxel Engine Error", MB_ICONERROR);
+        }
         cleanup();
         return 1;
     }

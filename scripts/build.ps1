@@ -26,20 +26,51 @@ if ($LASTEXITCODE -ne 0) { throw "check_constants.py failed: $LASTEXITCODE" }
 Write-Host "== export projectiles/materials (Python) ==" -ForegroundColor Cyan
 & python (Join-Path $Root "python\export_projectiles.py")
 if ($LASTEXITCODE -ne 0) { throw "export_projectiles.py failed: $LASTEXITCODE" }
+# Textures: licence/provenance check (CC0, photographic, every file listed)
+# and packing into build/textures.bin. A failed check fails the build.
+& python (Join-Path $Root "scripts\build_textures.py")
+if ($LASTEXITCODE -ne 0) { throw "build_textures.py failed: $LASTEXITCODE" }
 
 Write-Host "== compile shaders ==" -ForegroundColor Cyan
 $glslc = Join-Path $VK "Bin\glslc.exe"
 if (-not (Test-Path $glslc)) { throw "glslc missing: $glslc" }
-& $glslc (Join-Path $Root "shaders\voxel.vert") -o (Join-Path $Build "shaders\voxel.vert.spv")
-& $glslc (Join-Path $Root "shaders\voxel.frag") -o (Join-Path $Build "shaders\voxel.frag.spv")
+# A failed compile must fail the build: otherwise the previous .spv stays in
+# build/shaders and the engine silently runs the old shader.
+function Compile-Shader([string]$Name) {
+  & $glslc (Join-Path $Root "shaders\$Name") -o (Join-Path $Build "shaders\$Name.spv")
+  if ($LASTEXITCODE -ne 0) { throw "glslc failed for $Name ($LASTEXITCODE)" }
+}
+Compile-Shader "voxel.vert"
+Compile-Shader "voxel.frag"
 if (Test-Path (Join-Path $Root "shaders\post.vert")) {
-  & $glslc (Join-Path $Root "shaders\post.vert") -o (Join-Path $Build "shaders\post.vert.spv")
-  & $glslc (Join-Path $Root "shaders\post.frag") -o (Join-Path $Build "shaders\post.frag.spv")
+  Compile-Shader "post.vert"
+  Compile-Shader "post.frag"
 }
 
 Write-Host "== compile engine (Clang + VS env) ==" -ForegroundColor Cyan
 if (-not (Test-Path $VCVARS)) { throw "vcvars64.bat missing: $VCVARS" }
 if (-not (Test-Path (Join-Path $LLVM "clang++.exe"))) { throw "clang++ missing under $LLVM" }
+
+# Dear ImGui (third_party/imgui, MIT) is compiled once into build/imgui/*.o and
+# only recompiled when a source is newer than its object, so the engine build
+# does not pay for ~2 MB of third-party source every time.
+$ImguiDir = Join-Path $Root "third_party\imgui"
+$ImguiObjDir = Join-Path $Build "imgui"
+New-Item -ItemType Directory -Force -Path $ImguiObjDir | Out-Null
+$imguiSources = @("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp",
+                  "backends\imgui_impl_vulkan.cpp", "backends\imgui_impl_win32.cpp")
+$imguiCompile = @()
+$imguiObjects = @()
+foreach ($rel in $imguiSources) {
+  $srcFile = Join-Path $ImguiDir $rel
+  $objFile = Join-Path $ImguiObjDir ([IO.Path]::GetFileNameWithoutExtension($rel) + ".o")
+  $imguiObjects += "`"$objFile`""
+  if (-not (Test-Path $objFile) -or (Get-Item $srcFile).LastWriteTime -gt (Get-Item $objFile).LastWriteTime) {
+    $imguiCompile += "clang++.exe -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS -I`"$ImguiDir`" -I`"$VK\Include`" -c `"$srcFile`" -o `"$objFile`" || exit /b 1"
+  }
+}
+$imguiCompileLines = $imguiCompile -join "`r`n"
+$imguiObjectList = $imguiObjects -join " "
 
 $bat = @"
 @echo off
@@ -48,7 +79,8 @@ REM warning on stderr when it is absent. That must not abort the build, so
 REM both streams are discarded and the real clang exit code is what counts.
 call "$VCVARS" >nul 2>&1
 set "PATH=$LLVM;%PATH%"
-clang++.exe -std=c++17 -O2 -g -D_CRT_SECURE_NO_WARNINGS -I"$Src" -I"$VK\Include" "$Src\main.cpp" -o "$Build\voxel_engine.exe" -L"$VK\Lib" -lvulkan-1 -luser32 -lgdi32 -lshell32
+$imguiCompileLines
+clang++.exe -std=c++17 -O2 -g -D_CRT_SECURE_NO_WARNINGS -I"$Src" -I"$ImguiDir" -I"$VK\Include" "$Src\main.cpp" $imguiObjectList -o "$Build\voxel_engine.exe" -L"$VK\Lib" -lvulkan-1 -luser32 -lgdi32 -lshell32 -ldwmapi
 echo CLANG_EXIT=%ERRORLEVEL%
 exit /b %ERRORLEVEL%
 "@
@@ -81,6 +113,18 @@ $weaponsDst = Join-Path $Build "weapons"
 if (Test-Path $weaponsSrc) {
   New-Item -ItemType Directory -Force -Path $weaponsDst | Out-Null
   Copy-Item (Join-Path $weaponsSrc "*") $weaponsDst -Force -Recurse
+}
+# Terrain road + decoration prefabs (generated: scripts/build_terrain_prefabs.py).
+# The engine's terrain gate reads these back to check each tile presents the
+# sides its kind claims, so a stale copy here is a gate that passes on last
+# week's roads.
+$prefabsSrc = Join-Path $Root "data\prefabs"
+$prefabsDst = Join-Path $Build "prefabs"
+if (Test-Path $prefabsSrc) {
+  New-Item -ItemType Directory -Force -Path $prefabsDst | Out-Null
+  Copy-Item (Join-Path $prefabsSrc "*") $prefabsDst -Force -Recurse
+} elseif (Test-Path $prefabsDst) {
+  Remove-Item $prefabsDst -Recurse -Force
 }
 # Inventory item defs (RULES.md rule 12: unit=1, voxel_size=0.001)
 $itemsSrc = Join-Path $Root "data\items"

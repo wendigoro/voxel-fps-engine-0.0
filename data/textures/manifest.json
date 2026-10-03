@@ -1,0 +1,145 @@
+[
+  {
+    "key": "concrete",
+    "file": "concrete.jpg",
+    "source": "Poly Haven",
+    "asset_id": "brushed_concrete",
+    "source_url": "https://polyhaven.com/a/brushed_concrete",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brushed_concrete/brushed_concrete_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Dario Barresi",
+      "Dimitrios Savva"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "sheet_metal",
+    "file": "sheet_metal.jpg",
+    "source": "Poly Haven",
+    "asset_id": "corrugated_iron",
+    "source_url": "https://polyhaven.com/a/corrugated_iron",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/corrugated_iron/corrugated_iron_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Dimitrios Savva",
+      "Jenelle van Heerden"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "girder",
+    "file": "girder.jpg",
+    "source": "Poly Haven",
+    "asset_id": "rust_coarse_01",
+    "source_url": "https://polyhaven.com/a/rust_coarse_01",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rust_coarse_01/rust_coarse_01_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Dimitrios Savva",
+      "Rico Cilliers"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "wood",
+    "file": "wood.jpg",
+    "source": "Poly Haven",
+    "asset_id": "brown_planks_05",
+    "source_url": "https://polyhaven.com/a/brown_planks_05",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_planks_05/brown_planks_05_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Rob Tuytel"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "wood_dark",
+    "file": "wood_dark.jpg",
+    "source": "Poly Haven",
+    "asset_id": "dark_planks",
+    "source_url": "https://polyhaven.com/a/dark_planks",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/dark_planks/dark_planks_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Rob Tuytel"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "dirt",
+    "file": "dirt.jpg",
+    "source": "Poly Haven",
+    "asset_id": "dirt",
+    "source_url": "https://polyhaven.com/a/dirt",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/dirt/dirt_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Charlotte Baglioni"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "sand",
+    "file": "sand.jpg",
+    "source": "Poly Haven",
+    "asset_id": "coast_sand_01",
+    "source_url": "https://polyhaven.com/a/coast_sand_01",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/coast_sand_01/coast_sand_01_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Rob Tuytel"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "grass",
+    "file": "grass.jpg",
+    "source": "Poly Haven",
+    "asset_id": "sparse_grass",
+    "source_url": "https://polyhaven.com/a/sparse_grass",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/sparse_grass/sparse_grass_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Amal Kumar"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "snow",
+    "file": "snow.jpg",
+    "source": "Poly Haven",
+    "asset_id": "snow_02",
+    "source_url": "https://polyhaven.com/a/snow_02",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/snow_02/snow_02_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Rob Tuytel"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  },
+  {
+    "key": "asphalt",
+    "file": "asphalt.jpg",
+    "source": "Poly Haven",
+    "asset_id": "asphalt_02",
+    "source_url": "https://polyhaven.com/a/asphalt_02",
+    "download_url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/asphalt_02/asphalt_02_diff_1k.jpg",
+    "license": "CC0-1.0",
+    "authors": [
+      "Rob Tuytel"
+    ],
+    "creation_method": "photoscanned (Poly Haven: no generative AI)",
+    "fetched": "2026-10-01"
+  }
+]

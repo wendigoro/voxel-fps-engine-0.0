@@ -21,7 +21,13 @@ public final class MaterialPalette {
     public static final int PLEXIGLASS = 9;
     public static final int CARBON_FIBER = 10;
     public static final int TREATED_WOOD = 11;
-    public static final int CUSTOM = 12;
+    /** Ground materials: generated terrain and painted ground. */
+    public static final int SAND = 12;
+    public static final int GRASS = 13;
+    public static final int SNOW = 14;
+    public static final int ASPHALT = 15;
+    /** Painter-only id, always one past the engine table (see check_constants.py). */
+    public static final int CUSTOM = 16;
 
     public static final class Entry {
         public final int id;
@@ -48,6 +54,10 @@ public final class MaterialPalette {
         list.add(new Entry(PLEXIGLASS, "plexiglass", 0xA8D4E8));
         list.add(new Entry(CARBON_FIBER, "carbon_fiber", 0x1A1A1E));
         list.add(new Entry(TREATED_WOOD, "treated_wood", 0x6B4423));
+        list.add(new Entry(SAND, "sand", 0xC2AD7B));
+        list.add(new Entry(GRASS, "grass", 0x3D6B29));
+        list.add(new Entry(SNOW, "snow", 0xDBE3EE));
+        list.add(new Entry(ASPHALT, "asphalt", 0x33333A));
         list.add(new Entry(CUSTOM, "custom", 0xFFFFFF));
         ENTRIES = Collections.unmodifiableList(list);
         Map<String, Integer> map = new LinkedHashMap<>();
@@ -77,6 +87,7 @@ public final class MaterialPalette {
             case BUSH_LEAVES -> 0.15f; case BUSH_BRANCH -> 0.55f;
             case SHEET_METAL -> 7.80f; case GIRDER -> 7.85f; case WATER -> 1.00f;
             case PLEXIGLASS -> 1.20f; case CARBON_FIBER -> 1.75f; case TREATED_WOOD -> 0.75f;
+            case SAND -> 1.60f; case GRASS -> 0.50f; case SNOW -> 0.30f; case ASPHALT -> 2.30f;
             default -> 0.001f;
         };
     }
@@ -86,6 +97,7 @@ public final class MaterialPalette {
             case BUSH_LEAVES -> 0.35f; case BUSH_BRANCH -> 0.80f;
             case SHEET_METAL -> 0.55f; case GIRDER -> 1.40f; case WATER -> 1.00f;
             case PLEXIGLASS -> 0.40f; case CARBON_FIBER -> 0.45f; case TREATED_WOOD -> 0.95f;
+            case SAND -> 1.60f; case GRASS -> 0.70f; case SNOW -> 0.40f; case ASPHALT -> 1.30f;
             default -> 0.001f;
         };
     }

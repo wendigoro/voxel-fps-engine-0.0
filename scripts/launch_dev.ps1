@@ -14,12 +14,13 @@
   SmokePainter  - scripts/smoke_painter.ps1 (-> build_painter.ps1)
   SmokeAll      - painter smoke then engine smoke
   Stress        - scripts/stress_engine.ps1 (latency gate)
+  Terrain       - scripts/check_terrain.ps1 (chunk class + road gate)
   Ui            - scripts/run_painter_ui.ps1 if present, else Painter
   Help          - print usage
   (empty)       - interactive menu
 #>
 param(
-  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokeMovement", "SmokePainter", "SmokeAll", "Stress", "Ui", "Help", "")]
+  [ValidateSet("Build", "Painter", "Engine", "SmokeEngine", "SmokeMovement", "SmokePainter", "SmokeAll", "Stress", "Terrain", "Ui", "Help", "")]
   [string]$Action = "",
 
   [Parameter(ValueFromRemainingArguments = $true)]
@@ -58,7 +59,7 @@ function Invoke-RepoScript {
 
 function Show-Help {
   Write-Host @"
-launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokeMovement|SmokePainter|SmokeAll|Stress|Ui|Help>
+launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokeMovement|SmokePainter|SmokeAll|Stress|Terrain|Ui|Help>
   Build         - engine build.ps1
   Painter       - build_painter.ps1 (core smoke)
   Engine        - run.ps1 interactive
@@ -67,6 +68,7 @@ launch_dev.ps1 -Action <Build|Painter|Engine|SmokeEngine|SmokeMovement|SmokePain
   SmokePainter  - smoke_painter.ps1 / build_painter.ps1
   SmokeAll      - painter + movement + engine smokes
   Stress        - stress_engine.ps1 (latency gate: frame ms + debris upload us)
+  Terrain       - check_terrain.ps1 (chunk class + road + round-trip gate)
   Ui            - run_painter_ui.ps1 if present else Painter
   Help          - this text
 
@@ -84,7 +86,8 @@ function Show-Menu {
   Write-Host " 5  SmokePainter   smoke_painter.ps1"
   Write-Host " 6  SmokeAll       painter + movement + engine smokes"
   Write-Host " 7  Stress         stress_engine.ps1 (latency gate)"
-  Write-Host " 8  Ui             run_painter_ui.ps1 (or Painter)"
+  Write-Host " 8  Terrain        check_terrain.ps1 (chunk class + road gate)"
+  Write-Host " 9  Ui             run_painter_ui.ps1 (or Painter)"
   Write-Host " h  Help"
   Write-Host " q  Quit"
   Write-Host "------------------------------------"
@@ -98,7 +101,8 @@ function Show-Menu {
     "^5$" { return "SmokePainter" }
     "^6$" { return "SmokeAll" }
     "^7$" { return "Stress" }
-    "^8$" { return "Ui" }
+    "^9$" { return "Ui" }
+    "^8$" { return "Terrain" }
     "^[hH]$" { return "Help" }
     "^[qQ]$" { return "Quit" }
     default {
@@ -150,11 +154,17 @@ function Invoke-Action {
       # Structural sim/view check: a view TU must not reach the sim grid.
       $v = Invoke-RepoScript -Name "check_view_isolation.ps1"
       if ($v -ne 0) { return $v }
+      # Chunk classes, roads and the map round trip.
+      $t = Invoke-RepoScript -Name "check_terrain.ps1"
+      if ($t -ne 0) { return $t }
       Write-Host "SMOKE_ALL_OK" -ForegroundColor Green
       return 0
     }
     "Stress" {
       return Invoke-RepoScript -Name "stress_engine.ps1"
+    }
+    "Terrain" {
+      return Invoke-RepoScript -Name "check_terrain.ps1"
     }
     "Ui" {
       $ui = Join-Path $Scripts "run_painter_ui.ps1"
