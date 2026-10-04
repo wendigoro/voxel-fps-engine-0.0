@@ -268,7 +268,9 @@ struct QueueFamilyIndices {
 
 // ---- globals / app state ----
 static HINSTANCE g_hInstance;
-static HWND g_hwnd;
+static HWND g_hMainWindow = nullptr;
+static HWND g_hViewportWnd = nullptr;
+static HWND g_hwnd = nullptr; // Aliased to g_hViewportWnd for viewport operations
 static bool g_running = true;
 static bool g_resized = false;
 static int g_width = WIDTH;
@@ -1966,17 +1968,20 @@ static void updateWindowTitle() {
     if (g_paused) t += "  —  PAUSED: Esc to resume, Shift+Esc quits";
     else if (g_cursorLocked) t += "  —  Esc pause";
     else t += "  —  click to look, Esc pause";
-    SetWindowTextA(g_hwnd, t.c_str());
+    HWND target = g_hMainWindow ? g_hMainWindow : g_hwnd;
+    if (target) SetWindowTextA(target, t.c_str());
 }
 
 // Confine the cursor to the client area. Re-run whenever the window moves or
 // resizes while locked, since the clip rect is in screen coordinates.
 static void clipCursorToClient() {
+    HWND target = g_hViewportWnd ? g_hViewportWnd : g_hwnd;
+    if (!target) return;
     RECT rc;
-    GetClientRect(g_hwnd, &rc);
+    GetClientRect(target, &rc);
     POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
-    ClientToScreen(g_hwnd, &tl);
-    ClientToScreen(g_hwnd, &br);
+    ClientToScreen(target, &tl);
+    ClientToScreen(target, &br);
     const RECT screen{tl.x, tl.y, br.x, br.y};
     ClipCursor(&screen);
 }
@@ -2009,17 +2014,10 @@ static void setPaused(bool paused) {
     updateWindowTitle();
 }
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // The menu sees every message first (it tracks the mouse even when closed).
     if (g_uiReady && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return true;
     switch (msg) {
-    case WM_CLOSE:
-        g_running = false;
-        PostQuitMessage(0);
-        return 0;
-    case WM_DESTROY:
-        g_running = false;
-        return 0;
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
             g_width = std::max(1, static_cast<int>(LOWORD(lParam)));
@@ -2117,6 +2115,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == 'F') g_pendingInput.fireHeld = false;
         return 0;
     case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
         // While paused, clicks belong to the menu. A click while unlocked only
         // locks the mouse; it is not also read as a look drag or a pick.
         if (g_paused) return 0;
@@ -2180,35 +2179,98 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 }
 
+static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CLOSE:
+        g_running = false;
+        PostQuitMessage(0);
+        return 0;
+    case WM_DESTROY:
+        g_running = false;
+        return 0;
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED && g_hViewportWnd) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            SetWindowPos(g_hViewportWnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    case WM_SETFOCUS:
+        if (g_hViewportWnd) SetFocus(g_hViewportWnd);
+        return 0;
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+        if (g_hViewportWnd) {
+            SendMessageA(g_hViewportWnd, msg, wParam, lParam);
+            return 0;
+        }
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
 static void createWindow() {
     g_hInstance = GetModuleHandleA(nullptr);
-    WNDCLASSEXA wc{};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = g_hInstance;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = "VoxelVulkanEngine";
-    if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-        fail("RegisterClassEx failed");
+
+    // Register top-level main window class
+    WNDCLASSEXA wcMain{};
+    wcMain.cbSize = sizeof(wcMain);
+    wcMain.style = CS_HREDRAW | CS_VREDRAW;
+    wcMain.lpfnWndProc = MainWndProc;
+    wcMain.hInstance = g_hInstance;
+    wcMain.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcMain.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcMain.lpszClassName = "VoxelAppMainWindow";
+    if (!RegisterClassExA(&wcMain) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        fail("RegisterClassEx for main window failed");
+
+    // Register child viewport window class
+    WNDCLASSEXA wcView{};
+    wcView.cbSize = sizeof(wcView);
+    wcView.style = CS_HREDRAW | CS_VREDRAW;
+    wcView.lpfnWndProc = ViewportWndProc;
+    wcView.hInstance = g_hInstance;
+    wcView.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcView.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wcView.lpszClassName = "VoxelAppViewport";
+    if (!RegisterClassExA(&wcView) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        fail("RegisterClassEx for viewport failed");
 
     RECT r{0, 0, WIDTH, HEIGHT};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hwnd = CreateWindowExA(
-        0, wc.lpszClassName,
-"Voxel FPS 0.0",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_hMainWindow = CreateWindowExA(
+        0, wcMain.lpszClassName,
+        "Voxel FPS 0.0",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
-    if (!g_hwnd) fail("CreateWindowEx failed");
+    if (!g_hMainWindow) fail("CreateWindowEx for main window failed");
+
+    RECT clientRc{};
+    GetClientRect(g_hMainWindow, &clientRc);
+    int clientW = clientRc.right - clientRc.left;
+    int clientH = clientRc.bottom - clientRc.top;
+
+    g_hViewportWnd = CreateWindowExA(
+        0, wcView.lpszClassName,
+        nullptr,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+        0, 0, clientW, clientH,
+        g_hMainWindow, nullptr, g_hInstance, nullptr);
+    if (!g_hViewportWnd) fail("CreateWindowEx for viewport child failed");
+
+    g_hwnd = g_hViewportWnd; // Maintain g_hwnd as viewport handle for backward compatibility
+    SetFocus(g_hViewportWnd);
     updateWindowTitle();
+
     // Raw mouse input for locked look (HID generic desktop page, mouse usage).
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01;
     rid.usUsage = 0x02;
     rid.dwFlags = 0;
-    rid.hwndTarget = g_hwnd;
+    rid.hwndTarget = g_hViewportWnd;
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
 }
 
@@ -2332,7 +2394,7 @@ static void createInstance() {
 
 static void createSurface() {
     VkWin32SurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-    ci.hwnd = g_hwnd;
+    ci.hwnd = g_hViewportWnd ? g_hViewportWnd : g_hwnd;
     ci.hinstance = g_hInstance;
     if (vkCreateWin32SurfaceKHR(g_instance, &ci, nullptr, &g_surface) != VK_SUCCESS)
         fail("vkCreateWin32SurfaceKHR failed");
@@ -5595,7 +5657,7 @@ static void initUi() {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; // window layout is not persisted; settings are
     ImGui::StyleColorsDark();
-    ImGui_ImplWin32_Init(g_hwnd);
+    ImGui_ImplWin32_Init(g_hViewportWnd ? g_hViewportWnd : g_hwnd);
     ImGui_ImplVulkan_InitInfo ii{};
     ii.ApiVersion = VK_API_VERSION_1_2;
     ii.Instance = g_instance;
@@ -6985,7 +7047,11 @@ if (g_skyTileVB) {
     g_debugMessenger = VK_NULL_HANDLE;
     if (g_surface) vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
     if (g_instance) vkDestroyInstance(g_instance, nullptr);
-    if (g_hwnd) DestroyWindow(g_hwnd);
+    if (g_hViewportWnd) DestroyWindow(g_hViewportWnd);
+    if (g_hMainWindow) DestroyWindow(g_hMainWindow);
+    g_hViewportWnd = nullptr;
+    g_hMainWindow = nullptr;
+    g_hwnd = nullptr;
     g_pipeline = VK_NULL_HANDLE;
     g_overlayPipeline = VK_NULL_HANDLE;
     g_charPipeline = VK_NULL_HANDLE;
@@ -7000,7 +7066,6 @@ if (g_skyTileVB) {
     g_device = VK_NULL_HANDLE;
     g_surface = VK_NULL_HANDLE;
     g_instance = VK_NULL_HANDLE;
-    g_hwnd = nullptr;
     g_cmdBuffers.clear();
 }
 
