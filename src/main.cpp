@@ -6659,7 +6659,7 @@ static int runCaptureShots(float timeSec) {
 
 // --export-map <path>: write the loaded world, with its spawn and pickups, as a
 // run-length map document. This is how the procedural warehouse became
-// data/maps/warehouse_v1.map.vox.json; the fingerprints proved the round trip.
+// data/maps/warehouse_v2.map.vox.json; the fingerprints proved the round trip.
 static bool exportMapDocument(const sim::World& world, const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
@@ -7195,7 +7195,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createSync();
         initUi();
 
-        // The world comes from data/maps/warehouse_v1.map.vox.json (exported
+        // The world comes from data/maps/warehouse_v2.map.vox.json (exported
         // from the old procedural builder, with fingerprint parity, then the
         // builder was deleted). --export-map re-saves whatever world loaded.
         sim::World world;
@@ -7209,9 +7209,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             std::vector<std::string> candidates;
             if (g_mapOverridePath.empty()) {
                 candidates = {
-                    g_exeDir + "\\maps\\warehouse_v1.map.vox.json",
-                    g_exeDir + "\\..\\data\\maps\\warehouse_v1.map.vox.json",
-                    g_exeDir + "\\..\\..\\data\\maps\\warehouse_v1.map.vox.json",
+                    g_exeDir + "\\maps\\warehouse_v2.map.vox.json",
+                    g_exeDir + "\\..\\data\\maps\\warehouse_v2.map.vox.json",
+                    g_exeDir + "\\..\\..\\data\\maps\\warehouse_v2.map.vox.json",
                 };
             } else {
                 candidates = {g_mapOverridePath};
@@ -7268,7 +7268,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             }
             if (!loaded) {
                 if (g_mapOverridePath.empty())
-                    fail("map not found: data\\maps\\warehouse_v1.map.vox.json");
+                    fail("map not found: data\\maps\\warehouse_v2.map.vox.json");
                 fail("map not loaded: " + g_mapOverridePath);
             }
         }
