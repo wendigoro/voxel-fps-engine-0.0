@@ -2,184 +2,96 @@
   "schema": "imagoro.image/v1",
   "imageId": "imagoro.command-center",
   "imageVersion": "0.1.0",
-  "builtAt": "2026-10-04T22:32:25.545Z",
+  "builtAt": "2026-10-04T23:03:05.575Z",
   "renderer": "react",
   "shell": {
     "entry": "src/sections.ts",
     "sections": [
       {
-        "id": "engine",
-        "label": "Voxel Engine",
-        "blurb": "Live 3D viewport telemetry, voxel inspector, visual parameters & map sync.",
+        "id": "map",
+        "label": "Map Editor",
+        "blurb": "Live voxel raycasting, painting, carve/demolition tools, palette management, and Java Painter sync.",
         "span": "full",
         "align": "start",
         "slots": [
           {
-            "block": "imagoro.engine.status",
+            "block": "engine.map.inspector",
             "span": "pair"
           },
           {
-            "block": "imagoro.engine.inspector",
+            "block": "engine.map.tools",
             "span": "pair"
           },
           {
-            "block": "imagoro.engine.visuals",
+            "block": "engine.map.sync",
             "span": "pair"
           },
           {
-            "block": "imagoro.engine.map",
-            "span": "pair"
-          },
-          {
-            "block": "imagoro.console",
-            "span": "full"
-          }
-        ]
-      },
-      {
-        "id": "overview",
-        "label": "Overview",
-        "blurb": "Live business + analytics posture at a glance.",
-        "span": "full",
-        "align": "start",
-        "slots": [
-          {
-            "block": "imagoro.metrics",
-            "span": "pair"
-          },
-          {
-            "block": "imagoro.weather",
-            "span": "pair"
-          },
-          {
-            "block": "imagoro.route",
-            "span": "full"
-          },
-          {
-            "block": "imagoro.visualizer",
+            "block": "engine.map.terrain",
             "span": "pair"
           }
         ]
       },
       {
-        "id": "tasks",
-        "label": "Crew Tasks",
-        "blurb": "The node canvas composes crew tasks as a DAG (imports the demo tasks.yaml crew).",
+        "id": "model",
+        "label": "Model & Character",
+        "blurb": "Humanoid skeletal rig, limb kinematics, procedural locomotion, and camera perspective.",
         "span": "full",
         "align": "start",
         "slots": [
           {
-            "block": "imagoro.graph",
-            "span": "full",
-            "config": {
-              "role": "enterprise"
-            }
-          },
-          {
-            "block": "imagoro.console",
-            "span": "full"
-          },
-          {
-            "block": "imagoro.terminal",
-            "span": "full"
-          }
-        ]
-      },
-      {
-        "id": "pipeline",
-        "label": "Pipeline",
-        "blurb": "Pipeline monitor + blackboard categories, scoped by role.",
-        "span": "full",
-        "align": "start",
-        "slots": [
-          {
-            "block": "imagoro.pipeline",
+            "block": "engine.model.camera",
             "span": "pair"
           },
           {
-            "block": "imagoro.blackboard",
-            "span": "pair",
-            "config": {
-              "category": "pipeline",
-              "role": "business"
-            }
-          },
-          {
-            "block": "imagoro.audit",
-            "span": "full"
-          }
-        ]
-      },
-      {
-        "id": "network",
-        "label": "Network",
-        "blurb": "Mesh + route awareness across surfaces.",
-        "span": "full",
-        "align": "start",
-        "slots": [
-          {
-            "block": "imagoro.map",
-            "span": "full"
-          },
-          {
-            "block": "imagoro.route",
-            "span": "full"
-          },
-          {
-            "block": "imagoro.metrics",
-            "span": "full"
-          },
-          {
-            "block": "imagoro.visualizer",
-            "span": "full"
-          }
-        ]
-      },
-      {
-        "id": "control",
-        "label": "Control",
-        "blurb": "Chat, console and terminal for operators.",
-        "span": "full",
-        "align": "start",
-        "slots": [
-          {
-            "block": "imagoro.chat",
-            "span": "full"
-          },
-          {
-            "block": "imagoro.console",
-            "span": "full"
-          },
-          {
-            "block": "imagoro.terminal",
-            "span": "full"
-          }
-        ]
-      },
-      {
-        "id": "intent",
-        "label": "What can I do?",
-        "blurb": "Route a goal to a crew role, block or tool — plan preview only, nothing executes.",
-        "span": "full",
-        "align": "start",
-        "slots": [
-          {
-            "block": "imagoro.intent",
-            "span": "full",
-            "config": {
-              "role": "enterprise"
-            }
-          },
-          {
-            "block": "imagoro.sidebar",
-            "span": "pair",
-            "config": {
-              "role": "enterprise"
-            }
-          },
-          {
-            "block": "imagoro.console",
+            "block": "engine.model.locomotion",
             "span": "pair"
+          },
+          {
+            "block": "engine.model.character",
+            "span": "pair"
+          },
+          {
+            "block": "engine.model.weapons",
+            "span": "pair"
+          }
+        ]
+      },
+      {
+        "id": "visuals",
+        "label": "Visuals & Shaders",
+        "blurb": "Vulkan post-processing chain, retro CRT emulation, render scale, lighting, and occupancy shadows.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "engine.visuals.params",
+            "span": "pair"
+          },
+          {
+            "block": "engine.visuals.presets",
+            "span": "pair"
+          },
+          {
+            "block": "engine.visuals.lighting",
+            "span": "full"
+          }
+        ]
+      },
+      {
+        "id": "telemetry",
+        "label": "Telemetry & Logs",
+        "blurb": "Simulation timing, vertex counts, GPU memory allocations, and IPC bridge activity log.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "engine.status.telemetry",
+            "span": "full"
+          },
+          {
+            "block": "engine.console.log",
+            "span": "full"
           }
         ]
       }
@@ -610,27 +522,27 @@
   ],
   "dist": [
     {
-      "path": "assets/index-BbI98dFP.js",
-      "sha256": "d5e0e8cb4ed2a06661576c3d5b943296e4b634c3b88baf48b163fa99602e89ab",
-      "bytes": 359867,
-      "ms": 62
+      "path": "assets/index-BbSTyCXs.css",
+      "sha256": "67e904ac1a9bf706bb850ae828d7c6c48c378bb59cb3e3829c6e5b05588866c4",
+      "bytes": 8621,
+      "ms": 2
     },
     {
-      "path": "assets/index-CCZs9ZXG.css",
-      "sha256": "e944faaa8fb2b50e68345458c1d36f201b29eaabaec7e2733719bfce720144b9",
-      "bytes": 24227,
-      "ms": 0
+      "path": "assets/index-BdP-IRbr.js",
+      "sha256": "612594214824f85b8ed2ac34dd59db5d4d03c7413019bc5476739d9e64871045",
+      "bytes": 176575,
+      "ms": 39
     },
     {
       "path": "index.html",
-      "sha256": "1228a1c15ecc3812793834c6cc4e2a8caa0e312e8639553656edcdbdeefbc126",
+      "sha256": "84ad8245a70536a05f29a1659d2248937d0306fbbb3e1216378e30144004a86a",
       "bytes": 417,
       "ms": 0
     }
   ],
   "integrity": {
     "algorithm": "sha256",
-    "digest": "a2f392c41fe2b373d6f897d8951830dbf462b427e9bace1af3bfb88f156f33bb",
+    "digest": "596e1659d0716bc510e333326b8186e667b90ba41e17678f70bff645e7cb7f25",
     "files": 3
   }
 }

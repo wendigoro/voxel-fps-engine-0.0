@@ -6684,6 +6684,24 @@ static void handleEditorAction(const std::string& actionJson) {
         reloadMapFile(g_mapPath);
     } else if (type == "LAUNCH_JAVA_PAINTER") {
         launchJavaPainterAsync();
+    } else if (type == "SET_STANCE") {
+        int st = static_cast<int>(jsonExtractFloat(actionJson, "stance", 0.0f));
+        if (st >= 0 && st <= 2) g_move.stance = static_cast<movement::Stance>(st);
+    } else if (type == "SET_GAIT") {
+        int g = static_cast<int>(jsonExtractFloat(actionJson, "gait", 0.0f));
+        if (g >= 0 && g <= 2) g_move.gait = static_cast<movement::Gait>(g);
+    } else if (type == "TRIGGER_DASH") {
+        g_pendingInput.dash = true;
+    } else if (type == "TRIGGER_SLIDE") {
+        g_move.sliding = !g_move.sliding;
+    } else if (type == "CYCLE_WEAPON") {
+        g_pendingInput.cycleWeapon = true;
+    } else if (type == "SET_CALIBER") {
+        int c = static_cast<int>(jsonExtractFloat(actionJson, "caliber", 0.0f));
+        g_pendingInput.selectCaliber = c;
+    } else if (type == "SET_TIME_OF_DAY") {
+        float tod = jsonExtractFloat(actionJson, "timeOfDay", g_timeOfDay);
+        g_timeOfDay = std::clamp(tod, 0.0f, 1.0f);
     }
 }
 
@@ -8131,8 +8149,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     snap += "\"health\":" + std::to_string(g_health.health) + ",";
                     snap += "\"cam\":{\"x\":" + std::to_string(g_camPos.x) + ",\"y\":" + std::to_string(g_camPos.y) + ",\"z\":" + std::to_string(g_camPos.z) + ",";
                     snap += "\"yaw\":" + std::to_string(g_yaw) + ",\"pitch\":" + std::to_string(g_pitch) + "},";
+                    snap += "\"player\":{\"x\":" + std::to_string(g_player.px) + ",\"y\":" + std::to_string(g_player.py) + ",\"z\":" + std::to_string(g_player.pz) + "},";
                     snap += "\"thirdPerson\":" + std::string(g_thirdPerson ? "true" : "false") + ",";
                     snap += "\"legYaw\":" + std::to_string(g_legYaw) + ",";
+                    snap += "\"deltaYaw\":" + std::to_string(angleDiff(g_yaw, g_legYaw)) + ",";
+                    snap += "\"stance\":" + std::to_string(static_cast<int>(g_move.stance)) + ",";
+                    snap += "\"gait\":" + std::to_string(static_cast<int>(g_move.gait)) + ",";
+                    snap += "\"sliding\":" + std::string(g_move.sliding ? "true" : "false") + ",";
+                    snap += "\"dashing\":" + std::string(g_move.dashing ? "true" : "false") + ",";
+                    snap += "\"wallRunning\":" + std::string(g_move.wallRunning ? "true" : "false") + ",";
+                    snap += "\"stamina\":" + std::to_string(g_move.stamina) + ",";
+                    snap += "\"timeOfDay\":" + std::to_string(g_timeOfDay) + ",";
+                    snap += "\"vertices\":" + std::to_string(g_liveVertexCount) + ",";
+                    snap += "\"caliber\":" + std::to_string(g_activeCaliberIndex) + ",";
                     snap += "\"map\":{\"path\":\"" + normMapPath + "\",\"prefabs\":" + std::to_string(g_mapPrefabsStamped) + "},";
                     if (pick.hit) {
                         snap += "\"pick\":{\"hit\":true,\"x\":" + std::to_string(pick.x) + ",\"y\":" + std::to_string(pick.y) + ",\"z\":" + std::to_string(pick.z) + ",";
