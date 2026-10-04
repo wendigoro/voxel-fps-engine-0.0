@@ -6353,6 +6353,279 @@ static void syncCameraToPlayer() {
     g_camPos.z = g_player.pz + right.z * lat + fwd.z * g_camOffset.forwardLean;
 }
 
+// -----------------------------------------------------------------------------
+// Editor & UI Bridge Helpers: Voxel Raycast, Map Reload, File Watcher, Actions
+// -----------------------------------------------------------------------------
+
+struct PickResult {
+    bool hit = false;
+    int x = 0, y = 0, z = 0;
+    int nx = 0, ny = 0, nz = 0;
+    int adjX = 0, adjY = 0, adjZ = 0;
+    sim::Block block = sim::Block::Air;
+    int paletteIndex = 0;
+    float dist = 0.0f;
+    const char* blockName = "Air";
+};
+
+static const char* blockNameFor(sim::Block b) {
+    switch (b) {
+    case sim::Block::Air: return "Air";
+    case sim::Block::Dirt: return "Dirt";
+    case sim::Block::Concrete: return "Concrete";
+    case sim::Block::SheetMetal: return "SheetMetal";
+    case sim::Block::Girder: return "Girder";
+    case sim::Block::Wood: return "Wood";
+    case sim::Block::WoodDark: return "WoodDark";
+    case sim::Block::Water: return "Water";
+    case sim::Block::WaterCurrent: return "WaterCurrent";
+    case sim::Block::Moon: return "Moon";
+    case sim::Block::LightBulb: return "LightBulb";
+    case sim::Block::Sand: return "Sand";
+    case sim::Block::Grass: return "Grass";
+    case sim::Block::Snow: return "Snow";
+    case sim::Block::Asphalt: return "Asphalt";
+    default: return "Unknown";
+    }
+}
+
+static PickResult raycastVoxel(const Vec3& eye, const Vec3& dir, float maxDist = 40.0f) {
+    PickResult res;
+    if (!g_world) return res;
+
+    const float vs = VOXEL_SIZE;
+    float dx = dir.x, dy = dir.y, dz = dir.z;
+    const float eps = 1e-8f;
+    if (std::fabs(dx) < eps) dx = (dx < 0.0f ? -eps : eps);
+    if (std::fabs(dy) < eps) dy = (dy < 0.0f ? -eps : eps);
+    if (std::fabs(dz) < eps) dz = (dz < 0.0f ? -eps : eps);
+
+    float ox = eye.x / vs;
+    float oy = eye.y / vs;
+    float oz = eye.z / vs;
+
+    int ix = static_cast<int>(std::floor(ox));
+    int iy = static_cast<int>(std::floor(oy));
+    int iz = static_cast<int>(std::floor(oz));
+
+    const int stepX = dx > 0.0f ? 1 : -1;
+    const int stepY = dy > 0.0f ? 1 : -1;
+    const int stepZ = dz > 0.0f ? 1 : -1;
+
+    const float tDeltaX = vs / std::fabs(dx);
+    const float tDeltaY = vs / std::fabs(dy);
+    const float tDeltaZ = vs / std::fabs(dz);
+
+    float tMaxX = (stepX > 0)
+        ? ((static_cast<float>(ix) + 1.0f - ox) / dx) * vs
+        : ((ox - static_cast<float>(ix)) / -dx) * vs;
+    float tMaxY = (stepY > 0)
+        ? ((static_cast<float>(iy) + 1.0f - oy) / dy) * vs
+        : ((oy - static_cast<float>(iy)) / -dy) * vs;
+    float tMaxZ = (stepZ > 0)
+        ? ((static_cast<float>(iz) + 1.0f - oz) / dz) * vs
+        : ((oz - static_cast<float>(iz)) / -dz) * vs;
+
+    int lastFace = -1; // 0 = X, 1 = Y, 2 = Z
+    float traveled = 0.0f;
+    const int maxSteps = static_cast<int>(maxDist / vs);
+
+    for (int step = 0; step < maxSteps; ++step) {
+        if (sim::World::inBounds(ix, iy, iz)) {
+            sim::Block b = g_world->get(ix, iy, iz);
+            if (b != sim::Block::Air && b != sim::Block::Water && b != sim::Block::WaterCurrent) {
+                res.hit = true;
+                res.x = ix; res.y = iy; res.z = iz;
+                res.block = b;
+                res.paletteIndex = g_world->getAppearance(ix, iy, iz);
+                res.dist = traveled;
+                res.blockName = blockNameFor(b);
+                if (lastFace == 0) {
+                    res.nx = -stepX; res.ny = 0; res.nz = 0;
+                } else if (lastFace == 1) {
+                    res.nx = 0; res.ny = -stepY; res.nz = 0;
+                } else if (lastFace == 2) {
+                    res.nx = 0; res.ny = 0; res.nz = -stepZ;
+                } else {
+                    res.nx = 0; res.ny = 1; res.nz = 0;
+                }
+                res.adjX = ix + res.nx;
+                res.adjY = iy + res.ny;
+                res.adjZ = iz + res.nz;
+                return res;
+            }
+        } else if (traveled > 0.05f) {
+            break;
+        }
+
+        if (tMaxX < tMaxY) {
+            if (tMaxX < tMaxZ) {
+                traveled = tMaxX;
+                tMaxX += tDeltaX;
+                ix += stepX;
+                lastFace = 0;
+            } else {
+                traveled = tMaxZ;
+                tMaxZ += tDeltaZ;
+                iz += stepZ;
+                lastFace = 2;
+            }
+        } else {
+            if (tMaxY < tMaxZ) {
+                traveled = tMaxY;
+                tMaxY += tDeltaY;
+                iy += stepY;
+                lastFace = 1;
+            } else {
+                traveled = tMaxZ;
+                tMaxZ += tDeltaZ;
+                iz += stepZ;
+                lastFace = 2;
+            }
+        }
+    }
+    return res;
+}
+
+static bool reloadMapFile(const std::string& path) {
+    if (!g_world || path.empty()) return false;
+    mapvox::Doc mapDoc;
+    if (!mapvox::loadMapVox(path, mapDoc)) {
+        std::fprintf(stderr, "[map-reload] Failed to load %s: %s\n", path.c_str(), mapDoc.error.c_str());
+        return false;
+    }
+    if (mapDoc.sx != WORLD_W || mapDoc.sy != WORLD_H || mapDoc.sz != WORLD_D) {
+        std::fprintf(stderr, "[map-reload] Map size mismatch (%dx%dx%d != %dx%dx%d): %s\n",
+                     mapDoc.sx, mapDoc.sy, mapDoc.sz, WORLD_W, WORLD_H, WORLD_D, path.c_str());
+        return false;
+    }
+    *g_world = makeEmptyWorld();
+    mapvox::stampMapVox(mapDoc, *g_world, 0, 0, 0);
+    g_mapPrefabsStamped = 0;
+    for (const auto& pf : mapDoc.prefabs) {
+        if (stampPrefabById(pf.id, *g_world, pf.x, pf.y, pf.z, pf.rot)) {
+            ++g_mapPrefabsStamped;
+        }
+    }
+    g_mapTerrain = mapDoc.terrain;
+    generateMapTerrain(*g_world, g_mapTerrain);
+    g_mapSpawn = mapDoc.spawn;
+    g_mapPickups = mapDoc.pickups;
+    g_mapLights = mapDoc.lights;
+    g_bulbs.clear();
+    for (const auto& ml : mapDoc.lights) {
+        BulbLight l;
+        l.pos = Vec3(ml.x * VOXEL_SIZE, ml.y * VOXEL_SIZE, ml.z * VOXEL_SIZE);
+        l.color = Vec3(ml.r, ml.g, ml.b);
+        l.intensity = ml.intensity;
+        l.radius = ml.radius;
+        g_bulbs.push_back(l);
+    }
+    if (mapDoc.environment.present) {
+        g_mapEnvironment = mapDoc.environment;
+        g_moonDirWorld = Vec3(mapDoc.environment.moonDir[0],
+                              mapDoc.environment.moonDir[1],
+                              mapDoc.environment.moonDir[2])
+                             .normalized();
+    }
+    sendPalette(*g_world, g_viewPalette);
+    g_mapPath = path;
+    if (g_views) {
+        for (auto& v : *g_views) {
+            v.hasSnapshot = false;
+            v.meshedVersion = 0;
+        }
+    }
+    g_meshDirty = true;
+    std::fprintf(stderr, "[map-reload] Successfully reloaded map: %s (prefabs=%d)\n",
+                 path.c_str(), g_mapPrefabsStamped);
+    return true;
+}
+
+static FILETIME g_lastMapWriteTime{};
+static bool checkMapFileModified() {
+    if (g_mapPath.empty()) return false;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(g_mapPath.c_str(), GetFileExInfoStandard, &fad)) return false;
+    if (g_lastMapWriteTime.dwLowDateTime == 0 && g_lastMapWriteTime.dwHighDateTime == 0) {
+        g_lastMapWriteTime = fad.ftLastWriteTime;
+        return false;
+    }
+    if (CompareFileTime(&g_lastMapWriteTime, &fad.ftLastWriteTime) < 0) {
+        g_lastMapWriteTime = fad.ftLastWriteTime;
+        return true;
+    }
+    return false;
+}
+
+static void launchJavaPainterAsync() {
+    STARTUPINFOA si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    std::string cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\launch_dev.ps1 -Action Painter";
+    std::vector<char> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back('\0');
+    if (CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        std::fprintf(stderr, "[ui-bridge] Launched Java Painter externally\n");
+    } else {
+        std::fprintf(stderr, "[ui-bridge] Failed to launch Java Painter: 0x%08lX\n", GetLastError());
+    }
+}
+
+static void handleEditorAction(const std::string& actionJson) {
+    std::string type = jsonExtractString(actionJson, "type");
+    if (type.empty()) return;
+
+    if (type == "TOGGLE_PAUSE") {
+        setPaused(!g_paused);
+    } else if (type == "SET_PAUSED") {
+        bool p = jsonExtractBool(actionJson, "paused", false);
+        setPaused(p);
+    } else if (type == "RESET_CAMERA") {
+        g_yaw = g_mapSpawn.yaw;
+        g_pitch = g_mapSpawn.pitch;
+        g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+    } else if (type == "SPAWN_PLAYER") {
+        if (g_world) spawnPlayerOnMap(*g_world);
+    } else if (type == "SET_VISUAL_PARAM") {
+        std::string key = jsonExtractString(actionJson, "key");
+        float val = jsonExtractFloat(actionJson, "value", 0.0f);
+        if (auto* p = g_visReg.find(key)) {
+            p->set(val);
+            g_visReg.touch();
+        }
+    } else if (type == "APPLY_PRESET") {
+        std::string name = jsonExtractString(actionJson, "name");
+        g_visReg.applyPreset(name);
+    } else if (type == "RESET_VISUAL_PARAMS") {
+        g_visReg.resetDefaults();
+    } else if (type == "PAINT_VOXEL") {
+        int x = static_cast<int>(jsonExtractFloat(actionJson, "x", -1.0f));
+        int y = static_cast<int>(jsonExtractFloat(actionJson, "y", -1.0f));
+        int z = static_cast<int>(jsonExtractFloat(actionJson, "z", -1.0f));
+        int b = static_cast<int>(jsonExtractFloat(actionJson, "block", 2.0f));
+        int p = static_cast<int>(jsonExtractFloat(actionJson, "paletteIndex", 0.0f));
+        if (g_world && sim::World::inBounds(x, y, z)) {
+            g_world->set(x, y, z, static_cast<sim::Block>(b));
+            if (p != 0) g_world->setAppearance(x, y, z, static_cast<uint8_t>(p));
+            g_meshDirty = true;
+        }
+    } else if (type == "DELETE_VOXEL") {
+        int x = static_cast<int>(jsonExtractFloat(actionJson, "x", -1.0f));
+        int y = static_cast<int>(jsonExtractFloat(actionJson, "y", -1.0f));
+        int z = static_cast<int>(jsonExtractFloat(actionJson, "z", -1.0f));
+        if (g_world && sim::World::inBounds(x, y, z)) {
+            g_world->set(x, y, z, sim::Block::Air);
+            g_meshDirty = true;
+        }
+    } else if (type == "RELOAD_MAP") {
+        reloadMapFile(g_mapPath);
+    } else if (type == "LAUNCH_JAVA_PAINTER") {
+        launchJavaPainterAsync();
+    }
+}
+
 // Death drops whatever is in hand as a normal mat-8 world pickup, reusing the
 // existing pickup path instead of inventing a drop system. Packed items and
 // equipped gear are untouched — death is a setback, not a wipe.
@@ -7748,20 +8021,48 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
 
             if (g_editorMode && g_webHost.isInitialized()) {
                 g_webHost.drainActions([](const std::string& actionJson) {
-                    if (actionJson.find("\"TOGGLE_PAUSE\"") != std::string::npos) {
-                        setPaused(!g_paused);
-                    }
+                    handleEditorAction(actionJson);
                 });
 
                 static double lastSnapTime = 0.0;
                 double nowTime = static_cast<double>(g_tick) * TICK_DT;
                 if (nowTime - lastSnapTime >= 0.1) {
                     lastSnapTime = nowTime;
+
+                    if (checkMapFileModified()) {
+                        std::fprintf(stderr, "[map-watcher] Map file changed on disk: %s -> reloading world\n", g_mapPath.c_str());
+                        reloadMapFile(g_mapPath);
+                    }
+
+                    PickResult pick = raycastVoxel(g_camPos, cameraForward(), 40.0f);
+
+                    std::string normMapPath = g_mapPath;
+                    for (char& c : normMapPath) { if (c == '\\') c = '/'; }
+
                     std::string snap = "{\"type\":\"VIEW_SNAPSHOT\",\"data\":{";
                     snap += "\"tick\":" + std::to_string(g_tick) + ",";
-                    snap += "\"cam\":{\"x\":" + std::to_string(g_camPos.x) + ",\"y\":" + std::to_string(g_camPos.y) + ",\"z\":" + std::to_string(g_camPos.z) + "},";
+                    snap += "\"paused\":" + std::string(g_paused ? "true" : "false") + ",";
                     snap += "\"health\":" + std::to_string(g_health.health) + ",";
-                    snap += "\"paused\":" + std::string(g_paused ? "true" : "false") + "}}";
+                    snap += "\"cam\":{\"x\":" + std::to_string(g_camPos.x) + ",\"y\":" + std::to_string(g_camPos.y) + ",\"z\":" + std::to_string(g_camPos.z) + ",";
+                    snap += "\"yaw\":" + std::to_string(g_yaw) + ",\"pitch\":" + std::to_string(g_pitch) + "},";
+                    snap += "\"map\":{\"path\":\"" + normMapPath + "\",\"prefabs\":" + std::to_string(g_mapPrefabsStamped) + "},";
+                    if (pick.hit) {
+                        snap += "\"pick\":{\"hit\":true,\"x\":" + std::to_string(pick.x) + ",\"y\":" + std::to_string(pick.y) + ",\"z\":" + std::to_string(pick.z) + ",";
+                        snap += "\"nx\":" + std::to_string(pick.nx) + ",\"ny\":" + std::to_string(pick.ny) + ",\"nz\":" + std::to_string(pick.nz) + ",";
+                        snap += "\"adj\":[" + std::to_string(pick.adjX) + "," + std::to_string(pick.adjY) + "," + std::to_string(pick.adjZ) + "],";
+                        snap += "\"block\":" + std::to_string(static_cast<int>(pick.block)) + ",";
+                        snap += "\"blockName\":\"" + std::string(pick.blockName) + "\",";
+                        snap += "\"paletteIndex\":" + std::to_string(pick.paletteIndex) + ",";
+                        snap += "\"dist\":" + std::to_string(pick.dist) + "},";
+                    } else {
+                        snap += "\"pick\":{\"hit\":false},";
+                    }
+                    std::string vpJson = g_visReg.toJson();
+                    while (!vpJson.empty() && (vpJson.back() == '\n' || vpJson.back() == '\r' || vpJson.back() == ' ')) {
+                        vpJson.pop_back();
+                    }
+                    snap += "\"visualParams\":" + vpJson;
+                    snap += "}}";
                     g_webHost.postMessageJson(snap);
                 }
             }

@@ -2,11 +2,40 @@
   "schema": "imagoro.image/v1",
   "imageId": "imagoro.command-center",
   "imageVersion": "0.1.0",
-  "builtAt": "2026-10-04T22:12:53.885Z",
+  "builtAt": "2026-10-04T22:32:25.545Z",
   "renderer": "react",
   "shell": {
     "entry": "src/sections.ts",
     "sections": [
+      {
+        "id": "engine",
+        "label": "Voxel Engine",
+        "blurb": "Live 3D viewport telemetry, voxel inspector, visual parameters & map sync.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "imagoro.engine.status",
+            "span": "pair"
+          },
+          {
+            "block": "imagoro.engine.inspector",
+            "span": "pair"
+          },
+          {
+            "block": "imagoro.engine.visuals",
+            "span": "pair"
+          },
+          {
+            "block": "imagoro.engine.map",
+            "span": "pair"
+          },
+          {
+            "block": "imagoro.console",
+            "span": "full"
+          }
+        ]
+      },
       {
         "id": "overview",
         "label": "Overview",
@@ -581,10 +610,10 @@
   ],
   "dist": [
     {
-      "path": "assets/index-BveR0kyU.js",
-      "sha256": "28a21356bc6905ab3f427738906b70985f899e9e07245326ad88683595a60ad0",
-      "bytes": 344678,
-      "ms": 61
+      "path": "assets/index-BbI98dFP.js",
+      "sha256": "d5e0e8cb4ed2a06661576c3d5b943296e4b634c3b88baf48b163fa99602e89ab",
+      "bytes": 359867,
+      "ms": 62
     },
     {
       "path": "assets/index-CCZs9ZXG.css",
@@ -594,14 +623,14 @@
     },
     {
       "path": "index.html",
-      "sha256": "839d05f0340fc4a734576209f034cd0378f3a8f1ebd9727066d483221a861b58",
+      "sha256": "1228a1c15ecc3812793834c6cc4e2a8caa0e312e8639553656edcdbdeefbc126",
       "bytes": 417,
       "ms": 0
     }
   ],
   "integrity": {
     "algorithm": "sha256",
-    "digest": "dedb538990061b949c06abf6ee029e913f36c63244c416624e5aaa99a11b6f0d",
+    "digest": "a2f392c41fe2b373d6f897d8951830dbf462b427e9bace1af3bfb88f156f33bb",
     "files": 3
   }
 }
