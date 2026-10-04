@@ -44,6 +44,7 @@
 // The backend header keeps this behind #if 0 so it need not pull in windows.h.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam,
                                                              LPARAM lParam);
+#include "webview_host.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
 #include "ballistics.hpp"
@@ -266,11 +267,23 @@ struct QueueFamilyIndices {
     bool complete() const { return graphics >= 0 && present >= 0; }
 };
 
+static std::wstring utf8ToWide(const std::string& str) {
+    if (str.empty()) return L"";
+    int count = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
+    if (count <= 0) return L"";
+    std::wstring w(count - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &w[0], count);
+    return w;
+}
+
 // ---- globals / app state ----
 static HINSTANCE g_hInstance;
 static HWND g_hMainWindow = nullptr;
 static HWND g_hViewportWnd = nullptr;
+static HWND g_hWebPanelWnd = nullptr;
 static HWND g_hwnd = nullptr; // Aliased to g_hViewportWnd for viewport operations
+static bool g_editorMode = false;
+static WebViewHost g_webHost;
 static bool g_running = true;
 static bool g_resized = false;
 static int g_width = WIDTH;
@@ -2189,10 +2202,21 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         g_running = false;
         return 0;
     case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED && g_hViewportWnd) {
+        if (wParam != SIZE_MINIMIZED) {
             RECT rc;
             GetClientRect(hwnd, &rc);
-            SetWindowPos(g_hViewportWnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            int totalW = rc.right - rc.left;
+            int totalH = rc.bottom - rc.top;
+            if (g_editorMode && g_hWebPanelWnd && g_hViewportWnd) {
+                int panelW = std::min(450, totalW / 3);
+                if (panelW < 280) panelW = 280;
+                int viewW = std::max(1, totalW - panelW);
+                SetWindowPos(g_hWebPanelWnd, nullptr, 0, 0, panelW, totalH, SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(g_hViewportWnd, nullptr, panelW, 0, viewW, totalH, SWP_NOZORDER | SWP_NOACTIVATE);
+                g_webHost.resize(0, 0, panelW, totalH);
+            } else if (g_hViewportWnd) {
+                SetWindowPos(g_hViewportWnd, nullptr, 0, 0, totalW, totalH, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         return 0;
     case WM_SETFOCUS:
@@ -2253,11 +2277,48 @@ static void createWindow() {
     int clientW = clientRc.right - clientRc.left;
     int clientH = clientRc.bottom - clientRc.top;
 
+    int panelW = 0;
+    if (g_editorMode) {
+        panelW = std::min(450, clientW / 3);
+        if (panelW < 280) panelW = 280;
+
+        WNDCLASSEXA wcPanel{};
+        wcPanel.cbSize = sizeof(wcPanel);
+        wcPanel.style = CS_HREDRAW | CS_VREDRAW;
+        wcPanel.lpfnWndProc = DefWindowProcA;
+        wcPanel.hInstance = g_hInstance;
+        wcPanel.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wcPanel.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wcPanel.lpszClassName = "VoxelAppWebPanel";
+        if (!RegisterClassExA(&wcPanel) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            fail("RegisterClassEx for web panel failed");
+
+        g_hWebPanelWnd = CreateWindowExA(
+            0, wcPanel.lpszClassName,
+            nullptr,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            0, 0, panelW, clientH,
+            g_hMainWindow, nullptr, g_hInstance, nullptr);
+        if (!g_hWebPanelWnd) fail("CreateWindowEx for web panel failed");
+
+        std::string uiDist = g_exeDir + "\\data\\ui\\dist";
+        if (GetFileAttributesA(uiDist.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            uiDist = g_exeDir + "\\..\\data\\ui\\dist";
+        }
+        std::wstring userDataFolder = utf8ToWide(g_exeDir + "\\webview_profile");
+        std::wstring assetsFolder = utf8ToWide(uiDist);
+        g_webHost.initialize(g_hWebPanelWnd, userDataFolder, assetsFolder, [](const std::string& msg) {
+            std::fprintf(stderr, "[ui-bridge] action received: %s\n", msg.c_str());
+        });
+        g_webHost.resize(0, 0, panelW, clientH);
+        g_webHost.setVisible(true);
+    }
+
     g_hViewportWnd = CreateWindowExA(
         0, wcView.lpszClassName,
         nullptr,
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-        0, 0, clientW, clientH,
+        panelW, 0, clientW - panelW, clientH,
         g_hMainWindow, nullptr, g_hInstance, nullptr);
     if (!g_hViewportWnd) fail("CreateWindowEx for viewport child failed");
 
@@ -7045,10 +7106,13 @@ if (g_skyTileVB) {
     if (g_debugMessenger != VK_NULL_HANDLE && g_destroyDUM)
         g_destroyDUM(g_instance, g_debugMessenger, nullptr);
     g_debugMessenger = VK_NULL_HANDLE;
+    g_webHost.shutdown();
     if (g_surface) vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
     if (g_instance) vkDestroyInstance(g_instance, nullptr);
+    if (g_hWebPanelWnd) DestroyWindow(g_hWebPanelWnd);
     if (g_hViewportWnd) DestroyWindow(g_hViewportWnd);
     if (g_hMainWindow) DestroyWindow(g_hMainWindow);
+    g_hWebPanelWnd = nullptr;
     g_hViewportWnd = nullptr;
     g_hMainWindow = nullptr;
     g_hwnd = nullptr;
@@ -7339,6 +7403,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         g_stress = true;
         g_smoke = true; // reuse headless quit path
         g_smokeTicks = 600; // longer soak
+    }
+    if (cmd.find("--editor") != std::string::npos || cmd.find("--mode editor") != std::string::npos) {
+        g_editorMode = true;
     }
     // --mesh-helpers N overrides the mesh pool size (0 = serial), so the pooled
     // and serial mesher can be timed back to back on the same machine state.
@@ -7678,6 +7745,26 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             // animation is frame-rate independent.
             drawFrame(static_cast<float>(g_tick) * static_cast<float>(TICK_DT));
             ++frames;
+
+            if (g_editorMode && g_webHost.isInitialized()) {
+                g_webHost.drainActions([](const std::string& actionJson) {
+                    if (actionJson.find("\"TOGGLE_PAUSE\"") != std::string::npos) {
+                        setPaused(!g_paused);
+                    }
+                });
+
+                static double lastSnapTime = 0.0;
+                double nowTime = static_cast<double>(g_tick) * TICK_DT;
+                if (nowTime - lastSnapTime >= 0.1) {
+                    lastSnapTime = nowTime;
+                    std::string snap = "{\"type\":\"VIEW_SNAPSHOT\",\"data\":{";
+                    snap += "\"tick\":" + std::to_string(g_tick) + ",";
+                    snap += "\"cam\":{\"x\":" + std::to_string(g_camPos.x) + ",\"y\":" + std::to_string(g_camPos.y) + ",\"z\":" + std::to_string(g_camPos.z) + "},";
+                    snap += "\"health\":" + std::to_string(g_health.health) + ",";
+                    snap += "\"paused\":" + std::string(g_paused ? "true" : "false") + "}}";
+                    g_webHost.postMessageJson(snap);
+                }
+            }
 
             if (g_smoke && g_tick >= g_smokeTicks) {
                 g_running = false;

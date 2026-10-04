@@ -73,6 +73,11 @@ foreach ($rel in $imguiSources) {
 $imguiCompileLines = $imguiCompile -join "`r`n"
 $imguiObjectList = $imguiObjects -join " "
 
+$Webview2Dir = Join-Path $Root "third_party\webview2"
+$Webview2Inc = Join-Path $Webview2Dir "build\native\include"
+$Webview2Lib = Join-Path $Webview2Dir "build\native\x64"
+$Webview2StaticLib = Join-Path $Webview2Lib "WebView2LoaderStatic.lib"
+
 $bat = @"
 @echo off
 REM vcvars64.bat probes for vswhere.exe and prints a benign "not recognized"
@@ -81,7 +86,7 @@ REM both streams are discarded and the real clang exit code is what counts.
 call "$VCVARS" >nul 2>&1
 set "PATH=$LLVM;%PATH%"
 $imguiCompileLines
-clang++.exe -std=c++17 -O2 -g -D_CRT_SECURE_NO_WARNINGS -I"$Src" -I"$ImguiDir" -I"$VK\Include" "$Src\main.cpp" $imguiObjectList -o "$Build\voxel_engine.exe" -L"$VK\Lib" -lvulkan-1 -luser32 -lgdi32 -lshell32 -ldwmapi
+clang++.exe -std=c++17 -O2 -g -D_CRT_SECURE_NO_WARNINGS -I"$Src" -I"$ImguiDir" -I"$VK\Include" -I"$Webview2Inc" "$Src\main.cpp" $imguiObjectList "$Webview2StaticLib" -o "$Build\voxel_engine.exe" -L"$VK\Lib" -lvulkan-1 -luser32 -lgdi32 -lshell32 -ldwmapi -ladvapi32 -lole32 -loleaut32 -lshlwapi
 echo CLANG_EXIT=%ERRORLEVEL%
 exit /b %ERRORLEVEL%
 "@
@@ -133,6 +138,13 @@ $itemsDst = Join-Path $Build "items"
 if (Test-Path $itemsSrc) {
   New-Item -ItemType Directory -Force -Path $itemsDst | Out-Null
   Copy-Item (Join-Path $itemsSrc "*") $itemsDst -Force -Recurse
+}
+# Web UI assets (imagoro-ui dist bundle)
+$uiSrc = Join-Path $Root "data\ui"
+$uiDst = Join-Path $Build "data\ui"
+if (Test-Path $uiSrc) {
+  New-Item -ItemType Directory -Force -Path $uiDst | Out-Null
+  Copy-Item (Join-Path $uiSrc "*") $uiDst -Force -Recurse
 }
 
 $exe = Get-Item (Join-Path $Build "voxel_engine.exe")

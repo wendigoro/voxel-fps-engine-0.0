@@ -1,0 +1,607 @@
+{
+  "schema": "imagoro.image/v1",
+  "imageId": "imagoro.command-center",
+  "imageVersion": "0.1.0",
+  "builtAt": "2026-10-04T22:12:53.885Z",
+  "renderer": "react",
+  "shell": {
+    "entry": "src/sections.ts",
+    "sections": [
+      {
+        "id": "overview",
+        "label": "Overview",
+        "blurb": "Live business + analytics posture at a glance.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "imagoro.metrics",
+            "span": "pair"
+          },
+          {
+            "block": "imagoro.weather",
+            "span": "pair"
+          },
+          {
+            "block": "imagoro.route",
+            "span": "full"
+          },
+          {
+            "block": "imagoro.visualizer",
+            "span": "pair"
+          }
+        ]
+      },
+      {
+        "id": "tasks",
+        "label": "Crew Tasks",
+        "blurb": "The node canvas composes crew tasks as a DAG (imports the demo tasks.yaml crew).",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "imagoro.graph",
+            "span": "full",
+            "config": {
+              "role": "enterprise"
+            }
+          },
+          {
+            "block": "imagoro.console",
+            "span": "full"
+          },
+          {
+            "block": "imagoro.terminal",
+            "span": "full"
+          }
+        ]
+      },
+      {
+        "id": "pipeline",
+        "label": "Pipeline",
+        "blurb": "Pipeline monitor + blackboard categories, scoped by role.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "imagoro.pipeline",
+            "span": "pair"
+          },
+          {
+            "block": "imagoro.blackboard",
+            "span": "pair",
+            "config": {
+              "category": "pipeline",
+              "role": "business"
+            }
+          },
+          {
+            "block": "imagoro.audit",
+            "span": "full"
+          }
+        ]
+      },
+      {
+        "id": "network",
+        "label": "Network",
+        "blurb": "Mesh + route awareness across surfaces.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "imagoro.map",
+            "span": "full"
+          },
+          {
+            "block": "imagoro.route",
+            "span": "full"
+          },
+          {
+            "block": "imagoro.metrics",
+            "span": "full"
+          },
+          {
+            "block": "imagoro.visualizer",
+            "span": "full"
+          }
+        ]
+      },
+      {
+        "id": "control",
+        "label": "Control",
+        "blurb": "Chat, console and terminal for operators.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "imagoro.chat",
+            "span": "full"
+          },
+          {
+            "block": "imagoro.console",
+            "span": "full"
+          },
+          {
+            "block": "imagoro.terminal",
+            "span": "full"
+          }
+        ]
+      },
+      {
+        "id": "intent",
+        "label": "What can I do?",
+        "blurb": "Route a goal to a crew role, block or tool — plan preview only, nothing executes.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "imagoro.intent",
+            "span": "full",
+            "config": {
+              "role": "enterprise"
+            }
+          },
+          {
+            "block": "imagoro.sidebar",
+            "span": "pair",
+            "config": {
+              "role": "enterprise"
+            }
+          },
+          {
+            "block": "imagoro.console",
+            "span": "pair"
+          }
+        ]
+      }
+    ]
+  },
+  "blocks": [
+    {
+      "id": "imagoro.map",
+      "name": "Integrated Map",
+      "version": "0.1.0",
+      "family": "map",
+      "substrate": "react",
+      "module": "@imagoro/block-map",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          240
+        ],
+        "ideal": [
+          520,
+          320
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.route",
+      "name": "Route Planner",
+      "version": "0.1.0",
+      "family": "route",
+      "substrate": "react",
+      "module": "@imagoro/block-route",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          240
+        ],
+        "ideal": [
+          520,
+          360
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "gps",
+            "type": "coordinate"
+          }
+        ],
+        "out": [
+          {
+            "name": "route",
+            "type": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.metrics",
+      "name": "Run Metrics",
+      "version": "0.1.0",
+      "family": "metrics",
+      "substrate": "react",
+      "module": "@imagoro/block-metrics",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          120
+        ],
+        "ideal": [
+          480,
+          160
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.audit",
+      "name": "Notification Workflow Audit",
+      "version": "0.1.0",
+      "family": "audit",
+      "substrate": "react",
+      "module": "@imagoro/block-audit",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          180
+        ],
+        "ideal": [
+          520,
+          240
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.weather",
+      "name": "Weather (Current Route)",
+      "version": "0.1.0",
+      "family": "weather",
+      "substrate": "react",
+      "module": "@imagoro/block-weather",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          120
+        ],
+        "ideal": [
+          360,
+          180
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.visualizer",
+      "name": "Audio Visualizer",
+      "version": "0.1.0",
+      "family": "audio/visualizer",
+      "substrate": "react",
+      "module": "@imagoro/block-visualizer",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          120
+        ],
+        "ideal": [
+          560,
+          160
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "rms",
+            "type": "number[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.chat",
+      "name": "Chat",
+      "version": "0.1.0",
+      "family": "chat",
+      "substrate": "react",
+      "module": "@imagoro/block-chat",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          240
+        ],
+        "ideal": [
+          520,
+          360
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "messages",
+            "type": "chat/message[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.console",
+      "name": "Console",
+      "version": "0.1.0",
+      "family": "console",
+      "substrate": "react",
+      "module": "@imagoro/block-console",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          140
+        ],
+        "ideal": [
+          560,
+          260
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.terminal",
+      "name": "Terminal",
+      "version": "0.1.0",
+      "family": "terminal",
+      "substrate": "react",
+      "module": "@imagoro/block-terminal",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          160
+        ],
+        "ideal": [
+          560,
+          260
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.blackboard",
+      "name": "Blackboard",
+      "version": "0.1.0",
+      "family": "blackboard",
+      "substrate": "react",
+      "module": "@imagoro/block-blackboard",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          160
+        ],
+        "ideal": [
+          480,
+          240
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "snapshot",
+            "type": "blackboard/snapshot"
+          }
+        ],
+        "out": [
+          {
+            "name": "values",
+            "type": "kv"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.pipeline",
+      "name": "Pipeline Monitor",
+      "version": "0.1.0",
+      "family": "pipeline",
+      "substrate": "react",
+      "module": "@imagoro/block-pipeline",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          140
+        ],
+        "ideal": [
+          520,
+          200
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "run",
+            "type": "pipeline/run"
+          }
+        ],
+        "out": [
+          {
+            "name": "state",
+            "type": "pipeline/state"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.graph",
+      "name": "Node Canvas",
+      "version": "0.1.0",
+      "family": "graph",
+      "substrate": "react",
+      "module": "@imagoro/block-graph",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          480,
+          320
+        ],
+        "ideal": [
+          720,
+          480
+        ]
+      },
+      "ports": {
+        "in": [],
+        "out": [
+          {
+            "name": "graph",
+            "type": "object"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.intent",
+      "name": "Intent",
+      "version": "0.1.0",
+      "family": "chat",
+      "substrate": "react",
+      "module": "@imagoro/block-intent",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          360,
+          240
+        ],
+        "ideal": [
+          720,
+          300
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "proposal",
+            "type": "intent/proposal"
+          }
+        ],
+        "out": [
+          {
+            "name": "proposal",
+            "type": "intent/proposal"
+          },
+          {
+            "name": "execute",
+            "type": "intent/execute"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.sidebar",
+      "name": "Sidebar",
+      "version": "0.1.0",
+      "family": "sidebar",
+      "substrate": "react",
+      "module": "@imagoro/block-sidebar",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          260,
+          320
+        ],
+        "ideal": [
+          320,
+          640
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "activate",
+            "type": "sidebar/activate"
+          }
+        ],
+        "out": [
+          {
+            "name": "activate",
+            "type": "sidebar/activate"
+          }
+        ]
+      }
+    }
+  ],
+  "dist": [
+    {
+      "path": "assets/index-BveR0kyU.js",
+      "sha256": "28a21356bc6905ab3f427738906b70985f899e9e07245326ad88683595a60ad0",
+      "bytes": 344678,
+      "ms": 61
+    },
+    {
+      "path": "assets/index-CCZs9ZXG.css",
+      "sha256": "e944faaa8fb2b50e68345458c1d36f201b29eaabaec7e2733719bfce720144b9",
+      "bytes": 24227,
+      "ms": 0
+    },
+    {
+      "path": "index.html",
+      "sha256": "839d05f0340fc4a734576209f034cd0378f3a8f1ebd9727066d483221a861b58",
+      "bytes": 417,
+      "ms": 0
+    }
+  ],
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "dedb538990061b949c06abf6ee029e913f36c63244c416624e5aaa99a11b6f0d",
+    "files": 3
+  }
+}
