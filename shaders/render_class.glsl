@@ -15,5 +15,6 @@ const int RC_DEBRIS = 5;
 const int RC_MUZZLE = 6;
 const int RC_INVENTORY_LATTICE = 7;
 const int RC_WORLD_PICKUP = 8;
+const int RC_CHARACTER = 9;
 
 int renderClass(float attr) { return int(floor(attr + 0.5)); }
