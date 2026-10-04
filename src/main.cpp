@@ -297,17 +297,7 @@ static Vec3 g_camPos(
     WORLD_D * VOXEL_SIZE * 0.72f);
 
 // Physics-bound player body (feet at py; hitbox is unit-grid AABB).
-struct PlayerBody {
-    float px = 0, py = 0, pz = 0; // feet center (world)
-    float vx = 0, vy = 0, vz = 0;
-    bool onGround = false;
-    float lean = 0.0f;       // current lean -1..+1 (Q left, E right)
-    float leanTarget = 0.0f;
-    float eyeHeight = 0.0165f; // ~16.5 unit voxels
-    float height = 0.0185f;    // full body height
-    float radius = 0.0022f;    // horizontal half-extent (~2.2 unit voxels)
-    float jumpSpeed = 0.055f;
-};
+#include "player_body.hpp"
 static PlayerBody g_player;
 static bool g_wantJump = false;
 
@@ -5820,13 +5810,8 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     if (g_charPipeline != VK_NULL_HANDLE && g_charVB != VK_NULL_HANDLE && g_charIndexCount > 0) {
         if (g_boneMapped[frameIndex]) {
             char_model::Mat4 bones[char_model::kMaxBones];
-            for (int b = 0; b < char_model::kMaxBones; ++b) {
-                bones[b] = char_model::Mat4::identity();
-            }
-            // Subtle idle breathing on chest and head
-            const float breath = std::sin(static_cast<float>(g_tick) * 0.06f) * 0.003f;
-            bones[char_model::BoneId::Chest] = char_model::Mat4::translation(0.0f, breath, 0.0f);
-            bones[char_model::BoneId::Head] = char_model::Mat4::translation(0.0f, breath * 0.5f, 0.0f);
+            const float timeSec = static_cast<float>(g_tick) * TICK_DT;
+            char_model::evaluateProceduralPose(char_model::getCanonicalModel(), g_move, g_player, timeSec, bones);
             std::memcpy(g_boneMapped[frameIndex], bones, sizeof(bones));
         }
 
@@ -6733,6 +6718,7 @@ static const CaptureShot kCaptureShots[] = {
     {"pause_menu",      96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotMenu},
     {"preset_retro",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Retro"},
     {"preset_clean",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Clean"},
+    {"char_pose",       99.5f, 4.2f, 137.5f, -0.405f, -0.10f, kShotPlain},
 };
 
 // Shots for a generated-terrain world. The list above is fixed to the
@@ -6761,6 +6747,8 @@ static std::vector<CaptureShot> terrainCaptureShots() {
     // One terrain preset pass, so the post chain is exercised on generated
     // materials as well as on the warehouse's.
     shots.push_back({"terrain_preset", sx, eye, sz, 0.0f, -0.10f, kShotPlain, "Retro"});
+    // Posed character model shot on generated terrain
+    shots.push_back({"terrain_char", sx + 3.5f, eye, sz + 5.5f, -0.405f, -0.10f, kShotPlain});
     return shots;
 }
 

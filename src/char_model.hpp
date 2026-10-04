@@ -17,6 +17,9 @@
 //   Lattice bounds, proportions, and bone assignments are generated deterministically
 //   from integer coordinates and seed parameters.
 
+#include "movement.hpp"
+#include "player_body.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -140,6 +143,39 @@ struct Mat4 {
 
     static Mat4 scaling(float s) {
         return scaling(s, s, s);
+    }
+
+    static Mat4 rotationX(float rad) {
+        Mat4 r;
+        const float c = std::cos(rad);
+        const float s = std::sin(rad);
+        r.m[5] = c;
+        r.m[6] = s;
+        r.m[9] = -s;
+        r.m[10] = c;
+        return r;
+    }
+
+    static Mat4 rotationY(float rad) {
+        Mat4 r;
+        const float c = std::cos(rad);
+        const float s = std::sin(rad);
+        r.m[0] = c;
+        r.m[2] = -s;
+        r.m[8] = s;
+        r.m[10] = c;
+        return r;
+    }
+
+    static Mat4 rotationZ(float rad) {
+        Mat4 r;
+        const float c = std::cos(rad);
+        const float s = std::sin(rad);
+        r.m[0] = c;
+        r.m[1] = s;
+        r.m[4] = -s;
+        r.m[5] = c;
+        return r;
     }
 
     static Mat4 multiply(const Mat4& a, const Mat4& b) {
@@ -473,6 +509,234 @@ inline uint64_t hashModel(const Model& model) {
         addU32(bz);
     }
     return h;
+}
+
+// Returns the canonical humanoid model, generated once and cached.
+inline const Model& getCanonicalModel() {
+    static const Model s_model = generateHumanoid(0);
+    return s_model;
+}
+
+// Procedural locomotion baseline for character model posing (view-side only, Models layer).
+// Evaluates skeletal bone transforms from player movement intent and body state.
+// The simulation never reads these transforms; they are uploaded to the BonePalette SSBO
+// for GPU vertex skinning in char.vert.
+inline void evaluateProceduralPose(
+    const Model& model,
+    const movement::MoveState& move,
+    const PlayerBody& body,
+    float timeSec,
+    Mat4 outBones[kMaxBones])
+{
+    Vec3 localTrans[BoneId::Count]{};
+    Mat4 localRot[BoneId::Count];
+    for (int b = 0; b < BoneId::Count; ++b) {
+        localRot[b] = Mat4::identity();
+    }
+
+    // 1. Horizontal speed & movement intent
+    const float speedSq = body.vx * body.vx + body.vz * body.vz;
+    const float speed = std::sqrt(speedSq);
+    const bool isMoving = (speed > 0.001f);
+
+    // 2. Stamina-driven fatigue
+    const float stamina = std::clamp(move.stamina, 0.0f, 100.0f);
+    const float fatigue = (100.0f - stamina) / 100.0f; // 0 = rested, 1 = exhausted
+
+    // 3. Idle & Stamina Breathing:
+    // When idle or low on stamina, apply sinusoidal chest/spine heave and head bob
+    // with breathing rate scaled by (100.0f - move.stamina) / 100.0f.
+    const float breathFreq = 2.2f + 3.8f * fatigue;
+    const float breathAmp = 0.0025f + 0.0050f * fatigue;
+    const float breath = std::sin(timeSec * breathFreq) * breathAmp;
+
+    localTrans[BoneId::Chest].y += breath;
+    localTrans[BoneId::Spine].y += breath * 0.5f;
+    localTrans[BoneId::Head].y += breath * 0.4f;
+    localRot[BoneId::Head] = Mat4::rotationX(breath * 4.0f);
+
+    // Subtle idle sway when resting
+    if (!isMoving) {
+        const float idleSway = std::sin(timeSec * 1.5f) * 0.0015f * (1.0f + fatigue * 0.5f);
+        localTrans[BoneId::Pelvis].x += idleSway;
+        localRot[BoneId::Pelvis] = Mat4::rotationZ(idleSway * 1.5f);
+    }
+
+    // 4. Gait Cycles:
+    // When moving horizontally (sqrt(vx^2 + vz^2) > 0.001f), calculate locomotion phase
+    // based on gait cycle duration (Walk = 1.0s, Run = 0.7s, Sprint = 0.5s).
+    // Rotate thighs and calves in counter-phase around their modelPos anchors, counter-swing
+    // shoulders/forearms, and apply vertical hip bob and lateral pelvic sway.
+    if (isMoving) {
+        float cycleDuration = 1.0f;
+        if (move.stance == movement::Stance::Crouch) {
+            cycleDuration = 1.3f;
+        } else if (move.stance == movement::Stance::Prone) {
+            cycleDuration = 1.6f;
+        } else if (move.gait == movement::Gait::Sprint) {
+            cycleDuration = 0.5f;
+        } else if (move.gait == movement::Gait::Run) {
+            cycleDuration = 0.7f;
+        } else {
+            cycleDuration = 1.0f;
+        }
+
+        const float animPhase = (timeSec / cycleDuration) * 2.0f * 3.1415926535f;
+        const float s = std::sin(animPhase);
+        const float c = std::cos(animPhase);
+
+        float legSwingMax = 0.40f;
+        float kneeBendMax = 0.55f;
+        float armSwingMax = 0.35f;
+        float hipBobMax = 0.0035f;
+        float pelvisSwayMax = 0.0025f;
+
+        if (move.gait == movement::Gait::Run) {
+            legSwingMax = 0.65f;
+            kneeBendMax = 0.80f;
+            armSwingMax = 0.55f;
+            hipBobMax = 0.0060f;
+            pelvisSwayMax = 0.0035f;
+        } else if (move.gait == movement::Gait::Sprint) {
+            legSwingMax = 0.85f;
+            kneeBendMax = 1.05f;
+            armSwingMax = 0.75f;
+            hipBobMax = 0.0085f;
+            pelvisSwayMax = 0.0045f;
+        }
+
+        // Thighs counter-phase
+        localRot[BoneId::LThigh] = Mat4::rotationX(s * legSwingMax);
+        localRot[BoneId::RThigh] = Mat4::rotationX(-s * legSwingMax);
+
+        // Calves flex backward when thigh swings forward
+        localRot[BoneId::LCalf] = Mat4::rotationX(-std::max(0.0f, s) * kneeBendMax);
+        localRot[BoneId::RCalf] = Mat4::rotationX(-std::max(0.0f, -s) * kneeBendMax);
+
+        // Feet counter-flexion to stay level
+        localRot[BoneId::LFoot] = Mat4::rotationX(-s * legSwingMax * 0.35f);
+        localRot[BoneId::RFoot] = Mat4::rotationX(s * legSwingMax * 0.35f);
+
+        // Arms counter-swing opposite to legs
+        localRot[BoneId::LUpperArm] = Mat4::rotationX(-s * armSwingMax);
+        localRot[BoneId::RUpperArm] = Mat4::rotationX(s * armSwingMax);
+
+        // Forearms slight resting bend + flexion on forward swing
+        localRot[BoneId::LForeArm] = Mat4::rotationX(0.20f + std::max(0.0f, -s) * 0.35f);
+        localRot[BoneId::RForeArm] = Mat4::rotationX(0.20f + std::max(0.0f, s) * 0.35f);
+
+        // Pelvis hip bob and lateral sway
+        localTrans[BoneId::Pelvis].y -= std::abs(s) * hipBobMax;
+        localTrans[BoneId::Pelvis].x += c * pelvisSwayMax;
+        localRot[BoneId::Pelvis] = Mat4::rotationZ(c * 0.04f);
+
+        // Torso counter-twist
+        localRot[BoneId::Spine] = Mat4::rotationY(-s * 0.07f);
+    }
+
+    // 5. Stance Adaptations:
+    // In Crouch and Prone, compress spine height and flex thighs/calves to match
+    // collision heights (STANCE_COLLISION_HEIGHT).
+    if (move.stance == movement::Stance::Crouch) {
+        // Lower pelvis by ~0.42m to match crouch height
+        localTrans[BoneId::Pelvis].y -= 26.0f * kCellSize;
+        localRot[BoneId::LThigh] = Mat4::multiply(localRot[BoneId::LThigh], Mat4::rotationX(0.85f));
+        localRot[BoneId::RThigh] = Mat4::multiply(localRot[BoneId::RThigh], Mat4::rotationX(0.85f));
+        localRot[BoneId::LCalf] = Mat4::multiply(localRot[BoneId::LCalf], Mat4::rotationX(-1.45f));
+        localRot[BoneId::RCalf] = Mat4::multiply(localRot[BoneId::RCalf], Mat4::rotationX(-1.45f));
+        localRot[BoneId::LFoot] = Mat4::multiply(localRot[BoneId::LFoot], Mat4::rotationX(0.60f));
+        localRot[BoneId::RFoot] = Mat4::multiply(localRot[BoneId::RFoot], Mat4::rotationX(0.60f));
+        localRot[BoneId::Spine] = Mat4::multiply(localRot[BoneId::Spine], Mat4::rotationX(0.25f));
+        localRot[BoneId::Chest] = Mat4::multiply(localRot[BoneId::Chest], Mat4::rotationX(0.15f));
+        localRot[BoneId::Head] = Mat4::multiply(localRot[BoneId::Head], Mat4::rotationX(-0.25f));
+    } else if (move.stance == movement::Stance::Prone) {
+        // Lower pelvis near floor and rotate horizontal
+        localTrans[BoneId::Pelvis].y -= 46.0f * kCellSize;
+        localRot[BoneId::Pelvis] = Mat4::multiply(localRot[BoneId::Pelvis], Mat4::rotationX(1.52f));
+        localRot[BoneId::Head] = Mat4::multiply(localRot[BoneId::Head], Mat4::rotationX(-1.35f));
+        localRot[BoneId::LThigh] = Mat4::rotationX(-1.45f);
+        localRot[BoneId::RThigh] = Mat4::rotationX(-1.45f);
+        localRot[BoneId::LCalf] = Mat4::rotationX(-0.20f);
+        localRot[BoneId::RCalf] = Mat4::rotationX(-0.20f);
+        localRot[BoneId::LUpperArm] = Mat4::rotationX(0.60f);
+        localRot[BoneId::RUpperArm] = Mat4::rotationX(0.60f);
+        localRot[BoneId::LForeArm] = Mat4::rotationX(0.80f);
+        localRot[BoneId::RForeArm] = Mat4::rotationX(0.80f);
+    }
+
+    // 6. Maneuvers:
+    // Pitch torso forward during slide and dash, bank during wallrun.
+    if (move.sliding) {
+        localTrans[BoneId::Pelvis].y -= 18.0f * kCellSize;
+        localRot[BoneId::Pelvis] = Mat4::rotationX(-0.40f);
+        localRot[BoneId::Spine] = Mat4::rotationX(-0.15f);
+        localRot[BoneId::LThigh] = Mat4::rotationX(1.20f);
+        localRot[BoneId::RThigh] = Mat4::rotationX(1.10f);
+        localRot[BoneId::LCalf] = Mat4::rotationX(0.15f);
+        localRot[BoneId::RCalf] = Mat4::rotationX(0.30f);
+        localRot[BoneId::LUpperArm] = Mat4::rotationX(-0.60f);
+        localRot[BoneId::RUpperArm] = Mat4::rotationX(-0.60f);
+    }
+
+    if (move.dashing) {
+        localRot[BoneId::Pelvis] = Mat4::multiply(localRot[BoneId::Pelvis], Mat4::rotationX(0.45f));
+        localRot[BoneId::Spine] = Mat4::multiply(localRot[BoneId::Spine], Mat4::rotationX(0.20f));
+        localTrans[BoneId::Pelvis].y -= 4.0f * kCellSize;
+    }
+
+    if (move.wallRunning) {
+        const float bank = static_cast<float>(move.wallRunSide) * 0.35f;
+        localRot[BoneId::Pelvis] = Mat4::multiply(localRot[BoneId::Pelvis], Mat4::rotationZ(bank));
+        localRot[BoneId::Chest] = Mat4::multiply(localRot[BoneId::Chest], Mat4::rotationZ(bank * 0.4f));
+        localRot[BoneId::Head] = Mat4::multiply(localRot[BoneId::Head], Mat4::rotationZ(-bank * 0.3f));
+        if (move.wallRunSide > 0) {
+            localRot[BoneId::RThigh] = Mat4::rotationX(-0.55f);
+            localRot[BoneId::RCalf] = Mat4::rotationX(-0.40f);
+        } else {
+            localRot[BoneId::LThigh] = Mat4::rotationX(-0.55f);
+            localRot[BoneId::LCalf] = Mat4::rotationX(-0.40f);
+        }
+    }
+
+    // Player lean coupling (Q/E)
+    if (std::abs(body.lean) > 0.01f) {
+        const float leanRoll = -body.lean * 0.15f;
+        localRot[BoneId::Spine] = Mat4::multiply(localRot[BoneId::Spine], Mat4::rotationZ(leanRoll));
+        localRot[BoneId::Head] = Mat4::multiply(localRot[BoneId::Head], Mat4::rotationZ(-leanRoll * 0.5f));
+    }
+
+    // 7. Forward kinematics pass: propagate joint positions and rotations
+    // down the topological skeletal tree (all parents < child index).
+    struct JointState {
+        Vec3 pos;
+        Mat4 rot;
+    };
+    JointState global[kMaxBones];
+
+    // Bone 0: Root
+    global[0].pos = model.skeleton[0].modelPos + localTrans[0];
+    global[0].rot = localRot[0];
+
+    for (int b = 1; b < BoneId::Count; ++b) {
+        const int p = model.skeleton[b].parent;
+        const Vec3 restOffset = model.skeleton[b].modelPos - model.skeleton[p].modelPos;
+        const Vec3 rotatedOffset = global[p].rot.transformVector(restOffset + localTrans[b]);
+        global[b].pos = global[p].pos + rotatedOffset;
+        global[b].rot = Mat4::multiply(global[p].rot, localRot[b]);
+    }
+
+    // 8. Compute bone skinning matrices:
+    // outBones[b] = T(global[b].pos) * global[b].rot * T(-modelPos[b])
+    for (int b = 0; b < BoneId::Count; ++b) {
+        const Vec3& restPos = model.skeleton[b].modelPos;
+        outBones[b] = Mat4::multiply(
+            Mat4::translation(global[b].pos),
+            Mat4::multiply(global[b].rot, Mat4::translation(-restPos.x, -restPos.y, -restPos.z))
+        );
+    }
+    for (int b = BoneId::Count; b < kMaxBones; ++b) {
+        outBones[b] = Mat4::identity();
+    }
 }
 
 } // namespace char_model
