@@ -42,6 +42,7 @@ function Compile-Shader([string]$Name) {
 }
 Compile-Shader "voxel.vert"
 Compile-Shader "voxel.frag"
+Compile-Shader "char.vert"
 if (Test-Path (Join-Path $Root "shaders\post.vert")) {
   Compile-Shader "post.vert"
   Compile-Shader "post.frag"

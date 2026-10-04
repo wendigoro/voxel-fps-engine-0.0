@@ -559,6 +559,7 @@ static VkDescriptorSetLayout g_dsl = VK_NULL_HANDLE;
 static VkPipelineLayout g_pipelineLayout = VK_NULL_HANDLE;
 static VkPipeline g_pipeline = VK_NULL_HANDLE;
 static VkPipeline g_overlayPipeline = VK_NULL_HANDLE;
+static VkPipeline g_charPipeline = VK_NULL_HANDLE;
 static VkCommandPool g_cmdPool = VK_NULL_HANDLE;
 static std::vector<VkCommandBuffer> g_cmdBuffers;
 static VkImage g_depthImage = VK_NULL_HANDLE;
@@ -601,6 +602,20 @@ static VkDeviceMemory g_uboMems[MAX_FRAMES]{};
 static void* g_uboMapped[MAX_FRAMES]{};
 static VkDescriptorPool g_descPool = VK_NULL_HANDLE;
 static VkDescriptorSet g_descSets[MAX_FRAMES]{};
+static VkBuffer g_boneBuf[MAX_FRAMES]{};
+static VkDeviceMemory g_boneMem[MAX_FRAMES]{};
+static void* g_boneMapped[MAX_FRAMES]{};
+
+// Skinned character model buffers (Models layer, view-side only)
+static VkBuffer g_charVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_charMem = VK_NULL_HANDLE;
+static void* g_charMapped = nullptr;
+static VkBuffer g_charIB = VK_NULL_HANDLE;
+static VkDeviceMemory g_charIBMem = VK_NULL_HANDLE;
+static void* g_charIBMapped = nullptr;
+static uint32_t g_charIndexCount = 0;
+static uint32_t g_charVertexCount = 0;
+static char_mesh::ExtractedMesh g_charExtracted;
 static VkSemaphore g_imageAvailable[MAX_FRAMES]{};
 static VkSemaphore g_renderFinished[MAX_FRAMES]{};
 static VkFence g_inFlight[MAX_FRAMES]{};
@@ -1623,6 +1638,36 @@ static void buildFixtureMesh() {
                          l.y - 1.0f + static_cast<float>(k), l.z - 0.5f, VOXEL_SIZE, l.r, l.g, l.b, cls);
     }
     g_fixtureVertexCount = wi;
+}
+
+// Skinned character mesh initialization and GPU buffer allocation (Models layer).
+// Canonical humanoid sub-lattice is extracted once into static vertex/index buffers.
+static void initCharacterMesh() {
+    if (g_charVB != VK_NULL_HANDLE) return;
+    const char_model::Model model = char_model::generateHumanoid(0);
+    g_charExtracted = char_mesh::extractMesh(model);
+    if (g_charExtracted.vertices.empty() || g_charExtracted.indices.empty()) return;
+
+    g_charVertexCount = static_cast<uint32_t>(g_charExtracted.vertices.size());
+    g_charIndexCount = static_cast<uint32_t>(g_charExtracted.indices.size());
+
+    const VkDeviceSize vbSize = sizeof(char_mesh::SkinnedVertex) * g_charVertexCount;
+    createBuffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_charVB, g_charMem);
+    vkMapMemory(g_device, g_charMem, 0, vbSize, 0, &g_charMapped);
+    if (g_charMapped) {
+        std::memcpy(g_charMapped, g_charExtracted.vertices.data(), static_cast<size_t>(vbSize));
+    }
+
+    const VkDeviceSize ibSize = sizeof(uint32_t) * g_charIndexCount;
+    createBuffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_charIB, g_charIBMem);
+    vkMapMemory(g_device, g_charIBMem, 0, ibSize, 0, &g_charIBMapped);
+    if (g_charIBMapped) {
+        std::memcpy(g_charIBMapped, g_charExtracted.indices.data(), static_cast<size_t>(ibSize));
+    }
 }
 
 static void updatePickupMesh() {
@@ -2872,7 +2917,7 @@ static void recordOccupancyUpload(VkCommandBuffer cmd, uint32_t frameIndex) {
 static void createDescriptors() {
     uploadTextures();
     createOccupancyVolume();
-    VkDescriptorSetLayoutBinding bindings[4]{};
+    VkDescriptorSetLayoutBinding bindings[5]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -2887,9 +2932,13 @@ static void createDescriptors() {
     bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[4].binding = 4; // bone palette
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 4;
+    lci.bindingCount = 5;
     lci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(g_device, &lci, nullptr, &g_dsl) != VK_SUCCESS)
         fail("descriptor set layout failed");
@@ -2899,11 +2948,24 @@ static void createDescriptors() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      g_uboBuffers[i], g_uboMems[i]);
         vkMapMemory(g_device, g_uboMems[i], 0, sizeof(FrameUBO), 0, &g_uboMapped[i]);
+
+        const VkDeviceSize boneBufSize = sizeof(char_model::Mat4) * char_model::kMaxBones;
+        createBuffer(boneBufSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_boneBuf[i], g_boneMem[i]);
+        vkMapMemory(g_device, g_boneMem[i], 0, boneBufSize, 0, &g_boneMapped[i]);
+        if (g_boneMapped[i]) {
+            char_model::Mat4 idents[char_model::kMaxBones];
+            for (int b = 0; b < char_model::kMaxBones; ++b) {
+                idents[b] = char_model::Mat4::identity();
+            }
+            std::memcpy(g_boneMapped[i], idents, static_cast<size_t>(boneBufSize));
+        }
     }
 
     VkDescriptorPoolSize poolSizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES},
                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAMES}};
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * MAX_FRAMES}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.poolSizeCount = 3;
     pci.pPoolSizes = poolSizes;
@@ -2948,8 +3010,15 @@ static void createDescriptors() {
         lightWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         lightWrite.descriptorCount = 1;
         lightWrite.pBufferInfo = &li;
-        VkWriteDescriptorSet writes[4] = {write, texWrite, occWrite, lightWrite};
-        vkUpdateDescriptorSets(g_device, 4, writes, 0, nullptr);
+        VkDescriptorBufferInfo boneBi{g_boneBuf[i], 0, sizeof(char_model::Mat4) * char_model::kMaxBones};
+        VkWriteDescriptorSet boneWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        boneWrite.dstSet = g_descSets[i];
+        boneWrite.dstBinding = 4;
+        boneWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        boneWrite.descriptorCount = 1;
+        boneWrite.pBufferInfo = &boneBi;
+        VkWriteDescriptorSet writes[5] = {write, texWrite, occWrite, lightWrite, boneWrite};
+        vkUpdateDescriptorSets(g_device, 5, writes, 0, nullptr);
     }
 }
 
@@ -3062,9 +3131,16 @@ rs.cullMode = VK_CULL_MODE_NONE; // sky dome + moon billboard + world
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynStates;
 
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(char_model::Mat4);
+
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &g_dsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(g_device, &plci, nullptr, &g_pipelineLayout) != VK_SUCCESS)
         fail("pipeline layout failed");
 
@@ -3093,6 +3169,48 @@ rs.cullMode = VK_CULL_MODE_NONE; // sky dome + moon billboard + world
     if (vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &g_overlayPipeline) != VK_SUCCESS)
         fail("overlay graphics pipeline failed");
 
+    // Skinned character pipeline (char.vert + voxel.frag)
+    const std::string charVertPath = resolveShaderPath("char.vert");
+    if (charVertPath.empty()) return false;
+    VkShaderModule charVert = loadShader(charVertPath);
+
+    VkPipelineShaderStageCreateInfo charStages[2]{};
+    charStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    charStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    charStages[0].module = charVert;
+    charStages[0].pName = "main";
+    charStages[1] = stages[1]; // voxel.frag
+
+    VkVertexInputBindingDescription charBind{};
+    charBind.binding = 0;
+    charBind.stride = sizeof(char_mesh::SkinnedVertex);
+    charBind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription charAttrs[7]{};
+    charAttrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(char_mesh::SkinnedVertex, x)};
+    charAttrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(char_mesh::SkinnedVertex, nx)};
+    charAttrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(char_mesh::SkinnedVertex, r)};
+    charAttrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT, offsetof(char_mesh::SkinnedVertex, mat)};
+    charAttrs[4] = {4, 0, VK_FORMAT_R8G8B8A8_UINT, offsetof(char_mesh::SkinnedVertex, bone)};
+    charAttrs[5] = {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(char_mesh::SkinnedVertex, weight)};
+    charAttrs[6] = {6, 0, VK_FORMAT_R8_UINT, offsetof(char_mesh::SkinnedVertex, region)};
+
+    VkPipelineVertexInputStateCreateInfo charVi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    charVi.vertexBindingDescriptionCount = 1;
+    charVi.pVertexBindingDescriptions = &charBind;
+    charVi.vertexAttributeDescriptionCount = 7;
+    charVi.pVertexAttributeDescriptions = charAttrs;
+
+    VkGraphicsPipelineCreateInfo charPci = pci;
+    charPci.stageCount = 2;
+    charPci.pStages = charStages;
+    charPci.pVertexInputState = &charVi;
+    charPci.renderPass = g_renderPass;
+    charPci.subpass = 0;
+    if (vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &charPci, nullptr, &g_charPipeline) != VK_SUCCESS)
+        fail("character graphics pipeline failed");
+
+    vkDestroyShaderModule(g_device, charVert, nullptr);
     vkDestroyShaderModule(g_device, vert, nullptr);
     vkDestroyShaderModule(g_device, frag, nullptr);
     return true;
@@ -5697,6 +5815,45 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         vkCmdDraw(cmd, g_pickupVertexCount, 1, 0, 0);
     }
 
+    // Skinned character models (Models layer, view-side only)
+    if (g_charVB == VK_NULL_HANDLE) initCharacterMesh();
+    if (g_charPipeline != VK_NULL_HANDLE && g_charVB != VK_NULL_HANDLE && g_charIndexCount > 0) {
+        if (g_boneMapped[frameIndex]) {
+            char_model::Mat4 bones[char_model::kMaxBones];
+            for (int b = 0; b < char_model::kMaxBones; ++b) {
+                bones[b] = char_model::Mat4::identity();
+            }
+            // Subtle idle breathing on chest and head
+            const float breath = std::sin(static_cast<float>(g_tick) * 0.06f) * 0.003f;
+            bones[char_model::BoneId::Chest] = char_model::Mat4::translation(0.0f, breath, 0.0f);
+            bones[char_model::BoneId::Head] = char_model::Mat4::translation(0.0f, breath * 0.5f, 0.0f);
+            std::memcpy(g_boneMapped[frameIndex], bones, sizeof(bones));
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_charPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelineLayout, 0, 1,
+                                &g_descSets[frameIndex], 0, nullptr);
+        VkDeviceSize cOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_charVB, &cOff);
+        vkCmdBindIndexBuffer(cmd, g_charIB, 0, VK_INDEX_TYPE_UINT32);
+
+        const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
+        const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
+        const char_model::Mat4 transMat = char_model::Mat4::translation(
+            static_cast<float>(g_spawnCellX + 2) * VOXEL_SIZE,
+            static_cast<float>(g_spawnCellY) * VOXEL_SIZE,
+            static_cast<float>(g_spawnCellZ + 2) * VOXEL_SIZE
+        );
+        const char_model::Mat4 modelMat = char_model::Mat4::multiply(transMat, scaleMat);
+        vkCmdPushConstants(cmd, g_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(char_model::Mat4), &modelMat);
+        vkCmdDrawIndexed(cmd, g_charIndexCount, 1, 0, 0, 0);
+
+        // Restore world pipeline & descriptors for following passes (debris & sky)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelineLayout, 0, 1,
+                                &g_descSets[frameIndex], 0, nullptr);
+    }
+
     // Visual debris cubes (8x8x8 chips) after world mesh, before sky
     if (g_debrisVB != VK_NULL_HANDLE && g_debrisVertexCount > 0) {
         VkDeviceSize dOff = 0;
@@ -6733,6 +6890,7 @@ static void cleanup() {
     destroySwapchainObjects();
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, nullptr);
     if (g_overlayPipeline) vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
+    if (g_charPipeline) vkDestroyPipeline(g_device, g_charPipeline, nullptr);
     if (g_pipelineLayout) vkDestroyPipelineLayout(g_device, g_pipelineLayout, nullptr);
     g_post.destroy(); // owns the world render pass (g_renderPass)
     g_renderPass = VK_NULL_HANDLE;
@@ -6748,6 +6906,14 @@ static void cleanup() {
         if (g_occStageMem[i]) vkFreeMemory(g_device, g_occStageMem[i], nullptr);
         if (g_lightBuf[i]) vkDestroyBuffer(g_device, g_lightBuf[i], nullptr);
         if (g_lightMem[i]) vkFreeMemory(g_device, g_lightMem[i], nullptr);
+        if (g_boneBuf[i]) {
+            if (g_boneMapped[i]) vkUnmapMemory(g_device, g_boneMem[i]);
+            vkDestroyBuffer(g_device, g_boneBuf[i], nullptr);
+            vkFreeMemory(g_device, g_boneMem[i], nullptr);
+            g_boneBuf[i] = VK_NULL_HANDLE;
+            g_boneMem[i] = VK_NULL_HANDLE;
+            g_boneMapped[i] = nullptr;
+        }
     }
     if (g_texView) vkDestroyImageView(g_device, g_texView, nullptr);
     if (g_texImage) vkDestroyImage(g_device, g_texImage, nullptr);
@@ -6807,6 +6973,22 @@ if (g_skyTileVB) {
         g_inventoryMem = VK_NULL_HANDLE;
     }
     g_inventoryVertexCount = 0;
+    if (g_charVB) {
+        if (g_charMapped) { vkUnmapMemory(g_device, g_charMem); g_charMapped = nullptr; }
+        vkDestroyBuffer(g_device, g_charVB, nullptr);
+        vkFreeMemory(g_device, g_charMem, nullptr);
+        g_charVB = VK_NULL_HANDLE;
+        g_charMem = VK_NULL_HANDLE;
+    }
+    g_charVertexCount = 0;
+    if (g_charIB) {
+        if (g_charIBMapped) { vkUnmapMemory(g_device, g_charIBMem); g_charIBMapped = nullptr; }
+        vkDestroyBuffer(g_device, g_charIB, nullptr);
+        vkFreeMemory(g_device, g_charIBMem, nullptr);
+        g_charIB = VK_NULL_HANDLE;
+        g_charIBMem = VK_NULL_HANDLE;
+    }
+    g_charIndexCount = 0;
     destroyWorldMeshBuffer();
     if (g_cmdPool) vkDestroyCommandPool(g_device, g_cmdPool, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
@@ -6818,6 +7000,7 @@ if (g_skyTileVB) {
     if (g_hwnd) DestroyWindow(g_hwnd);
     g_pipeline = VK_NULL_HANDLE;
     g_overlayPipeline = VK_NULL_HANDLE;
+    g_charPipeline = VK_NULL_HANDLE;
     g_pipelineLayout = VK_NULL_HANDLE;
     g_renderPass = VK_NULL_HANDLE;
     g_overlayRenderPass = VK_NULL_HANDLE;
@@ -7318,6 +7501,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         seedPickups();
         ensurePickupBuffer();
         buildFixtureMesh();
+        initCharacterMesh();
 
         if (!exportMapPath.empty()) {
             const bool ok = exportMapDocument(world, exportMapPath);
