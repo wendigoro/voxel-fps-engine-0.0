@@ -1,0 +1,21 @@
+{
+ "format_version": 2,
+ "unit": 1,
+ "voxel_size": 0.001,
+ "mode": "map",
+ "dims": [
+  192,
+  64,
+  160
+ ],
+ "terrain": {
+  "class": "valley",
+  "seed": 20260930,
+  "props": true,
+  "roads": true
+ },
+ "cells_rle": {
+  "palette": [],
+  "runs": []
+ }
+}

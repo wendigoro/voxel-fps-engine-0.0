@@ -76,6 +76,10 @@ inline MaterialId blockMaterial(sim::Block b) {
     case Block::Girder: return MaterialId::Girder;
     case Block::Wood: return MaterialId::Wood;
     case Block::WoodDark: return MaterialId::BushBranch;
+    case Block::Sand: return MaterialId::Sand;
+    case Block::Grass: return MaterialId::Grass;
+    case Block::Snow: return MaterialId::Snow;
+    case Block::Asphalt: return MaterialId::Asphalt;
     case Block::Water:
     case Block::WaterCurrent: return MaterialId::Water;
     case Block::Moon:

@@ -39,6 +39,11 @@ MATERIALS: dict[str, Material] = {
     "treated_wood": Material(
         "treated_wood", density=0.75, weight=0.95, fragility=0.35, toughness=1.50, damping=0.42
     ),
+    # Ground materials: generated terrain (src/terrain.hpp) and painted ground.
+    "sand": Material("sand", density=1.60, weight=1.60, fragility=0.80, toughness=0.40, damping=0.45),
+    "grass": Material("grass", density=0.50, weight=0.70, fragility=0.95, toughness=0.10, damping=0.20),
+    "snow": Material("snow", density=0.30, weight=0.40, fragility=0.99, toughness=0.06, damping=0.30),
+    "asphalt": Material("asphalt", density=2.30, weight=1.30, fragility=0.12, toughness=2.20, damping=0.50),
 }
 
 # Engine unit voxel edge length (1000x smaller than original 1.0 blocks).

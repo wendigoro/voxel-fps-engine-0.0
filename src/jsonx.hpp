@@ -103,6 +103,15 @@ inline float jsonExtractFloat(const std::string& obj, const char* key, float fal
     }
 }
 
+// Is the key present at all? Every extractor above takes a fallback, which
+// cannot tell a field the author omitted from one whose value happens to equal
+// the fallback. A field that is REQUIRED must be told apart from one that
+// merely defaults, or a missing value silently becomes a default (the terrain
+// seed is the case that matters: a defaulted seed would be a silent clock).
+inline bool jsonxHasKey(const std::string& obj, const char* key) {
+    return obj.find(std::string("\"") + key + "\"") != std::string::npos;
+}
+
 inline bool jsonExtractBool(const std::string& obj, const char* key, bool fallback) {
     const std::string pat = std::string("\"") + key + "\"";
     size_t k = obj.find(pat);
@@ -309,6 +318,13 @@ inline bool jsonxSelfTest() {
     ok = ok && jsonExtractBool("{\"hitscan\":1}", "hitscan", false);
     ok = ok && !jsonExtractBool("{\"hitscan\":0}", "hitscan", true);
     ok = ok && jsonExtractBool("{\"a\":1}", "hitscan", true); // missing -> fallback
+
+    // jsonxHasKey: separates "authored as the fallback" from "not authored",
+    // which no extractor taking a fallback can do on its own.
+    ok = ok && jsonxHasKey("{\"seed\":0}", "seed");
+    ok = ok && jsonxHasKey("{\"seed\":7,\"base\":3}", "seed");
+    ok = ok && !jsonxHasKey("{\"base\":3}", "seed");
+    ok = ok && !jsonxHasKey("{}", "seed");
 
     // jsonExtractObjectBody: nested braces must stay balanced.
     ok = ok && jsonExtractObjectBody("{\"stats\":{\"a\":{\"b\":1},\"c\":2}}", "stats") ==

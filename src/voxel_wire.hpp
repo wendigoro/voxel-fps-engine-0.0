@@ -49,6 +49,12 @@ enum class BlockId : uint8_t {
     WaterCurrent = 8, // moving water source (same visual, current sampling)
     Moon = 9,         // cool emissive crescent grid
     LightBulb = 10,   // warm emissive indoor bulbs
+    // Ground materials. Appended for generated terrain (src/terrain.hpp) and
+    // painted ground; all solid, all unit cubes like every other block.
+    Sand = 11,
+    Grass = 12,
+    Snow = 13,
+    Asphalt = 14,
 };
 
 // 1 cell of padding on every side, so a view can decide whether a face on its
@@ -61,11 +67,26 @@ static constexpr int kSkirtCells = kSlice * kSlice * kSlice; // 39304
 
 // One block as it appears in a snapshot. Trivially copyable on purpose: this
 // is memcpy'd into shared memory and, later, appended to a UDP packet.
+// One cell on the wire: what occupies it, and how it is painted. `appear` is
+// an index into the map palette (Palette below); 0 means "the material's own
+// colour". Appearance is display data: the simulation never reads it back.
 struct BlockCell {
-    uint8_t id = 0;  // wire::BlockId
+    uint8_t id = 0;      // wire::BlockId
+    uint8_t appear = 0;  // palette index, 0 = material default
 };
 
-static_assert(sizeof(BlockCell) == 1, "BlockCell must stay one byte on the wire");
+static_assert(sizeof(BlockCell) == 2, "BlockCell is two bytes on the wire: block id + appearance");
+
+// The map palette, sent once with the map. Entry 0 is never used (it means
+// "material default"); entries 1..255 are authored colours.
+struct PaletteColor {
+    uint8_t r = 0, g = 0, b = 0;
+};
+static constexpr int kPaletteSize = 256;
+struct Palette {
+    PaletteColor colors[kPaletteSize];
+    int used = 1; // entries in use, counting the reserved 0
+};
 
 // Local cell coordinates as a view addresses its own snapshot. Skirted, so
 // valid range is -1 .. kChunkSize inclusive on each axis.

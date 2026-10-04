@@ -29,6 +29,7 @@
 #include <thread>
 #include <vector>
 
+#include "render_class.hpp"
 #include "view_chunk.hpp"
 
 namespace meshview {
@@ -92,6 +93,10 @@ inline Vec3 blockColor(wire::BlockId b) {
     case wire::BlockId::WaterCurrent: return {0.10f, 0.35f, 0.48f};
     case wire::BlockId::Moon:         return {0.75f, 0.80f, 0.90f};
     case wire::BlockId::LightBulb:    return {1.00f, 0.75f, 0.45f};
+    case wire::BlockId::Sand:         return {0.76f, 0.68f, 0.48f};
+    case wire::BlockId::Grass:        return {0.24f, 0.42f, 0.16f};
+    case wire::BlockId::Snow:         return {0.86f, 0.89f, 0.93f};
+    case wire::BlockId::Asphalt:      return {0.20f, 0.20f, 0.22f};
     default:                          return {1, 0, 1};
     }
 }
@@ -154,7 +159,8 @@ inline void emitSharpFace(std::vector<view::ViewChunk::Vertex>& out, int ix, int
 inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
                              int lx, int ly, int lz,
                              int gx, int gy, int gz, int face,
-                             const Vec3& color, float mat = 0.0f) {
+                             const Vec3& color, float mat = 0.0f,
+                             float texLayerPlus1 = 0.0f, float painted = 0.0f) {
     static const float F[6][4][3] = {
         {{1,0,0},{1,1,0},{1,1,1},{1,0,1}}, // +X
         {{0,0,1},{0,1,1},{0,1,0},{0,0,0}}, // -X
@@ -183,6 +189,7 @@ inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
     int aoVal[4] = {3, 3, 3, 3};
     Vec3 cornerNorm[4];
     Vec3 cornerCol[4];
+    float cornerShade[4];
 
     for (int k = 0; k < 4; ++k) {
         const float* p = F[face][k];
@@ -217,7 +224,8 @@ inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
             aoVal[k] = 3;
         }
         const float aoFactor = kAoCurve[aoVal[k]];
-        cornerCol[k] = color * faceShade[face] * aoFactor;
+        cornerShade[k] = faceShade[face] * aoFactor;
+        cornerCol[k] = color * cornerShade[k];
 
         // Vertex normal smoothing: inspect 8 cubes around vertex in 1-cell skirt
         if (mat == 0.0f) {
@@ -274,7 +282,7 @@ inline void emitSmoothedFace(view::ViewChunk& vc, Stats& stats,
             oz + p[2] * kVoxelSize,
             cornerNorm[ci].x, cornerNorm[ci].y, cornerNorm[ci].z,
             cornerCol[ci].x, cornerCol[ci].y, cornerCol[ci].z,
-            mat
+            mat, texLayerPlus1, painted, cornerShade[ci]
         });
     }
 }
@@ -301,7 +309,14 @@ inline void meshChunk(view::ViewChunk& chunk, Stats& stats) {
                 const wire::BlockId b = sentBlockAt(chunk, stats, lx, ly, lz);
                 if (b == wire::BlockId::Air) continue;
                 const int x = baseX + lx, y = baseY + ly, z = baseZ + lz;
+                // Appearance layer: a painted cell takes its palette colour;
+                // index 0 (or no palette) keeps the material colour.
                 Vec3 col = blockColor(b);
+                const uint8_t ap = chunk.sent.appearance(lx, ly, lz);
+                if (ap != 0 && chunk.palette) {
+                    const wire::PaletteColor& pc = chunk.palette->colors[ap];
+                    col = Vec3(pc.r / 255.0f, pc.g / 255.0f, pc.b / 255.0f);
+                }
 
                 for (int f = 0; f < 6; ++f) {
                     // Read the neighbour out of the skirt. lx+1 == CHUNK_SIZE
@@ -319,11 +334,14 @@ inline void meshChunk(view::ViewChunk& chunk, Stats& stats) {
                         expose = (nb == wire::BlockId::Air) || isWater(nb);
                     }
                     if (!expose) continue;
-                    float mat = 0.0f;
-                    if (isWater(b)) mat = 1.0f;
-                    else if (b == wire::BlockId::LightBulb) mat = 2.0f;
-                    else if (b == wire::BlockId::Moon) mat = 3.0f;
-                    emitSmoothedFace(chunk, stats, lx, ly, lz, x, y, z, f, col, mat);
+                    rc::RenderClass cls = rc::RenderClass::World;
+                    if (isWater(b)) cls = rc::RenderClass::Water;
+                    else if (b == wire::BlockId::LightBulb) cls = rc::RenderClass::Bulb;
+                    else if (b == wire::BlockId::Moon) cls = rc::RenderClass::Moon;
+                    const float mat = rc::attr(cls);
+                    const float texId = chunk.texLayerPlus1 ? float(chunk.texLayerPlus1[uint8_t(b)]) : 0.0f;
+                    emitSmoothedFace(chunk, stats, lx, ly, lz, x, y, z, f, col, mat, texId,
+                                     ap != 0 ? 1.0f : 0.0f);
                 }
             }
         }

@@ -1,10 +1,21 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "render_class.glsl"
 layout(location = 0) in vec3 fragNormal;
 layout(location = 1) in vec3 fragColor;
 layout(location = 2) in vec3 fragWorldPos;
 layout(location = 3) in float fragMat;
 layout(location = 4) in vec2 fragNdc;
 layout(location = 5) in float fragViewZ;
+layout(location = 6) flat in vec2 fragTexId;
+layout(location = 7) in float fragShade;
+layout(set = 0, binding = 1) uniform sampler2DArray uTex;
+// Occupancy of the cells this client was sent (1 = opaque). Built by the view
+// from its chunk snapshots, so a hidden cell can never cast a visible shadow.
+layout(set = 0, binding = 2) uniform sampler3D uOcc;
+// Light sources (environment layer): two vec4 per light,
+// (position.xyz, intensity) then (colour.rgb, radius).
+layout(std430, set = 0, binding = 3) readonly buffer LightList { vec4 lights[]; };
 
 layout(set = 0, binding = 0) uniform FrameUBO {
     mat4 viewProj;
@@ -20,9 +31,61 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float fireOverlay;
     float damageFlash;
     float healthTint;
-    vec4 bulbPos[4];
-    vec4 bulbColor[4];
+    float fisheyeScale; // visuals menu: lens curve multiplier (1 = original)
+    float banding;      // visuals menu: colour-step multiplier (1 = original, 0 = off)
+    float uboPad0;
+    float uboPad1;
+    vec4 texParams[16]; // per texture layer: tileCells, tint, coverage, maskFromLuma
+    vec4 texGlobal;     // enabled, strength, scale, unused
+    vec4 occDims;       // occupancy volume W, H, D (cells), shadows enabled
+    vec4 shadowParams;  // max cells crossed, 1, unused, unused
+    vec4 lightInfo;     // light count (storage buffer below), unused x3
 } ubo;
+
+// World colour banding, scaled by the visuals menu. banding = 1 gives the
+// original steps exactly; 0 turns stepping off; higher is coarser.
+// Triplanar sample of one texture layer in world space: a tile spans
+// `tileWorld` units, so a texture covers many unit cells rather than repeating
+// per cube.
+vec3 triplanar(int layer, vec3 p, vec3 n, float tileWorld) {
+    vec3 w = pow(abs(n), vec3(4.0));
+    w /= (w.x + w.y + w.z + 1e-5);
+    vec3 cx = texture(uTex, vec3(p.zy / tileWorld, float(layer))).rgb;
+    vec3 cy = texture(uTex, vec3(p.xz / tileWorld, float(layer))).rgb;
+    vec3 cz = texture(uTex, vec3(p.xy / tileWorld, float(layer))).rgb;
+    return cx * w.x + cy * w.y + cz * w.z;
+}
+
+// Surface colour for a textured world cell (src/textures.hpp, "Blending").
+// `shadedBase` is the mesh colour, already multiplied by face shade and AO
+// (fragShade); the texture replaces/blends the unshaded colour and the shade
+// is applied again on top.
+vec3 texturedBase(vec3 shadedBase) {
+    if (fragTexId.x < 0.5 || ubo.texGlobal.x < 0.5) return shadedBase;
+    int layer = int(fragTexId.x + 0.5) - 1;
+    vec4 prm = ubo.texParams[layer];
+    float tileWorld = max(prm.x * 0.001 * ubo.texGlobal.z, 1e-4);
+    vec3 t = triplanar(layer, fragWorldPos, normalize(fragNormal), tileWorld);
+    float shade = max(fragShade, 1e-3);
+    vec3 surface = t;
+    if (fragTexId.y > 0.5) {
+        vec3 paint = shadedBase / shade;
+        // Filter: the texture pulled toward the paint (x2 so mid grey is neutral).
+        vec3 filtered = mix(t, clamp(t * paint * 2.0, 0.0, 1.0), prm.y);
+        // Base: the paint shows through where the texture does not cover it;
+        // with maskFromLuma, the texture's bright patches reveal the paint.
+        float luma = dot(t, vec3(0.299, 0.587, 0.114));
+        float cover = prm.z * mix(1.0, 1.0 - smoothstep(0.55, 0.85, luma), prm.w);
+        surface = mix(paint, filtered, cover);
+    }
+    return mix(shadedBase, surface * shade, ubo.texGlobal.y);
+}
+
+vec3 bandq(vec3 c, float levels) {
+    if (ubo.banding <= 0.0) return c;
+    float l = levels / ubo.banding;
+    return floor(c * l + 0.5) / l;
+}
 
 layout(location = 0) out vec4 outColor;
 
@@ -30,58 +93,53 @@ float hash21(vec2 p) {
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
 }
 
-float shadowRayDir(vec3 origin, vec3 L, float maxDist, out float edge) {
-    vec3 o = origin + normalize(fragNormal) * 0.0004;
-    float t = 0.0008;
-    float shadow = 1.0;
-    edge = 0.0;
-    float prev = 1.0;
-    for (int i = 0; i < 4; ++i) {
-        vec3 p = o + L * t;
-        float occ = 1.0;
-        if (p.y < 0.0025) occ = 0.12 + t * 8.0;
-        else if (p.y > 0.002 && p.y < 0.006) {
-            if (p.x > 0.01 && p.x < 0.15 && p.z > 0.01 && p.z < 0.12)
-                occ = 0.2 + t * 5.0;
-        }
-        edge = max(edge, abs(prev - occ));
-        prev = occ;
-        shadow = min(shadow, occ);
-        t += 0.0035 + t * 0.18;
-        if (t > maxDist) break;
-        if (shadow < 0.15) break;
+// Trace from just off the surface toward a light through the occupancy volume,
+// visiting every cell the ray crosses (Amanatides & Woo DDA, as the hitscan
+// does). A fixed-step march would slip between cubes that touch only at a
+// corner and leak light through a checkered roof; this cannot. A hit darkens
+// the light, less when the occluder is far (a cheap stand-in for a penumbra).
+// Returns 1 when unshadowed.
+float marchShadow(vec3 origin, vec3 L, float maxDist) {
+    if (ubo.occDims.w < 0.5) return 1.0;
+    const float vs = 0.001;
+    vec3 o = (origin + normalize(fragNormal) * 0.0007) / vs; // in cells
+    vec3 d = L;
+    ivec3 c = ivec3(floor(o));
+    ivec3 stp = ivec3(sign(d));
+    vec3 invAbs = 1.0 / max(abs(d), vec3(1e-6));
+    vec3 next = vec3(c) + max(vec3(stp), vec3(0.0));       // boundary ahead on each axis
+    vec3 tMax = (next - o) / d;
+    tMax = mix(tMax, vec3(1e30), lessThan(abs(d), vec3(1e-6)));
+    vec3 tDelta = invAbs;
+    ivec3 dims = ivec3(ubo.occDims.xyz);
+    float maxCells = maxDist / vs;
+    int budget = int(ubo.shadowParams.x * max(ubo.shadowParams.y, 0.25));
+    float t = 0.0;
+    for (int i = 0; i < 512; ++i) {
+        if (i >= budget || t > maxCells) break;
+        if (all(greaterThanEqual(c, ivec3(0))) && all(lessThan(c, dims)) &&
+            texelFetch(uOcc, c, 0).r > 0.5)
+            return mix(0.08, 0.45, clamp(t / maxCells, 0.0, 1.0));
+        // Step to the nearest boundary.
+        if (tMax.x < tMax.y && tMax.x < tMax.z) { t = tMax.x; tMax.x += tDelta.x; c.x += stp.x; }
+        else if (tMax.y < tMax.z)               { t = tMax.y; tMax.y += tDelta.y; c.y += stp.y; }
+        else                                    { t = tMax.z; tMax.z += tDelta.z; c.z += stp.z; }
     }
-    edge = clamp(edge * 2.5, 0.0, 1.0);
-    return clamp(shadow, 0.08, 1.0);
+    return 1.0;
+}
+
+float shadowRayDir(vec3 origin, vec3 L, float maxDist, out float edge) {
+    edge = 0.0;
+    return marchShadow(origin, L, maxDist);
 }
 
 float shadowRayPoint(vec3 origin, vec3 lightPos, out float edge) {
+    edge = 0.0;
     vec3 toL = lightPos - origin;
     float dist = length(toL);
-    edge = 0.0;
     if (dist < 1e-5) return 1.0;
-    vec3 L = toL / dist;
-    vec3 o = origin + normalize(fragNormal) * 0.00035;
-    float t = 0.0006;
-    float shadow = 1.0;
-    float prev = 1.0;
-    for (int i = 0; i < 3; ++i) {
-        vec3 p = o + L * t;
-        float occ = 1.0;
-        if (p.y < 0.0022) occ = 0.15;
-        else if (p.y > 0.035 && p.y < 0.05) {
-            if (p.x > 0.015 && p.x < 0.145 && p.z > 0.015 && p.z < 0.11)
-                occ = 0.55;
-        }
-        edge = max(edge, abs(prev - occ));
-        prev = occ;
-        shadow = min(shadow, occ);
-        t += 0.0025 + dist * 0.025;
-        if (t >= dist) break;
-        if (shadow < 0.2) break;
-    }
-    edge = clamp(edge * 2.0, 0.0, 1.0);
-    return clamp(shadow, 0.1, 1.0);
+    // Stop a cell short of the light so the fixture itself never shadows it.
+    return marchShadow(origin, toL / dist, max(dist - 0.0015, 0.0));
 }
 
 void applyFireOverlay(inout vec3 lit) {
@@ -125,25 +183,25 @@ void applyFireOverlay(inout vec3 lit) {
 void main() {
     vec3 n = normalize(fragNormal);
     vec3 base = fragColor;
-    float matId = fragMat;
+    // Render class of this fragment (src/render_class.hpp). Each branch below
+    // tests one class exactly, so their order does not matter. Every branch
+    // except Water returns; Water adjusts the base colour and then takes the
+    // shared World lighting path at the bottom.
+    int rc = renderClass(fragMat);
 
-    // mat 8: world item pickups. These are real world objects, not overlay UI, so
-    // they take the mat-0 lighting path (shadow rays, height AO, vignette) and sit
-    // in the scene instead of floating on top of it. Remapping the id to 0 lets
-    // them fall through every branch below into that shared world path; testing
-    // it here is required because the chain is a descending `matId > N.5` and an
-    // untested mat 8 would be swallowed by the mat-7 lattice branch.
-    if (matId > 7.5) matId = 0.0;
+    // World pickups are real world objects, not overlay UI: they take the World
+    // lighting path (shadow rays, height AO, vignette) and sit in the scene.
+    if (rc == RC_WORLD_PICKUP) rc = RC_WORLD;
 
-    // mat 7: inventory lattice unit cubes (RULES.md rule 12).
-    // Must be tested FIRST of the remaining ids: the chain below is a descending
-    // `matId > N.5` and an
-    // untested mat 7 would fall into the muzzle-flash branch. Deliberately skips
-    // the mat-0 path's world-space shadow rays, world-Y height AO and vignette —
+    // Surface layer: textured world cells (pickups carry no texture id).
+    if (rc == RC_WORLD) base = texturedBase(base);
+
+    // Inventory lattice unit cubes (RULES.md rule 12). Deliberately skips the
+    // World path's world-space shadow rays, world-Y height AO and vignette —
     // none of which mean anything on a lattice parented to the camera. The
-    // vertex stage also skips the fisheye for mat 7, so this is a clean 3D
+    // vertex stage also skips the fisheye for this class, so this is a clean 3D
     // projection. Flat face shading plus a light bitcrush to match the look.
-    if (matId > 6.5) {
+    if (rc == RC_INVENTORY_LATTICE) {
         vec3 key = normalize(vec3(0.42, 0.78, 0.30));
         float ndl = max(dot(n, key), 0.0);
         float fill = 0.42 + 0.58 * max(n.y, 0.0);
@@ -152,19 +210,19 @@ void main() {
         float face = pow(max(abs(n.x), max(abs(n.y), abs(n.z))), 8.0);
         lit += base * face * 0.14;
         float levels = 20.0;
-        lit = floor(lit * levels + 0.5) / levels;
+        lit = bandq(lit, levels);
         applyFireOverlay(lit);
         outColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
         return;
     }
 
-    // mat 6: muzzle flash cubes (emissive, no lighting)
-    if (matId > 5.5) {
+    // Muzzle flash cubes (emissive, no lighting)
+    if (rc == RC_MUZZLE) {
         vec3 glow = base * (1.4 + 0.6 * ubo.muzzleFlash);
         float pulse = 0.85 + 0.15 * sin(ubo.time * 90.0);
         glow *= pulse;
         float levels = 20.0;
-        glow = floor(glow * levels + 0.5) / levels;
+        glow = bandq(glow, levels);
         vec3 outRgb = glow;
         applyFireOverlay(outRgb);
         outColor = vec4(outRgb, 1.0);
@@ -172,7 +230,7 @@ void main() {
     }
 
     // mat 5: cubic debris chips — lit + emissive lift so sub-voxels read clearly
-    if (matId > 4.5) {
+    if (rc == RC_DEBRIS) {
         float night = smoothstep(0.55, 0.8, ubo.timeOfDay);
         vec3 ambientCol = mix(vec3(0.35, 0.38, 0.42), vec3(0.08, 0.09, 0.11), night);
         float ambient = (0.28 + 0.14 * max(n.y, 0.0)) * ubo.ambientScale;
@@ -186,14 +244,14 @@ void main() {
         float r = length(fragNdc);
         lit *= 1.0 - smoothstep(0.55, 1.45, r) * 0.25;
         float levels = 18.0;
-        lit = floor(lit * levels + 0.5) / levels;
+        lit = bandq(lit, levels);
         applyFireOverlay(lit);
         outColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
         return;
     }
 
     // mat 4: pixel sky tiles
-    if (matId > 3.5) {
+    if (rc == RC_SKY) {
         vec2 tuv = fragColor.rg;
         float elev = fragColor.b;
         vec2 cell = floor(tuv * 8.0);
@@ -221,14 +279,14 @@ void main() {
         sky *= 1.0 - smoothstep(0.55, 1.55, r) * 0.55;
 
         float levels = 14.0;
-        sky = floor(sky * levels + 0.5) / levels;
+        sky = bandq(sky, levels);
         applyFireOverlay(sky);
         outColor = vec4(sky, 1.0);
         return;
     }
 
     // mat 3: moon sprite light source
-    if (matId > 2.5) {
+    if (rc == RC_MOON) {
         vec2 uv = fragColor.rg;
         vec2 p = uv * 2.0 - 1.0;
         float d1 = length(p);
@@ -252,13 +310,13 @@ void main() {
         glow *= 1.0 - smoothstep(0.7, 1.5, r) * 0.25;
 
         float levels = 16.0;
-        glow = floor(glow * levels + 0.5) / levels;
+        glow = bandq(glow, levels);
         applyFireOverlay(glow);
         outColor = vec4(glow, clamp(crescent + halo * 0.65, 0.0, 1.0));
         return;
     }
 
-    if (matId > 1.5) {
+    if (rc == RC_BULB) {
         vec3 glow = vec3(1.0, 0.72, 0.42) * (1.1 + 0.15 * sin(ubo.time * 6.0));
         float r = length(fragNdc);
         glow *= 1.0 - smoothstep(0.6, 1.4, r) * 0.25;
@@ -267,7 +325,7 @@ void main() {
         return;
     }
 
-    if (matId > 0.5) {
+    if (rc == RC_WATER) {
         float tide = sin(fragWorldPos.x * 180.0 + ubo.time * 2.2) *
                      cos(fragWorldPos.z * 160.0 - ubo.time * 1.7);
         float foam = smoothstep(0.55, 0.95, abs(tide));
@@ -288,11 +346,14 @@ void main() {
     vec3 bulbContrib = vec3(0.0);
     float bulbEdge = 0.0;
     vec3 viewDir = normalize(ubo.camPos - fragWorldPos);
-    for (int i = 0; i < 4; ++i) {
-        float inten = ubo.bulbPos[i].w;
+    int lightCount = int(ubo.lightInfo.x);
+    for (int i = 0; i < lightCount; ++i) {
+        vec4 lpi = lights[i * 2];
+        vec4 lcr = lights[i * 2 + 1];
+        float inten = lpi.w;
         if (inten <= 0.001) continue;
-        vec3 lp = ubo.bulbPos[i].xyz;
-        float radius = max(ubo.bulbColor[i].w, 0.01);
+        vec3 lp = lpi.xyz;
+        float radius = max(lcr.w, 0.01);
         vec3 toL = lp - fragWorldPos;
         float dist = length(toL);
         if (dist > radius * 1.2) continue;
@@ -300,18 +361,14 @@ void main() {
         att *= smoothstep(radius, radius * 0.12, dist);
         vec3 Ld = toL / max(dist, 1e-5);
         float nd = max(dot(n, Ld), 0.0);
-        float sh = 1.0;
-        if (i < 2) {
-            float e = 0.0;
-            sh = shadowRayPoint(fragWorldPos, lp, e);
-            bulbEdge = max(bulbEdge, e);
-        }
-        vec3 warm = ubo.bulbColor[i].rgb;
+        // Every light within range is shadowed through the occupancy volume.
+        float e = 0.0;
+        float sh = (nd > 0.0) ? shadowRayPoint(fragWorldPos, lp, e) : 1.0;
+        bulbEdge = max(bulbEdge, e);
+        vec3 warm = lcr.rgb;
         bulbContrib += warm * att * nd * sh;
-        if (i < 2) {
-            vec3 hh = normalize(Ld + viewDir);
-            bulbContrib += warm * pow(max(dot(n, hh), 0.0), 32.0) * att * 0.2 * sh;
-        }
+        vec3 hh = normalize(Ld + viewDir);
+        bulbContrib += warm * pow(max(dot(n, hh), 0.0), 32.0) * att * 0.2 * sh;
     }
 
     // Muzzle as transient point light near camera
@@ -344,7 +401,7 @@ void main() {
     float luma = dot(lit, vec3(0.299, 0.587, 0.114));
     lit = mix(vec3(luma), lit, 0.72);
     float levels = 18.0;
-    lit = floor(lit * levels + 0.5) / levels;
+    lit = bandq(lit, levels);
     lit = pow(clamp(lit, 0.0, 1.0), vec3(1.12));
 
     applyFireOverlay(lit);
