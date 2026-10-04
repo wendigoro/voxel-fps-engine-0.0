@@ -130,6 +130,18 @@ struct Mat4 {
         return translation(t.x, t.y, t.z);
     }
 
+    static Mat4 scaling(float sx, float sy, float sz) {
+        Mat4 r;
+        r.m[0] = sx;
+        r.m[5] = sy;
+        r.m[10] = sz;
+        return r;
+    }
+
+    static Mat4 scaling(float s) {
+        return scaling(s, s, s);
+    }
+
     static Mat4 multiply(const Mat4& a, const Mat4& b) {
         Mat4 r;
         for (int c = 0; c < 4; ++c) {
