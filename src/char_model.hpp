@@ -526,7 +526,10 @@ inline void evaluateProceduralPose(
     const movement::MoveState& move,
     const PlayerBody& body,
     float timeSec,
-    Mat4 outBones[kMaxBones])
+    float deltaYaw,
+    float aimPitch,
+    Mat4 outBones[kMaxBones],
+    Vec3* outHeadPos = nullptr)
 {
     Vec3 localTrans[BoneId::Count]{};
     Mat4 localRot[BoneId::Count];
@@ -562,11 +565,11 @@ inline void evaluateProceduralPose(
         localRot[BoneId::Pelvis] = Mat4::rotationZ(idleSway * 1.5f);
     }
 
-    // 4. Gait Cycles:
-    // When moving horizontally (sqrt(vx^2 + vz^2) > 0.001f), calculate locomotion phase
-    // based on gait cycle duration (Walk = 1.0s, Run = 0.7s, Sprint = 0.5s).
-    // Rotate thighs and calves in counter-phase around their modelPos anchors, counter-swing
-    // shoulders/forearms, and apply vertical hip bob and lateral pelvic sway.
+    // 4. Gait Cycles & Limb Kinematics:
+    // Model space: +X is right, +Y is up, +Z is forward.
+    // Forward leg swing is -X rotation (brings foot forward into +Z).
+    // Backward knee flexion is +X rotation (pulls calf/foot backward into -Z).
+    // Arms counter-swing opposite to legs.
     if (isMoving) {
         float cycleDuration = 1.0f;
         if (move.stance == movement::Stance::Crouch) {
@@ -605,30 +608,36 @@ inline void evaluateProceduralPose(
             pelvisSwayMax = 0.0045f;
         }
 
-        // Thighs counter-phase
-        localRot[BoneId::LThigh] = Mat4::rotationX(s * legSwingMax);
-        localRot[BoneId::RThigh] = Mat4::rotationX(-s * legSwingMax);
+        // Left Leg forward swing phase (s > 0):
+        // Thigh swings forward (-X rot)
+        localRot[BoneId::LThigh] = Mat4::rotationX(-s * legSwingMax);
+        // Knee flexes backward when swinging forward (+X rot)
+        localRot[BoneId::LCalf] = Mat4::rotationX(std::max(0.0f, s) * kneeBendMax);
+        // Ankle counter-flexion keeps foot level
+        localRot[BoneId::LFoot] = Mat4::rotationX(s * legSwingMax * 0.40f);
 
-        // Calves flex backward when thigh swings forward
-        localRot[BoneId::LCalf] = Mat4::rotationX(-std::max(0.0f, s) * kneeBendMax);
-        localRot[BoneId::RCalf] = Mat4::rotationX(-std::max(0.0f, -s) * kneeBendMax);
+        // Right Leg backward push phase:
+        // Thigh swings backward (+X rot)
+        localRot[BoneId::RThigh] = Mat4::rotationX(s * legSwingMax);
+        // Knee straight or slight push-off bend
+        localRot[BoneId::RCalf] = Mat4::rotationX(std::max(0.0f, -s) * (kneeBendMax * 0.25f));
+        // Foot toe push-off
+        localRot[BoneId::RFoot] = Mat4::rotationX(-s * legSwingMax * 0.40f);
 
-        // Feet counter-flexion to stay level
-        localRot[BoneId::LFoot] = Mat4::rotationX(-s * legSwingMax * 0.35f);
-        localRot[BoneId::RFoot] = Mat4::rotationX(s * legSwingMax * 0.35f);
+        // Arms counter-swing opposite to legs:
+        // Left arm swings backward (+X rot) when left leg swings forward
+        localRot[BoneId::LUpperArm] = Mat4::rotationX(s * armSwingMax);
+        // Right arm swings forward (-X rot) when right leg swings backward
+        localRot[BoneId::RUpperArm] = Mat4::rotationX(-s * armSwingMax);
 
-        // Arms counter-swing opposite to legs
-        localRot[BoneId::LUpperArm] = Mat4::rotationX(-s * armSwingMax);
-        localRot[BoneId::RUpperArm] = Mat4::rotationX(s * armSwingMax);
-
-        // Forearms slight resting bend + flexion on forward swing
-        localRot[BoneId::LForeArm] = Mat4::rotationX(0.20f + std::max(0.0f, -s) * 0.35f);
-        localRot[BoneId::RForeArm] = Mat4::rotationX(0.20f + std::max(0.0f, s) * 0.35f);
+        // Forearms natural forward flexion (+Z bend)
+        localRot[BoneId::LForeArm] = Mat4::rotationX(-0.25f - std::max(0.0f, -s) * 0.40f);
+        localRot[BoneId::RForeArm] = Mat4::rotationX(-0.25f - std::max(0.0f, s) * 0.40f);
 
         // Pelvis hip bob and lateral sway
         localTrans[BoneId::Pelvis].y -= std::abs(s) * hipBobMax;
         localTrans[BoneId::Pelvis].x += c * pelvisSwayMax;
-        localRot[BoneId::Pelvis] = Mat4::rotationZ(c * 0.04f);
+        localRot[BoneId::Pelvis] = Mat4::rotationZ(c * 0.035f);
 
         // Torso counter-twist
         localRot[BoneId::Spine] = Mat4::rotationY(-s * 0.07f);
@@ -705,7 +714,24 @@ inline void evaluateProceduralPose(
         localRot[BoneId::Head] = Mat4::multiply(localRot[BoneId::Head], Mat4::rotationZ(-leanRoll * 0.5f));
     }
 
-    // 7. Forward kinematics pass: propagate joint positions and rotations
+    // 7. Torso alternate orientation (waist twist & aim pitch):
+    // Spine, Chest, and Head distribute the angle difference between leg heading
+    // and camera aim (deltaYaw) as well as the camera pitch (aimPitch).
+    // In model space (+X right, +Y up, +Z forward):
+    // - deltaYaw > 0 turns right (+Y rotation)
+    // - aimPitch > 0 tilts up (-X rotation)
+    if (std::abs(deltaYaw) > 1e-4f || std::abs(aimPitch) > 1e-4f) {
+        const Mat4 spineAim = Mat4::multiply(Mat4::rotationY(deltaYaw * 0.45f), Mat4::rotationX(-aimPitch * 0.35f));
+        localRot[BoneId::Spine] = Mat4::multiply(spineAim, localRot[BoneId::Spine]);
+
+        const Mat4 chestAim = Mat4::multiply(Mat4::rotationY(deltaYaw * 0.40f), Mat4::rotationX(-aimPitch * 0.45f));
+        localRot[BoneId::Chest] = Mat4::multiply(chestAim, localRot[BoneId::Chest]);
+
+        const Mat4 headAim = Mat4::multiply(Mat4::rotationY(deltaYaw * 0.15f), Mat4::rotationX(-aimPitch * 0.20f));
+        localRot[BoneId::Head] = Mat4::multiply(headAim, localRot[BoneId::Head]);
+    }
+
+    // 8. Forward kinematics pass: propagate joint positions and rotations
     // down the topological skeletal tree (all parents < child index).
     struct JointState {
         Vec3 pos;
@@ -725,7 +751,11 @@ inline void evaluateProceduralPose(
         global[b].rot = Mat4::multiply(global[p].rot, localRot[b]);
     }
 
-    // 8. Compute bone skinning matrices:
+    if (outHeadPos) {
+        *outHeadPos = global[BoneId::Head].pos;
+    }
+
+    // 9. Compute bone skinning matrices:
     // outBones[b] = T(global[b].pos) * global[b].rot * T(-modelPos[b])
     for (int b = 0; b < BoneId::Count; ++b) {
         const Vec3& restPos = model.skeleton[b].modelPos;
@@ -737,6 +767,17 @@ inline void evaluateProceduralPose(
     for (int b = BoneId::Count; b < kMaxBones; ++b) {
         outBones[b] = Mat4::identity();
     }
+}
+
+// Backward-compatible overload for callers passing default orientation
+inline void evaluateProceduralPose(
+    const Model& model,
+    const movement::MoveState& move,
+    const PlayerBody& body,
+    float timeSec,
+    Mat4 outBones[kMaxBones])
+{
+    evaluateProceduralPose(model, move, body, timeSec, 0.0f, 0.0f, outBones, nullptr);
 }
 
 } // namespace char_model

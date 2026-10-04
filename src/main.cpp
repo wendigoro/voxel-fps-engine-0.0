@@ -305,6 +305,17 @@ static float g_yaw = 0.0f;          // 0 = looking toward -Z
 static float g_pitch = -0.28f; // slightly down with higher fisheye POV
 static float g_moveSpeed = 0.045f;  // walk speed (world units/sec at 0.001 voxel scale)
 static float g_lookSens = 0.0035f;
+// View-side character model orientation, camera locking, and third-person perspective
+static float g_legYaw = 0.0f;
+static bool g_thirdPerson = false;
+static Vec3 g_charHeadWorldPos{};
+
+static inline float angleDiff(float target, float current) {
+    float diff = target - current;
+    while (diff > static_cast<float>(M_PI)) diff -= static_cast<float>(2.0 * M_PI);
+    while (diff < -static_cast<float>(M_PI)) diff += static_cast<float>(2.0 * M_PI);
+    return diff;
+}
 // Locked FPS camera follows physics player (eye). Initialized in spawnPlayer().
 static Vec3 g_camPos(
     WORLD_W * VOXEL_SIZE * 0.5f,
@@ -2122,6 +2133,7 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (wParam == '4') g_pendingInput.selectCaliber = 3;
         if (wParam == 'V') g_pendingInput.cycleWeapon = true;
         if (wParam == 'B') g_pendingInput.cycleFireMode = true;
+        if (wParam == 'T' || wParam == VK_F5) g_thirdPerson = !g_thirdPerson;
         return 0;
     case WM_KEYUP:
         if (wParam < 256) g_keys[wParam] = false;
@@ -5934,7 +5946,18 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         if (g_boneMapped[frameIndex]) {
             char_model::Mat4 bones[char_model::kMaxBones];
             const float timeSec = static_cast<float>(g_tick) * TICK_DT;
-            char_model::evaluateProceduralPose(char_model::getCanonicalModel(), g_move, g_player, timeSec, bones);
+            const float deltaYaw = g_captureActive ? 0.0f : angleDiff(g_yaw, g_legYaw);
+            const float aimPitch = g_captureActive ? 0.0f : g_pitch;
+            char_model::evaluateProceduralPose(
+                char_model::getCanonicalModel(), g_move, g_player, timeSec,
+                deltaYaw, aimPitch, bones, nullptr);
+
+            // In first person, collapse head and neck so local player camera has
+            // an unobstructed view while chest, arms, legs, and feet remain visible looking down.
+            if (!g_thirdPerson && !g_captureActive) {
+                bones[char_model::BoneId::Head] = char_model::Mat4::scaling(0.0f);
+                bones[char_model::BoneId::Neck] = char_model::Mat4::scaling(0.0f);
+            }
             std::memcpy(g_boneMapped[frameIndex], bones, sizeof(bones));
         }
 
@@ -5947,12 +5970,13 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
 
         const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
         const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
-        const char_model::Mat4 transMat = char_model::Mat4::translation(
-            static_cast<float>(g_spawnCellX + 2) * VOXEL_SIZE,
-            static_cast<float>(g_spawnCellY) * VOXEL_SIZE,
-            static_cast<float>(g_spawnCellZ + 2) * VOXEL_SIZE
-        );
-        const char_model::Mat4 modelMat = char_model::Mat4::multiply(transMat, scaleMat);
+        const float modelYaw = g_captureActive ? 0.0f : g_legYaw;
+        const char_model::Mat4 rotMat = char_model::Mat4::rotationY(static_cast<float>(M_PI) - modelYaw);
+        const float modelX = g_captureActive ? (static_cast<float>(g_spawnCellX + 2) * VOXEL_SIZE) : g_player.px;
+        const float modelY = g_captureActive ? (static_cast<float>(g_spawnCellY) * VOXEL_SIZE) : g_player.py;
+        const float modelZ = g_captureActive ? (static_cast<float>(g_spawnCellZ + 2) * VOXEL_SIZE) : g_player.pz;
+        const char_model::Mat4 transMat = char_model::Mat4::translation(modelX, modelY, modelZ);
+        const char_model::Mat4 modelMat = char_model::Mat4::multiply(transMat, char_model::Mat4::multiply(rotMat, scaleMat));
         vkCmdPushConstants(cmd, g_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(char_model::Mat4), &modelMat);
         vkCmdDrawIndexed(cmd, g_charIndexCount, 1, 0, 0, 0);
 
@@ -6232,6 +6256,7 @@ static void spawnPlayerOnMap(const sim::World& world) {
         g_player.leanTarget = 0.0f;
         g_yaw = g_mapSpawn.yaw;
         g_pitch = g_mapSpawn.pitch;
+        g_legYaw = g_yaw;
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
         return;
     }
@@ -6277,6 +6302,7 @@ static void spawnPlayerOnMap(const sim::World& world) {
         g_player.leanTarget = 0.0f;
         g_yaw = g_mapSpawn.yaw;
         g_pitch = g_mapSpawn.pitch;
+        g_legYaw = g_yaw;
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
     }
 }
@@ -6337,20 +6363,50 @@ static Vec3 flatRight() {
     return Vec3(std::cos(g_yaw), 0.0f, std::sin(g_yaw)).normalized();
 }
 
-// Sync locked eye camera to physics body + lean offset.
+// Sync locked eye camera to animated character model head + lean offset.
 static void syncCameraToPlayer() {
+    // 1. Update leg heading based on movement velocity and waist twist limit:
+    const float horizSpeedSq = g_player.vx * g_player.vx + g_player.vz * g_player.vz;
+    if (horizSpeedSq > 1e-6f) {
+        const float moveYaw = std::atan2(g_player.vx, -g_player.vz);
+        g_legYaw += angleDiff(moveYaw, g_legYaw) * 0.35f;
+    } else {
+        const float diff = angleDiff(g_yaw, g_legYaw);
+        if (diff > 1.15f) {
+            g_legYaw = g_yaw - 1.15f;
+        } else if (diff < -1.15f) {
+            g_legYaw = g_yaw + 1.15f;
+        }
+    }
+    while (g_legYaw > static_cast<float>(M_PI)) g_legYaw -= static_cast<float>(2.0 * M_PI);
+    while (g_legYaw < -static_cast<float>(M_PI)) g_legYaw += static_cast<float>(2.0 * M_PI);
+
+    // 2. Evaluate procedural model pose to obtain the animated head joint position
+    const float deltaYaw = angleDiff(g_yaw, g_legYaw);
+    const float aimPitch = g_pitch;
+    const float timeSec = static_cast<float>(g_tick) * TICK_DT;
+    char_model::Vec3 headModelPos{};
+    char_model::Mat4 dummyBones[char_model::kMaxBones];
+    char_model::evaluateProceduralPose(
+        char_model::getCanonicalModel(), g_move, g_player, timeSec,
+        deltaYaw, aimPitch, dummyBones, &headModelPos);
+
+    const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
+    const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
+    const char_model::Mat4 rotMat = char_model::Mat4::rotationY(static_cast<float>(M_PI) - g_legYaw);
+    const char_model::Mat4 transMat = char_model::Mat4::translation(g_player.px, g_player.py, g_player.pz);
+    const char_model::Mat4 modelMat = char_model::Mat4::multiply(transMat, char_model::Mat4::multiply(rotMat, scaleMat));
+
+    const char_model::Vec3 headWorld = modelMat.transformPoint(headModelPos);
+    g_charHeadWorldPos = Vec3(headWorld.x, headWorld.y, headWorld.z);
+
+    // The body and model are the authority. The camera is locked to the head joint,
+    // plus any presentation offsets from the movement intent system.
     Vec3 right = flatRight();
     Vec3 fwd = flatForward();
-    const float leanLat = g_player.lean * 0.0032f;   // lateral peek
-    const float leanDrop = std::fabs(g_player.lean) * 0.0009f;
-    // The body is the authority. Everything past this line is presentation:
-    // lean, the movement system's stance eye height, and the offset it produced
-    // this tick. None of it is read back by the simulation.
-    const float eye = movement::STANCE_EYE_HEIGHT[static_cast<int>(g_move.stance)];
-    const float lat = leanLat + g_camOffset.lateralLean;
-    g_camPos.x = g_player.px + right.x * lat + fwd.x * g_camOffset.forwardLean;
-    g_camPos.y = g_player.py + eye + g_camOffset.eyeLift - leanDrop;
-    g_camPos.z = g_player.pz + right.z * lat + fwd.z * g_camOffset.forwardLean;
+    g_camPos.x = g_charHeadWorldPos.x + right.x * g_camOffset.lateralLean + fwd.x * g_camOffset.forwardLean;
+    g_camPos.y = g_charHeadWorldPos.y + g_camOffset.eyeLift;
+    g_camPos.z = g_charHeadWorldPos.z + right.z * g_camOffset.lateralLean + fwd.z * g_camOffset.forwardLean;
 }
 
 // -----------------------------------------------------------------------------
@@ -6585,7 +6641,12 @@ static void handleEditorAction(const std::string& actionJson) {
     } else if (type == "RESET_CAMERA") {
         g_yaw = g_mapSpawn.yaw;
         g_pitch = g_mapSpawn.pitch;
+        g_legYaw = g_yaw;
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+    } else if (type == "TOGGLE_THIRD_PERSON") {
+        g_thirdPerson = !g_thirdPerson;
+    } else if (type == "SET_THIRD_PERSON") {
+        g_thirdPerson = jsonExtractBool(actionJson, "thirdPerson", false);
     } else if (type == "SPAWN_PLAYER") {
         if (g_world) spawnPlayerOnMap(*g_world);
     } else if (type == "SET_VISUAL_PARAM") {
@@ -6846,7 +6907,32 @@ static Vec3 lerpEye(const Vec3& a, const Vec3& b, float t) {
 static Vec3 renderEye() {
     if (g_paused || g_captureActive) return g_camPos;
     const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
-    return lerpEye(g_camPosPrevTick, g_camPos, alpha);
+    Vec3 eye = lerpEye(g_camPosPrevTick, g_camPos, alpha);
+    if (g_thirdPerson) {
+        Vec3 fwd = cameraForward();
+        Vec3 right = cameraRight();
+        float dist = 0.032f;
+        if (g_world) {
+            Vec3 target = eye - fwd * dist + right * 0.007f + Vec3(0.0f, 0.004f, 0.0f);
+            Vec3 dir = target - eye;
+            float totalLen = dir.length();
+            if (totalLen > 1e-4f) {
+                Vec3 stepDir = dir * (1.0f / totalLen);
+                for (float s = 0.002f; s <= totalLen; s += 0.002f) {
+                    Vec3 p = eye + stepDir * s;
+                    int cx = static_cast<int>(std::floor(p.x / VOXEL_SIZE));
+                    int cy = static_cast<int>(std::floor(p.y / VOXEL_SIZE));
+                    int cz = static_cast<int>(std::floor(p.z / VOXEL_SIZE));
+                    if (sim::World::inBounds(cx, cy, cz) && isSolidBlock(g_world->get(cx, cy, cz))) {
+                        dist = std::max(0.005f, s - 0.002f);
+                        break;
+                    }
+                }
+            }
+        }
+        eye = eye - fwd * dist + right * (0.007f * (dist / 0.032f)) + Vec3(0.0f, 0.004f * (dist / 0.032f), 0.0f);
+    }
+    return eye;
 }
 
 static void updateUBO(uint32_t frameIndex, float timeSec) {
@@ -8045,6 +8131,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     snap += "\"health\":" + std::to_string(g_health.health) + ",";
                     snap += "\"cam\":{\"x\":" + std::to_string(g_camPos.x) + ",\"y\":" + std::to_string(g_camPos.y) + ",\"z\":" + std::to_string(g_camPos.z) + ",";
                     snap += "\"yaw\":" + std::to_string(g_yaw) + ",\"pitch\":" + std::to_string(g_pitch) + "},";
+                    snap += "\"thirdPerson\":" + std::string(g_thirdPerson ? "true" : "false") + ",";
+                    snap += "\"legYaw\":" + std::to_string(g_legYaw) + ",";
                     snap += "\"map\":{\"path\":\"" + normMapPath + "\",\"prefabs\":" + std::to_string(g_mapPrefabsStamped) + "},";
                     if (pick.hit) {
                         snap += "\"pick\":{\"hit\":true,\"x\":" + std::to_string(pick.x) + ",\"y\":" + std::to_string(pick.y) + ",\"z\":" + std::to_string(pick.z) + ",";
