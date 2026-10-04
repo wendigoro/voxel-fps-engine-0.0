@@ -47,6 +47,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "sim_input.hpp"
 #include "movement.hpp"
 #include "ballistics.hpp"
+#include "char_model.hpp"
+#include "char_mesh.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -7463,6 +7465,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const bool jsonxOk = jsonxSelfTest();
             const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
             const bool visualParamsOk = vis::selfTest();
+            const char_mesh::SelfTestReport charMeshRep = char_mesh::selfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -7807,6 +7810,12 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nterrain_prefab_spares_authored_ok="
                 << (g_terrainSmoke.prefabSparesAuthoredOk ? 1 : 0)
                 << "\nterrain_ok=" << (g_terrainSmoke.ok() ? 1 : 0)
+                << "\nchar_mesh_cells=" << charMeshRep.solidCells
+                << "\nchar_mesh_verts=" << charMeshRep.vertexCount
+                << "\nchar_mesh_indices=" << charMeshRep.indexCount
+                << "\nchar_mesh_culled_faces=" << charMeshRep.culledFaces
+                << "\nchar_mesh_golden=" << std::hex << charMeshRep.goldenHash << std::dec
+                << "\nchar_mesh_ok=" << (charMeshRep.ok() ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -7900,6 +7909,10 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             // keeps this triageable on its own, and it is checked on scratch
             // worlds, so it cannot make the map fingerprints move.
             if (!g_terrainSmoke.ok()) { cleanup(); return 10; }
+            // Character model and skinned mesh extraction contract:
+            // 16 mm sub-lattice, face culling, weight normalization, region partitioning,
+            // and golden hash match. Exit 11 keeps CI triage separate.
+            if (!charMeshRep.ok()) { cleanup(); return 11; }
         }
     } catch (const std::exception& e) {
         // Every automated run here is headless -- smoke, stress, capture, export --
