@@ -1839,7 +1839,7 @@ static void updateDebrisMesh() {
         if (drawn >= drawCap) break;
         if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u) break;
         ++drawn;
-        emitDebrisCube(p, kDebrisMatId, put);
+        emitDebrisCube(p, p.emissive ? kMuzzleMatId : kDebrisMatId, put);
     }
 
     // Muzzle flash: stacked emissive cubes just ahead of the camera along aim.
@@ -3423,17 +3423,17 @@ static bool ensureVertexCapacity(uint32_t verts) {
 struct SimBallisticsHooks final : ballistics::Hooks {
     void voxelDestroyed(int x, int y, int z, Block was, MaterialId mat,
                         const ballistics::Impact& imp) override {
-        // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
-        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
-                                imp.aoeScale);
+        // Visual degradation: spawn 1-2 sublattice impact units (occupancy still unit cube).
+        g_debris.spawnSublatticeImpact(x, y, z, mat, imp.sub, imp.energy, VOXEL_SIZE,
+                                      imp.aoeScale);
         (void)was;
         g_meshDirty = true;
         ++g_voxelsDestroyed;
     }
     void ricochet(int x, int y, int z, MaterialId mat, const ballistics::Impact& imp) override {
         ++g_debris.ricochets;
-        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
-                                imp.aoeScale);
+        g_debris.spawnSublatticeImpact(x, y, z, mat, imp.sub, imp.energy, VOXEL_SIZE,
+                                      imp.aoeScale);
     }
     ArmorZone bodySweep(float ax, float ay, float az, float bx, float by, float bz,
                         float radiusCells) override {
@@ -8244,6 +8244,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
             const bool visualParamsOk = vis::selfTest();
             const char_mesh::SelfTestReport charMeshRep = char_mesh::selfTest();
+            const bool sublatticeOk = sublatticeImpactSelfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -8296,6 +8297,10 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\ndebris_alive=" << g_debris.activeCount()
                 << "\ndebris_ricochets=" << g_debris.ricochets
                 << "\ndebris_subdiv=" << kDebrisSubDiv
+                << "\nsublattice_impact_ok=" << (sublatticeOk ? 1 : 0)
+                << "\nsublattice_direct_impacts=" << g_debris.sublatticeImpactsDirect
+                << "\nsublattice_oblique_impacts=" << g_debris.sublatticeImpactsOblique
+                << "\nsublattice_units_impacted=" << g_debris.sublatticeUnitsImpacted
                 << "\ndebris_verts_peak=" << g_debrisVertsPeak
                 << "\ndebris_upload_us_avg=" << (g_debrisUploadSamples > 0 ? (g_debrisUploadUsSum / g_debrisUploadSamples) : 0.0)
                 << "\ndebris_upload_us_max=" << g_debrisUploadUsMax
@@ -8691,6 +8696,9 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             // 16 mm sub-lattice, face culling, weight normalization, region partitioning,
             // and golden hash match. Exit 11 keeps CI triage separate.
             if (!charMeshRep.ok()) { cleanup(); return 11; }
+            // Sublattice impacts contract: 1-2 impacted units based on impact angle (<=45 deg direct vs >45 deg oblique).
+            // Exit 12 keeps CI triage separate.
+            if (!sublatticeOk) { cleanup(); return 12; }
         }
     } catch (const std::exception& e) {
         // Every automated run here is headless -- smoke, stress, capture, export --
