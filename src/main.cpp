@@ -1305,7 +1305,7 @@ static constexpr EquipSlotSpec kEquipSlotSpecs[kEquipSlotCount] = {
     // ArmorHead (6): head top center
     { EquipSlot::ArmorHead, "Head",     -8, 7, 0, 3, 2, 3, false, 0, 0, 0, 0, 0, 0 },
     // Backpack (7): pack frame between mannequin and pack volume
-    { EquipSlot::Backpack,  "Backpack", -3, 1, 0, 2, 3, 2, false, 0, 0, 0, 0, 0, 0 },
+    { EquipSlot::Backpack,  "Backpack", -3, 0, 0, 2, 3, 2, false, 0, 0, 0, 0, 0, 0 },
 };
 
 static void emitSlotBrackets(const Vec3& origin, const Vec3& dRight, const Vec3& dUp, const Vec3& dFwd,
@@ -1346,13 +1346,13 @@ static void updateInventoryMesh() {
         return;
     }
 
-    // Display basis: camera basis yawed so two faces of the volume are visible
-    // (a 3D projection rather than a flat orthographic panel). Built as two true
-    // rotations — yaw about the view up, then pitch about the yawed right — so
-    // the basis stays orthonormal. A tilt applied to only one axis (e.g.
-    // up*cp + fwd*sp) would shear it and turn the unit cells into rhomboids.
-    const float yaw = 0.52f; // ~30 degrees about the view up axis
-    const float pitch = 0.30f;
+    // Display basis: camera basis with subtle yaw and pitch so top and side
+    // faces of the unit cubes are visible (a 3D isometric projection rather
+    // than a flat orthographic panel). Built as two true rotations — yaw about
+    // the view up, then pitch about the yawed right — so the basis stays
+    // orthonormal (RULES.md rule 12).
+    const float yaw = 0.14f; // subtle ~8 degree relief, eliminating harsh perspective foreshortening
+    const float pitch = 0.08f;
     Vec3 fwd = cameraForward();
     Vec3 right = cameraRight();
     if (right.length() < 1e-5f) right = Vec3(1, 0, 0);
@@ -1367,11 +1367,11 @@ static void updateInventoryMesh() {
     const Vec3 dFwd = (dFwdY * cp + dUpY * sp).normalized();
     const Vec3 dUp = (dUpY * cp - dFwdY * sp).normalized();
 
-    // Anchor: down and to the right of the eye. A 3x3x4 cell block is
-    // 0.003 x 0.003 x 0.004 world units; the distance sets its screen size.
+    // Anchor: centered horizontally around the character rig and framed in the
+    // lower-middle field of view above the health HUD.
     const float k = kOverlayDepthScale;
     const float dist = 0.006f * k;
-    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f * k) + right * (0.0032f * k);
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0032f * k) + right * (0.0020f * k);
 
     g_invDisplay.origin = origin;
     g_invDisplay.right = dRight;
@@ -1431,10 +1431,11 @@ static void updateInventoryMesh() {
             if (defIdx >= 0) {
                 const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
                 if (d && d->shape.valid()) {
-                    for (int iz = 0; iz < d->shape.sz; ++iz) {
-                        for (int iy = 0; iy < d->shape.sy; ++iy) {
-                            for (int ix = 0; ix < d->shape.sx; ++ix) {
-                                if (!d->shape.solid(ix, iy, iz)) continue;
+                    const ItemShape itemShape = rotatedShape(d->shape, inv.slotRot[s]);
+                    for (int iz = 0; iz < itemShape.sz; ++iz) {
+                        for (int iy = 0; iy < itemShape.sy; ++iy) {
+                            for (int ix = 0; ix < itemShape.sx; ++ix) {
+                                if (!itemShape.solid(ix, iy, iz)) continue;
                                 testSlotCell(spec.x0 + ix, spec.y0 + iy, spec.z0 + iz);
                                 if (spec.hasSec) {
                                     testSlotCell(spec.secX0 + ix, spec.secY0 + iy, spec.secZ0 + iz);
@@ -1560,10 +1561,11 @@ static void updateInventoryMesh() {
                     cg = std::min(1.0f, cg + 0.34f);
                     cb = std::min(1.0f, cb + 0.38f);
                 }
-                for (int iz = 0; iz < d->shape.sz; ++iz) {
-                    for (int iy = 0; iy < d->shape.sy; ++iy) {
-                        for (int ix = 0; ix < d->shape.sx; ++ix) {
-                            if (!d->shape.solid(ix, iy, iz)) continue;
+                const ItemShape itemShape = rotatedShape(d->shape, inv.slotRot[s]);
+                for (int iz = 0; iz < itemShape.sz; ++iz) {
+                    for (int iy = 0; iy < itemShape.sy; ++iy) {
+                        for (int ix = 0; ix < itemShape.sx; ++ix) {
+                            if (!itemShape.solid(ix, iy, iz)) continue;
                             emitInventoryCube(origin, dRight, dUp, dFwd,
                                               static_cast<float>(spec.x0 + ix),
                                               static_cast<float>(spec.y0 + iy),
