@@ -309,6 +309,8 @@ static float g_lookSens = 0.0035f;
 static float g_legYaw = 0.0f;
 static bool g_thirdPerson = false;
 static Vec3 g_charHeadWorldPos{};
+static float g_charLocomotionPhase = 0.0f;
+static Vec3 g_playerPosPrevTick{};
 
 static inline float angleDiff(float target, float current) {
     float diff = target - current;
@@ -336,6 +338,7 @@ static movement::CameraOffset g_camOffset;
 // The sim eye as it stood before the most recent tick; renderEye() interpolates
 // from here to g_camPos. Written only by the host loop, read only by the view.
 static Vec3 g_camPosPrevTick;
+static Vec3 lerpEye(const Vec3& a, const Vec3& b, float t);
 // Smoke pause probe (see the main loop).
 static bool g_smokePauseDone = false;
 static bool g_smokePauseFrozenOk = false;
@@ -5945,12 +5948,24 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
     if (g_charPipeline != VK_NULL_HANDLE && g_charVB != VK_NULL_HANDLE && g_charIndexCount > 0) {
         if (g_boneMapped[frameIndex]) {
             char_model::Mat4 bones[char_model::kMaxBones];
-            const float timeSec = static_cast<float>(g_tick) * TICK_DT;
+            const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+            const float timeSec = (static_cast<float>(g_tick) + (g_paused ? 0.0f : alpha)) * static_cast<float>(TICK_DT);
             const float deltaYaw = g_captureActive ? 0.0f : angleDiff(g_yaw, g_legYaw);
             const float aimPitch = g_captureActive ? 0.0f : g_pitch;
+            float renderPhase = g_charLocomotionPhase;
+            const float horizSpeed = std::sqrt(g_player.vx * g_player.vx + g_player.vz * g_player.vz);
+            if (!g_paused && horizSpeed > 0.001f) {
+                float cadence = 1.2f;
+                if (g_move.gait == movement::Gait::Sprint) cadence = 2.0f;
+                else if (g_move.gait == movement::Gait::Run) cadence = 1.6f;
+                else if (g_move.stance == movement::Stance::Crouch) cadence = 0.9f;
+                else if (g_move.stance == movement::Stance::Prone) cadence = 0.7f;
+                renderPhase += cadence * alpha * static_cast<float>(TICK_DT) * (2.0f * static_cast<float>(M_PI));
+                if (renderPhase > 2.0f * static_cast<float>(M_PI)) renderPhase -= 2.0f * static_cast<float>(M_PI);
+            }
             char_model::evaluateProceduralPose(
                 char_model::getCanonicalModel(), g_move, g_player, timeSec,
-                deltaYaw, aimPitch, bones, nullptr);
+                deltaYaw, aimPitch, bones, nullptr, renderPhase);
 
             // In first person, collapse head and neck so local player camera has
             // an unobstructed view while chest, arms, legs, and feet remain visible looking down.
@@ -5972,9 +5987,11 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
         const float modelYaw = g_captureActive ? 0.0f : g_legYaw;
         const char_model::Mat4 rotMat = char_model::Mat4::rotationY(static_cast<float>(M_PI) - modelYaw);
-        const float modelX = g_captureActive ? (static_cast<float>(g_spawnCellX + 2) * VOXEL_SIZE) : g_player.px;
-        const float modelY = g_captureActive ? (static_cast<float>(g_spawnCellY) * VOXEL_SIZE) : g_player.py;
-        const float modelZ = g_captureActive ? (static_cast<float>(g_spawnCellZ + 2) * VOXEL_SIZE) : g_player.pz;
+        const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+        const Vec3 interpPos = lerpEye(g_playerPosPrevTick, Vec3(g_player.px, g_player.py, g_player.pz), alpha);
+        const float modelX = g_captureActive ? (static_cast<float>(g_spawnCellX + 2) * VOXEL_SIZE) : interpPos.x;
+        const float modelY = g_captureActive ? (static_cast<float>(g_spawnCellY) * VOXEL_SIZE) : interpPos.y;
+        const float modelZ = g_captureActive ? (static_cast<float>(g_spawnCellZ + 2) * VOXEL_SIZE) : interpPos.z;
         const char_model::Mat4 transMat = char_model::Mat4::translation(modelX, modelY, modelZ);
         const char_model::Mat4 modelMat = char_model::Mat4::multiply(transMat, char_model::Mat4::multiply(rotMat, scaleMat));
         vkCmdPushConstants(cmd, g_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(char_model::Mat4), &modelMat);
@@ -6258,6 +6275,8 @@ static void spawnPlayerOnMap(const sim::World& world) {
         g_pitch = g_mapSpawn.pitch;
         g_legYaw = g_yaw;
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+        g_playerPosPrevTick = Vec3(g_player.px, g_player.py, g_player.pz);
+        g_charLocomotionPhase = 0.0f;
         return;
     }
     // No authored spawn, but a terrain section: stand on the generated ground.
@@ -6304,6 +6323,8 @@ static void spawnPlayerOnMap(const sim::World& world) {
         g_pitch = g_mapSpawn.pitch;
         g_legYaw = g_yaw;
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+        g_playerPosPrevTick = Vec3(g_player.px, g_player.py, g_player.pz);
+        g_charLocomotionPhase = 0.0f;
     }
 }
 
@@ -6381,6 +6402,20 @@ static void syncCameraToPlayer() {
     while (g_legYaw > static_cast<float>(M_PI)) g_legYaw -= static_cast<float>(2.0 * M_PI);
     while (g_legYaw < -static_cast<float>(M_PI)) g_legYaw += static_cast<float>(2.0 * M_PI);
 
+    // Continuous locomotion phase accumulation during simulation tick
+    const float horizSpeed = std::sqrt(horizSpeedSq);
+    float cadence = 1.2f;
+    if (g_move.gait == movement::Gait::Sprint) cadence = 2.0f;
+    else if (g_move.gait == movement::Gait::Run) cadence = 1.6f;
+    else if (g_move.stance == movement::Stance::Crouch) cadence = 0.9f;
+    else if (g_move.stance == movement::Stance::Prone) cadence = 0.7f;
+    if (horizSpeed > 0.001f) {
+        g_charLocomotionPhase += cadence * static_cast<float>(TICK_DT) * (2.0f * static_cast<float>(M_PI));
+        if (g_charLocomotionPhase > 2.0f * static_cast<float>(M_PI)) {
+            g_charLocomotionPhase -= 2.0f * static_cast<float>(M_PI);
+        }
+    }
+
     // 2. Evaluate procedural model pose to obtain the animated head joint position
     const float deltaYaw = angleDiff(g_yaw, g_legYaw);
     const float aimPitch = g_pitch;
@@ -6389,7 +6424,7 @@ static void syncCameraToPlayer() {
     char_model::Mat4 dummyBones[char_model::kMaxBones];
     char_model::evaluateProceduralPose(
         char_model::getCanonicalModel(), g_move, g_player, timeSec,
-        deltaYaw, aimPitch, dummyBones, &headModelPos);
+        deltaYaw, aimPitch, dummyBones, &headModelPos, g_charLocomotionPhase);
 
     const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
     const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
@@ -7606,8 +7641,8 @@ static SimInput buildSimInput() {
 
     // Held lean keys -> one axis, so a view cannot send contradictory Q and E.
     float lean = 0.0f;
-    if (g_keys['E']) lean += 1.0f;
-    if (g_keys['Q']) lean -= 1.0f;
+    if (g_keys['Q']) lean += 1.0f;
+    if (g_keys['E']) lean -= 1.0f;
     in.leanAxis = lean;
     return in;
 }
@@ -8093,6 +8128,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                 g_tickAccum -= TICK_DT;
                 ++g_tick;
                 g_camPosPrevTick = g_camPos;
+                g_playerPosPrevTick = Vec3(g_player.px, g_player.py, g_player.pz);
                 ++g_ticksSinceRemesh;
                 // One tick of intent, produced by whichever client is driving:
                 // the local window, the scripted smoke harness, or (later) a

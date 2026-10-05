@@ -529,7 +529,8 @@ inline void evaluateProceduralPose(
     float deltaYaw,
     float aimPitch,
     Mat4 outBones[kMaxBones],
-    Vec3* outHeadPos = nullptr)
+    Vec3* outHeadPos = nullptr,
+    float locomotionPhase = -1.0f)
 {
     Vec3 localTrans[BoneId::Count]{};
     Mat4 localRot[BoneId::Count];
@@ -537,18 +538,18 @@ inline void evaluateProceduralPose(
         localRot[b] = Mat4::identity();
     }
 
-    // 1. Horizontal speed & movement intent
+    // 1. Horizontal speed & movement blending weight
     const float speedSq = body.vx * body.vx + body.vz * body.vz;
     const float speed = std::sqrt(speedSq);
-    const bool isMoving = (speed > 0.001f);
+    // Smooth transition weight: 0.0 at rest -> 1.0 at walk speed (0.030)
+    const float moveWeight = std::clamp(speed / 0.030f, 0.0f, 1.0f);
 
     // 2. Stamina-driven fatigue
     const float stamina = std::clamp(move.stamina, 0.0f, 100.0f);
     const float fatigue = (100.0f - stamina) / 100.0f; // 0 = rested, 1 = exhausted
 
     // 3. Idle & Stamina Breathing:
-    // When idle or low on stamina, apply sinusoidal chest/spine heave and head bob
-    // with breathing rate scaled by (100.0f - move.stamina) / 100.0f.
+    // Sinusoidal chest/spine heave and head bob with breathing rate scaled by fatigue.
     const float breathFreq = 2.2f + 3.8f * fatigue;
     const float breathAmp = 0.0025f + 0.0050f * fatigue;
     const float breath = std::sin(timeSec * breathFreq) * breathAmp;
@@ -558,9 +559,10 @@ inline void evaluateProceduralPose(
     localTrans[BoneId::Head].y += breath * 0.4f;
     localRot[BoneId::Head] = Mat4::rotationX(breath * 4.0f);
 
-    // Subtle idle sway when resting
-    if (!isMoving) {
-        const float idleSway = std::sin(timeSec * 1.5f) * 0.0015f * (1.0f + fatigue * 0.5f);
+    // Subtle idle sway when resting (smoothly fades out as movement picks up)
+    if (moveWeight < 0.999f) {
+        const float idleFactor = 1.0f - moveWeight;
+        const float idleSway = std::sin(timeSec * 1.5f) * 0.0015f * (1.0f + fatigue * 0.5f) * idleFactor;
         localTrans[BoneId::Pelvis].x += idleSway;
         localRot[BoneId::Pelvis] = Mat4::rotationZ(idleSway * 1.5f);
     }
@@ -569,22 +571,27 @@ inline void evaluateProceduralPose(
     // Model space: +X is right, +Y is up, +Z is forward.
     // Forward leg swing is -X rotation (brings foot forward into +Z).
     // Backward knee flexion is +X rotation (pulls calf/foot backward into -Z).
-    // Arms counter-swing opposite to legs.
-    if (isMoving) {
-        float cycleDuration = 1.0f;
-        if (move.stance == movement::Stance::Crouch) {
-            cycleDuration = 1.3f;
-        } else if (move.stance == movement::Stance::Prone) {
-            cycleDuration = 1.6f;
-        } else if (move.gait == movement::Gait::Sprint) {
-            cycleDuration = 0.5f;
-        } else if (move.gait == movement::Gait::Run) {
-            cycleDuration = 0.7f;
+    // Arms counter-swing opposite to legs (strictly contralateral).
+    if (moveWeight > 0.001f) {
+        float animPhase = 0.0f;
+        if (locomotionPhase >= 0.0f) {
+            animPhase = locomotionPhase;
         } else {
-            cycleDuration = 1.0f;
+            float cycleDuration = 1.0f;
+            if (move.stance == movement::Stance::Crouch) {
+                cycleDuration = 1.3f;
+            } else if (move.stance == movement::Stance::Prone) {
+                cycleDuration = 1.6f;
+            } else if (move.gait == movement::Gait::Sprint) {
+                cycleDuration = 0.5f;
+            } else if (move.gait == movement::Gait::Run) {
+                cycleDuration = 0.7f;
+            } else {
+                cycleDuration = 1.0f;
+            }
+            animPhase = (timeSec / cycleDuration) * 2.0f * 3.1415926535f;
         }
 
-        const float animPhase = (timeSec / cycleDuration) * 2.0f * 3.1415926535f;
         const float s = std::sin(animPhase);
         const float c = std::cos(animPhase);
 
@@ -609,38 +616,38 @@ inline void evaluateProceduralPose(
         }
 
         // Left Leg forward swing phase (s > 0):
-        // Thigh swings forward (-X rot)
-        localRot[BoneId::LThigh] = Mat4::rotationX(-s * legSwingMax);
-        // Knee flexes backward when swinging forward (+X rot)
-        localRot[BoneId::LCalf] = Mat4::rotationX(std::max(0.0f, s) * kneeBendMax);
+        // Thigh swings forward (-X rot brings foot forward into +Z)
+        localRot[BoneId::LThigh] = Mat4::rotationX(-s * legSwingMax * moveWeight);
+        // Knee flexes backward when swinging forward (+X rot pulls calf/foot backward)
+        localRot[BoneId::LCalf] = Mat4::rotationX(std::max(0.0f, s) * kneeBendMax * moveWeight);
         // Ankle counter-flexion keeps foot level
-        localRot[BoneId::LFoot] = Mat4::rotationX(s * legSwingMax * 0.40f);
+        localRot[BoneId::LFoot] = Mat4::rotationX(s * legSwingMax * 0.40f * moveWeight);
 
-        // Right Leg backward push phase:
-        // Thigh swings backward (+X rot)
-        localRot[BoneId::RThigh] = Mat4::rotationX(s * legSwingMax);
-        // Knee straight or slight push-off bend
-        localRot[BoneId::RCalf] = Mat4::rotationX(std::max(0.0f, -s) * (kneeBendMax * 0.25f));
-        // Foot toe push-off
-        localRot[BoneId::RFoot] = Mat4::rotationX(-s * legSwingMax * 0.40f);
+        // Right Leg backward push phase (s < 0, so -s > 0 is forward swing):
+        // Thigh swings forward when s < 0 (-X rot) and backward when s > 0 (+X rot)
+        localRot[BoneId::RThigh] = Mat4::rotationX(s * legSwingMax * moveWeight);
+        // Knee flexes backward during forward swing (-s > 0), perfectly symmetrical with left knee
+        localRot[BoneId::RCalf] = Mat4::rotationX(std::max(0.0f, -s) * kneeBendMax * moveWeight);
+        // Foot ankle counter-flexion keeps foot level
+        localRot[BoneId::RFoot] = Mat4::rotationX(-s * legSwingMax * 0.40f * moveWeight);
 
-        // Arms counter-swing opposite to legs:
-        // Left arm swings backward (+X rot) when left leg swings forward
-        localRot[BoneId::LUpperArm] = Mat4::rotationX(s * armSwingMax);
-        // Right arm swings forward (-X rot) when right leg swings backward
-        localRot[BoneId::RUpperArm] = Mat4::rotationX(-s * armSwingMax);
+        // Arms counter-swing opposite to legs (strictly contralateral):
+        // Left arm swings backward (+X rot) when left leg swings forward (s > 0)
+        localRot[BoneId::LUpperArm] = Mat4::rotationX(s * armSwingMax * moveWeight);
+        // Right arm swings forward (-X rot) when left leg swings forward (s > 0)
+        localRot[BoneId::RUpperArm] = Mat4::rotationX(-s * armSwingMax * moveWeight);
 
-        // Forearms natural forward flexion (+Z bend)
-        localRot[BoneId::LForeArm] = Mat4::rotationX(-0.25f - std::max(0.0f, -s) * 0.40f);
-        localRot[BoneId::RForeArm] = Mat4::rotationX(-0.25f - std::max(0.0f, s) * 0.40f);
+        // Forearms natural forward flexion (+Z bend) with dynamic swing flexion:
+        localRot[BoneId::LForeArm] = Mat4::rotationX((-0.20f - std::max(0.0f, -s) * 0.35f) * moveWeight);
+        localRot[BoneId::RForeArm] = Mat4::rotationX((-0.20f - std::max(0.0f, s) * 0.35f) * moveWeight);
 
-        // Pelvis hip bob and lateral sway
-        localTrans[BoneId::Pelvis].y -= std::abs(s) * hipBobMax;
-        localTrans[BoneId::Pelvis].x += c * pelvisSwayMax;
-        localRot[BoneId::Pelvis] = Mat4::rotationZ(c * 0.035f);
+        // Pelvis hip bob (2x frequency, drops during midstance of both feet) and lateral sway
+        localTrans[BoneId::Pelvis].y -= std::abs(s) * hipBobMax * moveWeight;
+        localTrans[BoneId::Pelvis].x += c * pelvisSwayMax * moveWeight;
+        localRot[BoneId::Pelvis] = Mat4::rotationZ(c * 0.035f * moveWeight);
 
         // Torso counter-twist
-        localRot[BoneId::Spine] = Mat4::rotationY(-s * 0.07f);
+        localRot[BoneId::Spine] = Mat4::rotationY(-s * 0.07f * moveWeight);
     }
 
     // 5. Stance Adaptations:
@@ -707,9 +714,9 @@ inline void evaluateProceduralPose(
         }
     }
 
-    // Player lean coupling (Q/E)
+    // Player lean coupling (Q/E) - increased by 150% (2.5x base magnitude)
     if (std::abs(body.lean) > 0.01f) {
-        const float leanRoll = -body.lean * 0.15f;
+        const float leanRoll = -body.lean * 0.375f;
         localRot[BoneId::Spine] = Mat4::multiply(localRot[BoneId::Spine], Mat4::rotationZ(leanRoll));
         localRot[BoneId::Head] = Mat4::multiply(localRot[BoneId::Head], Mat4::rotationZ(-leanRoll * 0.5f));
     }
