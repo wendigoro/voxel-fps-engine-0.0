@@ -288,14 +288,21 @@ struct DebrisSystem {
     void beginFrame() { spawnBurstFrame = 0; }
 
     DebrisParticle* allocParticle() {
+        DebrisParticle* p = nullptr;
         if (!freeList.empty()) {
             int idx = freeList.back();
             freeList.pop_back();
-            return &particles[static_cast<size_t>(idx)];
+            p = &particles[static_cast<size_t>(idx)];
+        } else if (static_cast<int>(particles.size()) < kMaxDebris) {
+            particles.emplace_back();
+            p = &particles.back();
         }
-        if (static_cast<int>(particles.size()) >= kMaxDebris) return nullptr;
-        particles.emplace_back();
-        return &particles.back();
+        if (p) {
+            ++aliveCached;
+            if (aliveCached > activePeak) activePeak = aliveCached;
+            meshDirty = true;
+        }
+        return p;
     }
 
     // Spawn sublattice impact effects: 1 or 2 impacted units depending on angle of impact.
@@ -345,16 +352,16 @@ struct DebrisSystem {
                 DebrisParticle* spark = allocParticle();
                 if (spark) {
                     spark->sx = su.sx; spark->sy = su.sy; spark->sz = su.sz;
-                    spark->px = (static_cast<float>(ix) + (su.sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nx * (subSize * 0.35f);
-                    spark->py = (static_cast<float>(iy) + (su.sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.ny * (subSize * 0.35f);
-                    spark->pz = (static_cast<float>(iz) + (su.sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nz * (subSize * 0.35f);
-                    spark->vx = effSub.nx * 0.08f + frandSigned() * 0.03f;
-                    spark->vy = effSub.ny * 0.08f + frandSigned() * 0.03f + 0.02f;
-                    spark->vz = effSub.nz * 0.08f + frandSigned() * 0.03f;
-                    spark->life = 0.09f + frand() * 0.04f;
+                    spark->px = (static_cast<float>(ix) + (su.sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nx * (subSize * 0.55f * kDebrisVisualScale);
+                    spark->py = (static_cast<float>(iy) + (su.sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.ny * (subSize * 0.55f * kDebrisVisualScale);
+                    spark->pz = (static_cast<float>(iz) + (su.sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nz * (subSize * 0.55f * kDebrisVisualScale);
+                    spark->vx = effSub.nx * 0.12f + frandSigned() * 0.05f;
+                    spark->vy = effSub.ny * 0.12f + frandSigned() * 0.05f + 0.04f;
+                    spark->vz = effSub.nz * 0.12f + frandSigned() * 0.05f;
+                    spark->life = 0.12f + frand() * 0.06f;
                     spark->maxLife = spark->life;
                     spark->cr = 1.0f; spark->cg = 0.92f; spark->cb = 0.65f;
-                    spark->half = subSize * 0.65f;
+                    spark->half = subSize * 0.65f * kDebrisVisualScale;
                     spark->mat = mat;
                     spark->alive = true;
                     spark->stationary = false;
@@ -366,18 +373,20 @@ struct DebrisSystem {
             }
 
             // 2. Surface Crater Dent Mark (stationary chipped dent cube at the sublattice unit)
+            // Offset outward along struck normal so it sits proud of the solid face without depth-buffer culling.
             if (spawnBurstFrame < kHardMaxSpawnBurst) {
                 DebrisParticle* dent = allocParticle();
                 if (dent) {
                     dent->sx = su.sx; dent->sy = su.sy; dent->sz = su.sz;
-                    dent->px = (static_cast<float>(ix) + (su.sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize;
-                    dent->py = (static_cast<float>(iy) + (su.sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize;
-                    dent->pz = (static_cast<float>(iz) + (su.sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize;
+                    const float normalOffset = subSize * 0.52f * kDebrisVisualScale;
+                    dent->px = (static_cast<float>(ix) + (su.sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nx * normalOffset;
+                    dent->py = (static_cast<float>(iy) + (su.sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.ny * normalOffset;
+                    dent->pz = (static_cast<float>(iz) + (su.sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nz * normalOffset;
                     dent->vx = 0.0f; dent->vy = 0.0f; dent->vz = 0.0f;
-                    dent->life = 1.8f;
-                    dent->maxLife = 1.8f;
+                    dent->life = 2.5f;
+                    dent->maxLife = 2.5f;
                     dent->cr = cr * 0.45f; dent->cg = cg * 0.45f; dent->cb = cb * 0.45f;
-                    dent->half = subSize * 0.48f;
+                    dent->half = subSize * 0.50f * kDebrisVisualScale;
                     dent->mat = mat;
                     dent->alive = true;
                     dent->stationary = true;
@@ -412,30 +421,31 @@ struct DebrisSystem {
                                 float voxelSize) {
         const float subSize = voxelSize / static_cast<float>(kDebrisSubDiv);
         p.sx = sx; p.sy = sy; p.sz = sz;
-        p.px = (static_cast<float>(ix) + (sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize;
-        p.py = (static_cast<float>(iy) + (sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize;
-        p.pz = (static_cast<float>(iz) + (sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize;
+        // Start slightly proud of the face so chips are immediately clear of the solid wall
+        p.px = (static_cast<float>(ix) + (sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + sub.nx * (subSize * 0.5f * kDebrisVisualScale);
+        p.py = (static_cast<float>(iy) + (sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + sub.ny * (subSize * 0.5f * kDebrisVisualScale);
+        p.pz = (static_cast<float>(iz) + (sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + sub.nz * (subSize * 0.5f * kDebrisVisualScale);
 
         float dirX, dirY, dirZ;
         if (sub.count == 1) {
             // Direct impact: rebound cone off surface normal + loft
-            dirX = sub.nx * 0.75f + frandSigned() * (0.45f + fragility);
-            dirY = sub.ny * 0.75f + frandSigned() * (0.45f + fragility) + 0.40f;
-            dirZ = sub.nz * 0.75f + frandSigned() * (0.45f + fragility);
+            dirX = sub.nx * 0.85f + frandSigned() * (0.45f + fragility);
+            dirY = sub.ny * 0.85f + frandSigned() * (0.45f + fragility) + 0.45f;
+            dirZ = sub.nz * 0.85f + frandSigned() * (0.45f + fragility);
         } else {
             // Oblique impact: graze spray along tangential direction + scatter
             float gx = -sub.nx * 0.2f + (1.0f - std::fabs(sub.nx)) * frandSigned() * 0.8f;
-            float gy = -sub.ny * 0.2f + 0.35f;
+            float gy = -sub.ny * 0.2f + 0.40f;
             float gz = -sub.nz * 0.2f + (1.0f - std::fabs(sub.nz)) * frandSigned() * 0.8f;
-            dirX = sub.nx * 0.35f + gx;
-            dirY = sub.ny * 0.35f + gy;
-            dirZ = sub.nz * 0.35f + gz;
+            dirX = sub.nx * 0.45f + gx;
+            dirY = sub.ny * 0.45f + gy;
+            dirZ = sub.nz * 0.45f + gz;
         }
         float dlen = std::sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
         if (dlen > 1e-6f) { dirX /= dlen; dirY /= dlen; dirZ /= dlen; }
         else { dirX = 0; dirY = 1.0f; dirZ = 0; }
 
-        Mat3 scatter = Mat3::scale(baseSpeed / std::max(0.25f, massScale));
+        Mat3 scatter = Mat3::scale(std::max(0.12f, baseSpeed * 1.8f) / std::max(0.25f, massScale));
         scatter.mulVec(dirX, dirY, dirZ, p.vx, p.vy, p.vz);
 
         p.life = 0.70f + frand() * 1.35f + (1.0f - fragility) * 0.35f;

@@ -1792,7 +1792,7 @@ static void drainInventoryInput() {
 static void updateDebrisMesh() {
     const int alive = g_debris.activeCount();
     const bool flashOn = g_muzzleFlash > 0.02f;
-    if (alive <= 0 && !flashOn) {
+    if (alive <= 0 && !flashOn && !g_debris.meshDirty) {
         g_debrisVertexCount = 0;
         g_debrisWasActive = false;
         g_debris.meshDirty = false;
@@ -2161,10 +2161,13 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             g_inventoryClick = true;
             return 0;
         }
+        g_pendingInput.firePressed = true;
+        g_pendingInput.fireHeld = true;
         SetCapture(hwnd);
         return 0;
     case WM_LBUTTONUP:
         g_mouseDown = false;
+        g_pendingInput.fireHeld = false;
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:

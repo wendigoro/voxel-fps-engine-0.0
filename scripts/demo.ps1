@@ -36,7 +36,7 @@ if ($headless) {
   Write-Host "SkipInteractive/headless set - headless demo only."
 } else {
   Write-Host "== interactive warehouse demo =="
-  Write-Host "Controls: WASD walk | Space jump | Q/E lean | LMB look | RMB/F fire | 1-4 ammo | R cycle | Esc quit"
+  Write-Host "Controls: WASD walk | Space jump | Q/E lean | LMB/RMB/F fire | 1-4 ammo | R cycle | Esc quit"
   Write-Host "          TAB pack | G take pickup | pack: LMB lift/place, RMB stow, R rotate" -ForegroundColor DarkGray
   Start-Process -FilePath $Exe -WorkingDirectory $Build | Out-Null
   Write-Host ("engine_launch=exe cwd=" + $Build)
