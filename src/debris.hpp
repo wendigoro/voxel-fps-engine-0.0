@@ -296,9 +296,27 @@ struct DebrisSystem {
         } else if (static_cast<int>(particles.size()) < kMaxDebris) {
             particles.emplace_back();
             p = &particles.back();
+        } else {
+            // Buffer capacity reached: recycle oldest stationary particle (FIFO recycling)
+            for (size_t i = 0; i < particles.size(); ++i) {
+                if (particles[i].alive && particles[i].stationary) {
+                    p = &particles[i];
+                    break;
+                }
+            }
+            if (!p) {
+                // If all particles are dynamic/sparks, recycle the one with shortest remaining life
+                float minLife = 1e9f;
+                for (size_t i = 0; i < particles.size(); ++i) {
+                    if (particles[i].alive && particles[i].life < minLife) {
+                        minLife = particles[i].life;
+                        p = &particles[i];
+                    }
+                }
+            }
         }
         if (p) {
-            ++aliveCached;
+            if (!p->alive) ++aliveCached;
             if (aliveCached > activePeak) activePeak = aliveCached;
             meshDirty = true;
         }
@@ -383,8 +401,8 @@ struct DebrisSystem {
                     dent->py = (static_cast<float>(iy) + (su.sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.ny * normalOffset;
                     dent->pz = (static_cast<float>(iz) + (su.sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nz * normalOffset;
                     dent->vx = 0.0f; dent->vy = 0.0f; dent->vz = 0.0f;
-                    dent->life = 2.5f;
-                    dent->maxLife = 2.5f;
+                    dent->life = 3600.0f;
+                    dent->maxLife = 3600.0f;
                     dent->cr = cr * 0.45f; dent->cg = cg * 0.45f; dent->cb = cb * 0.45f;
                     dent->half = subSize * 0.50f * kDebrisVisualScale;
                     dent->mat = mat;
@@ -507,17 +525,23 @@ struct DebrisSystem {
                     }
                     if (p.bounces > 5 || (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz) < 4e-6f) {
                         p.vx = p.vy = p.vz = 0;
+                        p.stationary = true;
                     }
                 } else {
                     // Air drag keeps chips from flying forever at high energy.
                     p.vx *= damp; p.vy *= damp; p.vz *= damp;
                 }
             }
-            p.life -= dt;
-            if (p.life <= 0.0f) {
-                p.alive = false;
-                freeList.push_back(i);
+            if (!p.stationary) {
+                p.life -= dt;
+                if (p.life <= 0.0f) {
+                    p.alive = false;
+                    freeList.push_back(i);
+                } else {
+                    ++active;
+                }
             } else {
+                // Stationary debris (sublattice crater dent marks & resting chips) stays rendered!
                 ++active;
             }
         }

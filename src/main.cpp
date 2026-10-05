@@ -300,6 +300,126 @@ static int g_mouseX = 0, g_mouseY = 0, g_lastMouseX = 0, g_lastMouseY = 0;
 // The view's raw device state. The simulation never reads this: buildSimInput()
 // translates it into player intent, and that intent is all sim::tick() receives.
 static SimInput g_pendingInput;
+
+enum class KeyAction : int {
+    MoveForward = 0,
+    MoveBackward,
+    MoveLeft,
+    MoveRight,
+    Jump,
+    Sprint,
+    Crouch,
+    Dash,
+    StanceCycle,
+    LeanLeft,
+    LeanRight,
+    PrimaryFire,
+    AimDownSights,
+    ReloadOrRotate,
+    CycleWeapon,
+    CycleFireMode,
+    Interact,
+    ToggleInventory,
+    ThirdPerson,
+    Count
+};
+
+struct KeyActionDef {
+    KeyAction action;
+    const char* id;
+    const char* label;
+    const char* category;
+    int defaultKey1;
+    int defaultKey2;
+};
+
+static const KeyActionDef kKeyActionDefs[] = {
+    { KeyAction::MoveForward,     "move_forward",    "Move Forward",        "Movement",         'W',         VK_UP },
+    { KeyAction::MoveBackward,    "move_backward",   "Move Backward",       "Movement",         'S',         VK_DOWN },
+    { KeyAction::MoveLeft,        "move_left",       "Move Left",           "Movement",         'A',         VK_LEFT },
+    { KeyAction::MoveRight,       "move_right",      "Move Right",          "Movement",         'D',         VK_RIGHT },
+    { KeyAction::Jump,            "jump",            "Jump",                "Movement",         VK_SPACE,    0 },
+    { KeyAction::Sprint,          "sprint",          "Sprint",              "Movement",         VK_SHIFT,    0 },
+    { KeyAction::Crouch,          "crouch",          "Crouch",              "Movement",         VK_CONTROL,  0 },
+    { KeyAction::Dash,            "dash",            "Dash",                "Movement",         'C',         0 },
+    { KeyAction::StanceCycle,     "stance_cycle",    "Stance Cycle",        "Movement",         'V',         0 },
+    { KeyAction::LeanLeft,        "lean_left",       "Lean Left",           "Movement",         'Q',         0 },
+    { KeyAction::LeanRight,       "lean_right",      "Lean Right",          "Movement",         'E',         0 },
+
+    { KeyAction::PrimaryFire,     "primary_fire",    "Primary Fire",        "Combat",           VK_LBUTTON,  0 },
+    { KeyAction::AimDownSights,   "aim_down_sights", "Aim Down Sights",     "Combat",           VK_RBUTTON,  'X' },
+    { KeyAction::ReloadOrRotate,  "reload_rotate",   "Reload / Rotate",     "Combat",           'R',         0 },
+    { KeyAction::CycleWeapon,     "cycle_weapon",    "Cycle Weapon",        "Combat",           '1',         0 },
+    { KeyAction::CycleFireMode,   "cycle_fire_mode", "Cycle Fire Mode",     "Combat",           'B',         0 },
+
+    { KeyAction::Interact,        "interact",        "Interact / Pick Up",  "Interaction & UI", 'F',         'G' },
+    { KeyAction::ToggleInventory, "inventory",       "Inventory Lattice",   "Interaction & UI", VK_TAB,       0 },
+    { KeyAction::ThirdPerson,     "third_person",    "Third Person Camera", "Interaction & UI", 'T',         VK_F5 },
+};
+
+struct KeyBinding {
+    int key1 = 0;
+    int key2 = 0;
+};
+
+static KeyBinding g_keybindings[static_cast<int>(KeyAction::Count)];
+static int g_rebindingAction = -1;
+static int g_rebindingSlot = 0;
+static uint64_t g_rebindingFrame = 0;
+static std::string g_keybindStatus;
+
+static void initDefaultKeybindings() {
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        g_keybindings[i].key1 = kKeyActionDefs[i].defaultKey1;
+        g_keybindings[i].key2 = kKeyActionDefs[i].defaultKey2;
+    }
+}
+
+static bool isActionHeld(KeyAction act) {
+    const int idx = static_cast<int>(act);
+    if (idx < 0 || idx >= static_cast<int>(KeyAction::Count)) return false;
+    const int k1 = g_keybindings[idx].key1;
+    const int k2 = g_keybindings[idx].key2;
+    if (k1 > 0 && k1 < 256 && g_keys[k1]) return true;
+    if (k2 > 0 && k2 < 256 && g_keys[k2]) return true;
+    return false;
+}
+
+static bool isActionKey(KeyAction act, int vk) {
+    if (vk <= 0) return false;
+    const int idx = static_cast<int>(act);
+    if (idx < 0 || idx >= static_cast<int>(KeyAction::Count)) return false;
+    return g_keybindings[idx].key1 == vk || g_keybindings[idx].key2 == vk;
+}
+
+static std::string keyName(int vk) {
+    if (vk <= 0) return "-";
+    if (vk == VK_LBUTTON) return "Left Mouse";
+    if (vk == VK_RBUTTON) return "Right Mouse";
+    if (vk == VK_MBUTTON) return "Middle Mouse";
+    if (vk == VK_SPACE) return "Space";
+    if (vk == VK_SHIFT) return "Shift";
+    if (vk == VK_CONTROL) return "Ctrl";
+    if (vk == VK_MENU) return "Alt";
+    if (vk == VK_TAB) return "Tab";
+    if (vk == VK_ESCAPE) return "Esc";
+    if (vk == VK_RETURN) return "Enter";
+    if (vk == VK_BACK) return "Backspace";
+    if (vk == VK_DELETE) return "Del";
+    if (vk == VK_UP) return "Up Arrow";
+    if (vk == VK_DOWN) return "Down Arrow";
+    if (vk == VK_LEFT) return "Left Arrow";
+    if (vk == VK_RIGHT) return "Right Arrow";
+    if (vk >= VK_F1 && vk <= VK_F12) return "F" + std::to_string(vk - VK_F1 + 1);
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return std::string(1, static_cast<char>(vk));
+
+    char name[64]{};
+    UINT sc = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+    if (sc != 0 && GetKeyNameTextA(sc << 16, name, sizeof(name)) > 0) {
+        return std::string(name);
+    }
+    return "Key " + std::to_string(vk);
+}
 // Free-float first-person POV camera (radians)
 static float g_yaw = 0.0f;          // 0 = looking toward -Z
 static float g_pitch = -0.28f; // slightly down with higher fisheye POV
@@ -534,11 +654,12 @@ static VkDeviceMemory g_debrisMem = VK_NULL_HANDLE;
 static void* g_debrisMapped = nullptr;
 static uint32_t g_debrisVertexCount = 0;
 // True cubic chips: 36 verts/particle (6 faces × 2 tris). Cap keeps upload cheap.
-static constexpr uint32_t kDebrisMaxParticlesDraw = 160;
+static constexpr uint32_t kDebrisMaxParticlesDraw = 512;
 static constexpr uint32_t kDebrisVertsPerParticle = 36;
 static constexpr uint32_t kMuzzleFlashCubes = 4;
+static constexpr uint32_t kMaxProjectileTracersDraw = 64;
 static constexpr uint32_t kDebrisMaxVerts =
-    kDebrisMaxParticlesDraw * kDebrisVertsPerParticle + kMuzzleFlashCubes * 36u;
+    kDebrisMaxParticlesDraw * kDebrisVertsPerParticle + kMuzzleFlashCubes * 36u + kMaxProjectileTracersDraw * 72u;
 static double g_debrisUploadUsSum = 0.0;
 static double g_debrisUploadUsMax = 0.0;
 static int g_debrisUploadSamples = 0;
@@ -1481,23 +1602,23 @@ static void updateInventoryMesh() {
                 if (inst >= 0 && inst < static_cast<int>(inv.items.size())) {
                     const ItemDef* d = itemDefAt(g_itemDefs, inv.items[inst].defIndex);
                     if (d) {
-                        cr = d->cr;
-                        cg = d->cg;
-                        cb = d->cb;
+                        cr = d->cr * 0.18f;
+                        cg = d->cg * 0.18f;
+                        cb = d->cb * 0.18f;
                     } else {
-                        cr = cg = cb = 0.8f;
+                        cr = cg = cb = 0.15f;
                     }
                 } else {
-                    cr = 0.10f;
-                    cg = 0.11f;
-                    cb = 0.14f; // dim backing for an empty cell
+                    cr = 0.012f;
+                    cg = 0.016f;
+                    cb = 0.022f; // subtle dark open strut frame for empty cell
                 }
                 // Hover highlight on the cell under the cursor.
                 if (g_invHover.lattice && g_invHover.x == ix && g_invHover.y == iy &&
                     g_invHover.z == iz) {
-                    cr = std::min(1.0f, cr + 0.30f);
-                    cg = std::min(1.0f, cg + 0.34f);
-                    cb = std::min(1.0f, cb + 0.38f);
+                    cr = std::min(1.0f, cr + 0.22f);
+                    cg = std::min(1.0f, cg + 0.26f);
+                    cb = std::min(1.0f, cb + 0.32f);
                 }
                 emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(ix),
                                   static_cast<float>(iy), static_cast<float>(iz), cr, cg, cb,
@@ -1553,13 +1674,13 @@ static void updateInventoryMesh() {
             // Equipped piece: emit 3D unit-cube shape of the item
             const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
             if (d && d->shape.valid()) {
-                float cr = overrideColor ? tintR : d->cr * 1.15f;
-                float cg = overrideColor ? tintG : d->cg * 1.15f;
-                float cb = overrideColor ? tintB : d->cb * 1.15f;
+                float cr = overrideColor ? tintR : d->cr * 0.22f;
+                float cg = overrideColor ? tintG : d->cg * 0.22f;
+                float cb = overrideColor ? tintB : d->cb * 0.22f;
                 if (isHovered && !overrideColor) {
-                    cr = std::min(1.0f, cr + 0.30f);
-                    cg = std::min(1.0f, cg + 0.34f);
-                    cb = std::min(1.0f, cb + 0.38f);
+                    cr = std::min(1.0f, cr + 0.22f);
+                    cg = std::min(1.0f, cg + 0.26f);
+                    cb = std::min(1.0f, cb + 0.32f);
                 }
                 const ItemShape itemShape = rotatedShape(d->shape, inv.slotRot[s]);
                 for (int iz = 0; iz < itemShape.sz; ++iz) {
@@ -1590,13 +1711,13 @@ static void updateInventoryMesh() {
             if (overrideColor) {
                 cr = tintR; cg = tintG; cb = tintB;
             } else if (isHovered) {
-                cr = 0.50f; cg = 0.70f; cb = 0.95f; // bright cyan hover
+                cr = 0.20f; cg = 0.35f; cb = 0.50f; // bright cyan hover
             } else if (slotIsArmor(spec.slot)) {
-                cr = 0.14f; cg = 0.18f; cb = 0.24f; // armor frame blue/cyan
+                cr = 0.035f; cg = 0.045f; cb = 0.065f; // armor frame blue/cyan
             } else if (slotIsWeapon(spec.slot)) {
-                cr = 0.24f; cg = 0.19f; cb = 0.14f; // weapon frame amber
+                cr = 0.065f; cg = 0.050f; cb = 0.035f; // weapon frame amber
             } else {
-                cr = 0.18f; cg = 0.20f; cb = 0.16f; // backpack frame olive
+                cr = 0.045f; cg = 0.055f; cb = 0.040f; // backpack frame olive
             }
             emitSlotBrackets(origin, dRight, dUp, dFwd, spec.x0, spec.y0, spec.z0, spec.sx, spec.sy, cr, cg, cb, wi);
             if (spec.hasSec) {
@@ -1608,7 +1729,7 @@ static void updateInventoryMesh() {
     // Pedestal base under mannequin legs
     for (int x = -8; x <= -6; ++x) {
         emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(x), 0.0f, 0.0f,
-                          0.12f, 0.13f, 0.16f, static_cast<float>(kInventoryMatId), wi);
+                          0.03f, 0.035f, 0.045f, static_cast<float>(kInventoryMatId), wi);
     }
 
     g_inventorySlotVertexCount = wi - wiBeforeSlots;
@@ -1947,29 +2068,27 @@ static void drainInventoryInput() {
     }
 }
 
-// Cubic 8^3 debris chips + short-lived muzzle flash cubes (display only).
+// Cubic 8^3 debris chips + short-lived muzzle flash cubes + projectile tracers (display only).
 static void updateDebrisMesh() {
     const int alive = g_debris.activeCount();
     const bool flashOn = g_muzzleFlash > 0.02f;
-    if (alive <= 0 && !flashOn && !g_debris.meshDirty) {
+    const bool projsActive = !g_projectiles.empty();
+    if (alive <= 0 && !flashOn && !projsActive && !g_debris.meshDirty) {
         g_debrisVertexCount = 0;
         g_debrisWasActive = false;
         g_debris.meshDirty = false;
         return;
     }
-    // Skip rebuild only when nothing moved and no flash (still draw last mesh).
-    if (!g_debris.meshDirty && !flashOn && g_debrisWasActive && g_debrisVertexCount > 0) {
+    // Skip rebuild only when nothing moved, no active projectiles, and no flash (still draw last mesh).
+    if (!g_debris.meshDirty && !flashOn && !projsActive && g_debrisWasActive && g_debrisVertexCount > 0) {
         return;
     }
 
     ensureDebrisBuffer();
     if (!g_debrisMapped) { g_debrisVertexCount = 0; return; }
-
-    LARGE_INTEGER t0{}, t1{}, freq{};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-
-    Vertex* verts = reinterpret_cast<Vertex*>(g_debrisMapped);
+    alignas(64) static std::vector<Vertex> s_debrisScratch;
+    if (s_debrisScratch.size() < kDebrisMaxVerts) s_debrisScratch.resize(kDebrisMaxVerts);
+    Vertex* verts = s_debrisScratch.data();
     uint32_t wi = 0;
     auto put = [&](float px, float py, float pz,
                    float nx, float ny, float nz,
@@ -1986,17 +2105,23 @@ static void updateDebrisMesh() {
     };
 
     // Soft-cap drawn particles under load (36 verts each).
-    const int drawCap = g_stress ? 96 : static_cast<int>(kDebrisMaxParticlesDraw);
+    const int drawCap = g_stress ? 24 : static_cast<int>(kDebrisMaxParticlesDraw);
     int drawn = 0;
-    int stride = 1;
-    if (alive > drawCap) stride = (alive + drawCap - 1) / drawCap;
 
-    int seen = 0;
+    // 1. Stationary debris: sublattice crater dent marks & resting chips stay rendered
     for (const auto& p : g_debris.particles) {
-        if (!p.alive) continue;
-        if ((seen++ % stride) != 0) continue;
+        if (!p.alive || !p.stationary) continue;
         if (drawn >= drawCap) break;
-        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u) break;
+        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u - 72u) break;
+        ++drawn;
+        emitDebrisCube(p, kDebrisMatId, put);
+    }
+
+    // 2. Dynamic debris: flying chips and emissive sparks
+    for (const auto& p : g_debris.particles) {
+        if (!p.alive || p.stationary) continue;
+        if (drawn >= drawCap) break;
+        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u - 72u) break;
         ++drawn;
         emitDebrisCube(p, p.emissive ? kMuzzleMatId : kDebrisMatId, put);
     }
@@ -2030,10 +2155,49 @@ static void updateDebrisMesh() {
         }
     }
 
+    // 3. In-flight projectile tracers (glowing bullet head + trailing streak)
+    int projDrawn = 0;
+    const int maxProjsDraw = g_stress ? 4 : static_cast<int>(kMaxProjectileTracersDraw);
+    for (const auto& p : g_projectiles) {
+        if (!p.alive) continue;
+        if (projDrawn >= maxProjsDraw) break;
+        if (wi + 72u > kDebrisMaxVerts) break;
+        ++projDrawn;
+
+        float cr = 1.0f, cg = 0.88f, cb = 0.45f; // ballistic gold default
+        if (p.def.caliber == "energy") {
+            cr = 0.25f; cg = 0.85f; cb = 1.0f; // cyan
+        } else if (p.def.effect == "explosive" || p.def.caliber == "explosive") {
+            cr = 1.0f; cg = 0.45f; cb = 0.15f; // orange
+        }
+
+        const float half = std::max(0.0006f, std::min(0.0022f, p.def.radius * 0.75f));
+        emitFlashCube(p.px, p.py, p.pz, half, cr, cg, cb, kMuzzleMatId, put);
+
+        // Trailing streak along velocity
+        const float speedSq = p.vx * p.vx + p.vy * p.vy + p.vz * p.vz;
+        if (speedSq > 1e-4f) {
+            const float speed = std::sqrt(speedSq);
+            const float tLen = std::min(0.008f, speed * 0.0012f);
+            const float tx = p.px - (p.vx / speed) * tLen;
+            const float ty = p.py - (p.vy / speed) * tLen;
+            const float tz = p.pz - (p.vz / speed) * tLen;
+            emitFlashCube(tx, ty, tz, half * 0.70f, cr * 0.65f, cg * 0.65f, cb * 0.65f, kMuzzleMatId, put);
+        }
+    }
+
     g_debrisVertexCount = wi;
     if (wi > g_debrisVertsPeak) g_debrisVertsPeak = wi;
     g_debrisWasActive = (wi > 0);
     g_debris.meshDirty = false;
+
+    LARGE_INTEGER t0{}, t1{}, freq{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    if (wi > 0 && g_debrisMapped) {
+        std::memcpy(g_debrisMapped, verts, wi * sizeof(Vertex));
+    }
 
     QueryPerformanceCounter(&t1);
     const double us = (double(t1.QuadPart - t0.QuadPart) * 1e6) / double(freq.QuadPart);
@@ -2251,6 +2415,20 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     }
     case WM_KEYDOWN:
         if (wParam < 256) g_keys[wParam] = true;
+        if (g_rebindingAction >= 0) {
+            if (wParam == VK_ESCAPE) {
+                g_rebindingAction = -1;
+            } else if (wParam == VK_DELETE || wParam == VK_BACK) {
+                if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = 0;
+                else g_keybindings[g_rebindingAction].key2 = 0;
+                g_rebindingAction = -1;
+            } else {
+                if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = static_cast<int>(wParam);
+                else g_keybindings[g_rebindingAction].key2 = static_cast<int>(wParam);
+                g_rebindingAction = -1;
+            }
+            return 0;
+        }
         if (wParam == VK_ESCAPE) {
             // Esc pauses; Shift+Esc quits. Smoke/stress keep Esc = quit so a run
             // can be aborted (it then fails with smoke_complete=0, exit 7).
@@ -2268,13 +2446,13 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         // what the player asked for and sim::tick() validates it against the
         // authoritative inventory. This is what stops a modified client from
         // selecting a weapon it was never given.
-        if (wParam == 'F') {
+        if (isActionKey(KeyAction::PrimaryFire, static_cast<int>(wParam))) {
             g_pendingInput.firePressed = true;
             g_pendingInput.fireHeld = true;
         }
-        if (wParam == VK_SPACE) g_pendingInput.jump = true;
+        if (isActionKey(KeyAction::Jump, static_cast<int>(wParam)) || wParam == VK_SPACE) g_pendingInput.jump = true;
         // TAB: toggle the 3D inventory lattice (RULES.md rule 12)
-        if (wParam == VK_TAB) {
+        if (isActionKey(KeyAction::ToggleInventory, static_cast<int>(wParam)) || wParam == VK_TAB) {
             g_inventoryOpen = !g_inventoryOpen;
             if (g_inventoryOpen) {
                 // Free the cursor so it can select cells; drop any held item back
@@ -2299,31 +2477,40 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             return 0;
         }
-        // R: rotate the held item while the lattice is up; otherwise cycle ammo.
-        if (wParam == 'R') {
+        // R / ReloadOrRotate: rotate the held item while the lattice is up; otherwise cycle ammo.
+        if (isActionKey(KeyAction::ReloadOrRotate, static_cast<int>(wParam)) || wParam == 'R') {
             if (g_inventoryOpen) {
                 g_inventoryHandRot = (g_inventoryHandRot + 1) & 3;
             } else {
                 g_pendingInput.cycleAmmo = true;
             }
         }
-        // G: take the world item under the crosshair (auto-places into the pack)
-        if (wParam == 'G' && !g_inventoryOpen) g_pickupPressed = true;
+        // Interact / Pick Up: take the world item under the crosshair (auto-places into the pack)
+        if ((isActionKey(KeyAction::Interact, static_cast<int>(wParam)) || wParam == 'G') && !g_inventoryOpen) {
+            g_pickupPressed = true;
+        }
         // 1-4: caliber class (light medium heavy energy)
         if (wParam == '1') g_pendingInput.selectCaliber = 0;
         if (wParam == '2') g_pendingInput.selectCaliber = 1;
         if (wParam == '3') g_pendingInput.selectCaliber = 2;
         if (wParam == '4') g_pendingInput.selectCaliber = 3;
-        if (wParam == 'V') g_pendingInput.cycleWeapon = true;
-        if (wParam == 'B') g_pendingInput.cycleFireMode = true;
-        if (wParam == 'T' || wParam == VK_F5) g_thirdPerson = !g_thirdPerson;
+        if (isActionKey(KeyAction::CycleWeapon, static_cast<int>(wParam)) || wParam == 'V') g_pendingInput.cycleWeapon = true;
+        if (isActionKey(KeyAction::CycleFireMode, static_cast<int>(wParam)) || wParam == 'B') g_pendingInput.cycleFireMode = true;
+        if (isActionKey(KeyAction::ThirdPerson, static_cast<int>(wParam)) || wParam == 'T' || wParam == VK_F5) g_thirdPerson = !g_thirdPerson;
         return 0;
     case WM_KEYUP:
         if (wParam < 256) g_keys[wParam] = false;
-        if (wParam == 'F') g_pendingInput.fireHeld = false;
+        if (isActionKey(KeyAction::PrimaryFire, static_cast<int>(wParam))) g_pendingInput.fireHeld = false;
         return 0;
     case WM_LBUTTONDOWN:
+        g_keys[VK_LBUTTON] = true;
         SetFocus(hwnd);
+        if (g_rebindingAction >= 0 && g_frame > g_rebindingFrame) {
+            if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = VK_LBUTTON;
+            else g_keybindings[g_rebindingAction].key2 = VK_LBUTTON;
+            g_rebindingAction = -1;
+            return 0;
+        }
         // While paused, clicks belong to the menu. A click while unlocked only
         // locks the mouse; it is not also read as a look drag or a pick.
         if (g_paused) return 0;
@@ -2341,26 +2528,59 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             g_inventoryClick = true;
             return 0;
         }
-        g_pendingInput.firePressed = true;
-        g_pendingInput.fireHeld = true;
+        if (isActionKey(KeyAction::PrimaryFire, VK_LBUTTON)) {
+            g_pendingInput.firePressed = true;
+            g_pendingInput.fireHeld = true;
+        }
         SetCapture(hwnd);
         return 0;
     case WM_LBUTTONUP:
+        g_keys[VK_LBUTTON] = false;
         g_mouseDown = false;
-        g_pendingInput.fireHeld = false;
+        if (isActionKey(KeyAction::PrimaryFire, VK_LBUTTON)) {
+            g_pendingInput.fireHeld = false;
+        }
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
+        g_keys[VK_RBUTTON] = true;
+        if (g_rebindingAction >= 0 && g_frame > g_rebindingFrame) {
+            if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = VK_RBUTTON;
+            else g_keybindings[g_rebindingAction].key2 = VK_RBUTTON;
+            g_rebindingAction = -1;
+            return 0;
+        }
         if (g_paused) return 0;
         if (g_inventoryOpen) {
             g_inventoryStow = true;
             return 0;
         }
-        g_pendingInput.firePressed = true;
-        g_pendingInput.fireHeld = true;
+        if (isActionKey(KeyAction::AimDownSights, VK_RBUTTON)) {
+            g_pendingInput.ads = true;
+        } else if (isActionKey(KeyAction::PrimaryFire, VK_RBUTTON)) {
+            g_pendingInput.firePressed = true;
+            g_pendingInput.fireHeld = true;
+        }
         return 0;
     case WM_RBUTTONUP:
-        g_pendingInput.fireHeld = false;
+        g_keys[VK_RBUTTON] = false;
+        if (isActionKey(KeyAction::AimDownSights, VK_RBUTTON)) {
+            g_pendingInput.ads = false;
+        } else if (isActionKey(KeyAction::PrimaryFire, VK_RBUTTON)) {
+            g_pendingInput.fireHeld = false;
+        }
+        return 0;
+    case WM_MBUTTONDOWN:
+        g_keys[VK_MBUTTON] = true;
+        if (g_rebindingAction >= 0 && g_frame > g_rebindingFrame) {
+            if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = VK_MBUTTON;
+            else g_keybindings[g_rebindingAction].key2 = VK_MBUTTON;
+            g_rebindingAction = -1;
+            return 0;
+        }
+        return 0;
+    case WM_MBUTTONUP:
+        g_keys[VK_MBUTTON] = false;
         return 0;
     case WM_MOUSEMOVE:
         g_mouseX = static_cast<short>(LOWORD(lParam));
@@ -6000,6 +6220,115 @@ static void drawVisualsPanel() {
     }
 }
 
+static void saveKeybindings() {
+    const std::string path = g_exeDir + "\\keybindings.json";
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        g_keybindStatus = "Could not write " + path;
+        return;
+    }
+    f << "{\n";
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        f << "  \"" << kKeyActionDefs[i].id << "\": ["
+          << g_keybindings[i].key1 << ", "
+          << g_keybindings[i].key2 << "]"
+          << (i + 1 < static_cast<int>(KeyAction::Count) ? ",\n" : "\n");
+    }
+    f << "}\n";
+    g_keybindStatus = "Saved " + path;
+}
+
+static void loadKeybindings() {
+    const std::string path = g_exeDir + "\\keybindings.json";
+    bool readable = false;
+    const std::string text = jsonReadText(path, &readable);
+    if (!readable) {
+        g_keybindStatus = "No saved keybindings yet";
+        return;
+    }
+    int loaded = 0;
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        std::vector<int> arr = jsonExtractIntArray(text, kKeyActionDefs[i].id);
+        if (!arr.empty()) {
+            g_keybindings[i].key1 = arr[0];
+            g_keybindings[i].key2 = arr.size() >= 2 ? arr[1] : 0;
+            ++loaded;
+        }
+    }
+    g_keybindStatus = "Loaded " + std::to_string(loaded) + " keybindings";
+}
+
+static void drawKeybindsPanel() {
+    if (ImGui::Button("Reset Defaults")) {
+        initDefaultKeybindings();
+        g_keybindStatus = "Reset to defaults";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save##keys")) {
+        saveKeybindings();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load##keys")) {
+        loadKeybindings();
+    }
+    if (!g_keybindStatus.empty()) {
+        ImGui::TextDisabled("%s", g_keybindStatus.c_str());
+    }
+
+    if (g_rebindingAction >= 0 && g_rebindingAction < static_cast<int>(KeyAction::Count)) {
+        const auto& def = kKeyActionDefs[g_rebindingAction];
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                           "Press key or mouse button for [%s] (%s)...",
+                           def.label, g_rebindingSlot == 0 ? "Primary" : "Secondary");
+        ImGui::TextDisabled("Esc: Cancel  |  Del / Backspace: Clear");
+        if (ImGui::Button("Cancel Rebind")) {
+            g_rebindingAction = -1;
+        }
+        ImGui::Separator();
+    }
+
+    const char* currentCategory = nullptr;
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        const auto& def = kKeyActionDefs[i];
+        if (!currentCategory || std::strcmp(currentCategory, def.category) != 0) {
+            currentCategory = def.category;
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", currentCategory);
+            ImGui::Separator();
+        }
+
+        ImGui::PushID(i);
+        ImGui::Text("%-20s", def.label);
+        ImGui::SameLine(180.0f);
+
+        // Slot 1 (Primary)
+        const bool isRebinding1 = (g_rebindingAction == i && g_rebindingSlot == 0);
+        std::string btn1Text = isRebinding1 ? "[ Press Key ]" : "[" + keyName(g_keybindings[i].key1) + "]";
+        if (isRebinding1) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.5f, 0.1f, 1.0f));
+        if (ImGui::Button(btn1Text.c_str(), ImVec2(105.0f, 0.0f))) {
+            g_rebindingAction = i;
+            g_rebindingSlot = 0;
+            g_rebindingFrame = g_frame;
+        }
+        if (isRebinding1) ImGui::PopStyleColor();
+
+        ImGui::SameLine();
+
+        // Slot 2 (Secondary)
+        const bool isRebinding2 = (g_rebindingAction == i && g_rebindingSlot == 1);
+        std::string btn2Text = isRebinding2 ? "[ Press Key ]" : "[" + keyName(g_keybindings[i].key2) + "]";
+        if (isRebinding2) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.5f, 0.1f, 1.0f));
+        if (ImGui::Button(btn2Text.c_str(), ImVec2(105.0f, 0.0f))) {
+            g_rebindingAction = i;
+            g_rebindingSlot = 1;
+            g_rebindingFrame = g_frame;
+        }
+        if (isRebinding2) ImGui::PopStyleColor();
+
+        ImGui::PopID();
+    }
+}
+
 static bool projectLatticePoint(float lx, float ly, float lz, float& sx, float& sy) {
     if (!g_invDisplay.valid) return false;
     const Vec3 p = g_invDisplay.origin + g_invDisplay.right * (lx * VOXEL_SIZE) +
@@ -6018,6 +6347,120 @@ static void drawBadge(ImDrawList* draw, float cx, float cy, const char* text, Im
     draw->AddRectFilled(bMin, bMax, colBg, 4.0f);
     draw->AddRect(bMin, bMax, colBorder, 4.0f);
     draw->AddText(ImVec2(x, y), colText, text);
+}
+
+static bool itemScreenBounds(float ox, float oy, float oz, float sx, float sy, float sz,
+                             float& minX, float& minY, float& maxX, float& maxY) {
+    minX = minY = 1e30f;
+    maxX = maxY = -1e30f;
+    int count = 0;
+    const float stepX = std::max(0.1f, sx);
+    const float stepY = std::max(0.1f, sy);
+    const float stepZ = std::max(0.1f, sz);
+    for (float cz = 0.0f; cz <= sz + 1e-4f; cz += stepZ) {
+        for (float cy = 0.0f; cy <= sy + 1e-4f; cy += stepY) {
+            for (float cx = 0.0f; cx <= sx + 1e-4f; cx += stepX) {
+                float sxPos = 0.0f, syPos = 0.0f;
+                if (projectLatticePoint(ox + cx, oy + cy, oz + cz, sxPos, syPos)) {
+                    minX = std::min(minX, sxPos);
+                    maxX = std::max(maxX, sxPos);
+                    minY = std::min(minY, syPos);
+                    maxY = std::max(maxY, syPos);
+                    ++count;
+                }
+            }
+        }
+    }
+    return count > 0 && maxX > minX && maxY > minY;
+}
+
+static void drawItemCard(ImDrawList* draw, float minX, float minY, float maxX, float maxY,
+                         const ItemDef* def, int rounds, bool isHovered, const char* extraBadge = nullptr) {
+    if (!def) return;
+    const float w = maxX - minX;
+    const float h = maxY - minY;
+    if (w < 8.0f || h < 8.0f) return;
+
+    ImU32 catCol = IM_COL32(180, 200, 220, 220);
+    const char* catTag = "ITEM";
+    if (def->cls == ItemClass::WeaponPrimary || def->cls == ItemClass::WeaponSmall) {
+        catCol = IM_COL32(245, 180, 60, 240);
+        catTag = (def->cls == ItemClass::WeaponSmall) ? "SIDEARM" : "WEAPON";
+    } else if (def->cls == ItemClass::Armor) {
+        catCol = IM_COL32(70, 180, 255, 240);
+        catTag = "ARMOR";
+    } else if (def->cls == ItemClass::AmmoPouch) {
+        catCol = IM_COL32(225, 210, 80, 240);
+        catTag = "AMMO";
+    } else if (def->cls == ItemClass::Backpack) {
+        catCol = IM_COL32(120, 210, 130, 240);
+        catTag = "PACK";
+    }
+
+    const ImU32 bgCol = isHovered ? IM_COL32(24, 34, 48, 240) : IM_COL32(15, 21, 29, 215);
+    const ImU32 borderCol = isHovered ? IM_COL32(255, 255, 255, 255) : catCol;
+    const float borderThick = isHovered ? 2.0f : 1.0f;
+
+    // Card background & border
+    draw->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY), bgCol, 4.0f);
+    draw->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY), borderCol, 4.0f, 0, borderThick);
+
+    // Tech corner accent indicators
+    const float cornerLen = std::min(8.0f, std::min(w, h) * 0.25f);
+    draw->AddLine(ImVec2(minX, minY), ImVec2(minX + cornerLen, minY), borderCol, borderThick + 0.5f);
+    draw->AddLine(ImVec2(minX, minY), ImVec2(minX, minY + cornerLen), borderCol, borderThick + 0.5f);
+    draw->AddLine(ImVec2(maxX, maxY), ImVec2(maxX - cornerLen, maxY), borderCol, borderThick + 0.5f);
+    draw->AddLine(ImVec2(maxX, maxY), ImVec2(maxX, maxY - cornerLen), borderCol, borderThick + 0.5f);
+
+    // Icon & Content layout
+    const float midX = (minX + maxX) * 0.5f;
+    const float midY = (minY + maxY) * 0.5f;
+
+    if (h >= 32.0f && w >= 36.0f) {
+        // Tag badge at top
+        const ImVec2 tagSz = ImGui::CalcTextSize(catTag);
+        draw->AddRectFilled(ImVec2(midX - tagSz.x * 0.5f - 4.0f, minY + 3.0f),
+                            ImVec2(midX + tagSz.x * 0.5f + 4.0f, minY + 5.0f + tagSz.y),
+                            IM_COL32(10, 14, 20, 200), 2.0f);
+        draw->AddText(ImVec2(midX - tagSz.x * 0.5f, minY + 4.0f), catCol, catTag);
+
+        // Item Name in center
+        std::string displayName = def->name;
+        ImVec2 nameSz = ImGui::CalcTextSize(displayName.c_str());
+        if (nameSz.x > w - 8.0f && displayName.length() > 8) {
+            displayName = displayName.substr(0, 7) + "..";
+            nameSz = ImGui::CalcTextSize(displayName.c_str());
+        }
+        draw->AddText(ImVec2(midX - nameSz.x * 0.5f, midY - nameSz.y * 0.5f),
+                      IM_COL32(245, 248, 252, 255), displayName.c_str());
+
+        // Stat Badge at bottom (ammo count or armor rating or extra)
+        char statStr[32] = {0};
+        if (extraBadge) {
+            snprintf(statStr, sizeof(statStr), "%s", extraBadge);
+        } else if (def->cls == ItemClass::WeaponPrimary || def->cls == ItemClass::WeaponSmall) {
+            snprintf(statStr, sizeof(statStr), "%d rnds", rounds > 0 ? rounds : def->magazineSize);
+        } else if (def->cls == ItemClass::Armor) {
+            snprintf(statStr, sizeof(statStr), "+%.0f AP", def->armorPoints);
+        } else if (def->cls == ItemClass::AmmoPouch) {
+            snprintf(statStr, sizeof(statStr), "%d rsv", rounds);
+        }
+        if (statStr[0]) {
+            const ImVec2 statSz = ImGui::CalcTextSize(statStr);
+            draw->AddText(ImVec2(midX - statSz.x * 0.5f, maxY - statSz.y - 4.0f),
+                          IM_COL32(180, 205, 225, 220), statStr);
+        }
+    } else {
+        // Compact slot display
+        std::string compactName = def->name;
+        ImVec2 sz = ImGui::CalcTextSize(compactName.c_str());
+        if (sz.x > w - 4.0f && compactName.length() > 6) {
+            compactName = compactName.substr(0, 5) + ".";
+            sz = ImGui::CalcTextSize(compactName.c_str());
+        }
+        draw->AddText(ImVec2(midX - sz.x * 0.5f, midY - sz.y * 0.5f),
+                      IM_COL32(245, 248, 252, 255), compactName.c_str());
+    }
 }
 
 static void drawInventoryLabels() {
@@ -6049,38 +6492,68 @@ static void drawInventoryLabels() {
                   IM_COL32(18, 22, 28, 225), IM_COL32(70, 170, 80, 225), 10.0f, 4.5f);
     }
 
-    // 2. Individual Slot Tag Indicators
+    // 2. Storage Volume Open Lattice Grid (front face)
+    for (int iy = 0; iy < inv.vol.sy; ++iy) {
+        for (int ix = 0; ix < inv.vol.sx; ++ix) {
+            float cMinX = 0, cMinY = 0, cMaxX = 0, cMaxY = 0;
+            if (itemScreenBounds(static_cast<float>(ix), static_cast<float>(iy), 0.0f, 1.0f, 1.0f, 0.0f, cMinX, cMinY, cMaxX, cMaxY)) {
+                const bool cellHov = (g_invHover.lattice && g_invHover.x == ix && g_invHover.y == iy);
+                const ImU32 gridCol = cellHov ? IM_COL32(90, 200, 255, 220) : IM_COL32(40, 60, 85, 110);
+                draw->AddRect(ImVec2(cMinX, cMinY), ImVec2(cMaxX, cMaxY), gridCol, 1.0f, 0, cellHov ? 2.0f : 1.0f);
+            }
+        }
+    }
+
+    // 3. Stored Items -> Interactive Item Icon Cards
+    for (size_t i = 0; i < inv.items.size(); ++i) {
+        const auto& inst = inv.items[i];
+        if (inst.defIndex < 0) continue;
+        const ItemDef* d = itemDefAt(g_itemDefs, inst.defIndex);
+        if (!d) continue;
+        const ItemShape s = rotatedShape(d->shape, inst.rot);
+        float iMinX = 0, iMinY = 0, iMaxX = 0, iMaxY = 0;
+        if (itemScreenBounds(static_cast<float>(inst.ox), static_cast<float>(inst.oy), static_cast<float>(inst.oz),
+                             static_cast<float>(s.sx), static_cast<float>(s.sy), static_cast<float>(s.sz),
+                             iMinX, iMinY, iMaxX, iMaxY)) {
+            const bool isHovered = (g_invHover.lattice && invIndexAt(inv, g_invHover.x, g_invHover.y, g_invHover.z) == static_cast<int>(i));
+            drawItemCard(draw, iMinX + 1.5f, iMinY + 1.5f, iMaxX - 1.5f, iMaxY - 1.5f, d, inst.rounds, isHovered);
+        }
+    }
+
+    // 4. Equipment Slots & Character Armor Configuration
     for (int s = 0; s < kEquipSlotCount; ++s) {
         const auto& spec = kEquipSlotSpecs[s];
-        const bool isHovered = g_invHover.slot && g_invHover.slotIndex == s;
-
-        float anchorX = spec.x0 + spec.sx * 0.5f;
-        float anchorY = static_cast<float>(spec.y0);
-        if (slotIsWeapon(spec.slot)) {
-            // Weapon labels sit to the left of the weapon rack
-            anchorX = static_cast<float>(spec.x0) - 0.2f;
-            anchorY = spec.y0 + spec.sy * 0.5f;
-        } else if (spec.slot == EquipSlot::Backpack) {
-            anchorX = spec.x0 + spec.sx * 0.5f;
-            anchorY = static_cast<float>(spec.y0) + spec.sy * 0.5f;
-        } else {
-            // Armor zones sit to the right of the zone or above/below
-            anchorX = spec.x0 + spec.sx * 0.5f;
-            anchorY = static_cast<float>(spec.y0) + spec.sy * 0.5f;
+        const int defIdx = inv.slotDef[s];
+        const bool isHovered = (g_invHover.slot && g_invHover.slotIndex == s);
+        float sMinX = 0, sMinY = 0, sMaxX = 0, sMaxY = 0;
+        if (itemScreenBounds(static_cast<float>(spec.x0), static_cast<float>(spec.y0), static_cast<float>(spec.z0),
+                             static_cast<float>(spec.sx), static_cast<float>(spec.sy), static_cast<float>(spec.sz),
+                             sMinX, sMinY, sMaxX, sMaxY)) {
+            if (defIdx >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                drawItemCard(draw, sMinX + 1.0f, sMinY + 1.0f, sMaxX - 1.0f, sMaxY - 1.0f, d, d ? d->magazineSize : 0, isHovered);
+            } else {
+                const ImU32 frameCol = isHovered ? IM_COL32(100, 180, 255, 240) : IM_COL32(48, 68, 92, 140);
+                draw->AddRect(ImVec2(sMinX, sMinY), ImVec2(sMaxX, sMaxY), frameCol, 3.0f, 0, isHovered ? 2.0f : 1.0f);
+                const ImVec2 nameSz = ImGui::CalcTextSize(spec.name);
+                draw->AddText(ImVec2((sMinX + sMaxX) * 0.5f - nameSz.x * 0.5f, (sMinY + sMaxY) * 0.5f - nameSz.y * 0.5f),
+                              isHovered ? IM_COL32(255, 255, 255, 240) : IM_COL32(130, 155, 180, 180), spec.name);
+            }
         }
-
-        float sx = 0.0f, sy = 0.0f;
-        if (projectLatticePoint(anchorX, anchorY, 0.0f, sx, sy)) {
-            const char* label = spec.name;
-            ImU32 textCol = isHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 190, 205, 200);
-            ImU32 bgCol = isHovered ? IM_COL32(35, 45, 60, 230) : IM_COL32(14, 18, 24, 180);
-            ImU32 borderCol = isHovered ? IM_COL32(100, 180, 255, 240) : IM_COL32(50, 65, 85, 160);
-
-            if (slotIsWeapon(spec.slot)) {
-                const ImVec2 ts = ImGui::CalcTextSize(label);
-                drawBadge(draw, sx - ts.x * 0.5f - 8.0f, sy, label, textCol, bgCol, borderCol, 5.0f, 2.5f);
-            } else if (spec.slot == EquipSlot::Backpack) {
-                drawBadge(draw, sx, sy - 18.0f, "FRAME", textCol, bgCol, borderCol, 4.0f, 2.0f);
+        if (spec.hasSec) {
+            if (itemScreenBounds(static_cast<float>(spec.secX0), static_cast<float>(spec.secY0), static_cast<float>(spec.secZ0),
+                                 static_cast<float>(spec.secSX), static_cast<float>(spec.secSY), static_cast<float>(spec.secSZ),
+                                 sMinX, sMinY, sMaxX, sMaxY)) {
+                if (defIdx >= 0) {
+                    const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                    drawItemCard(draw, sMinX + 1.0f, sMinY + 1.0f, sMaxX - 1.0f, sMaxY - 1.0f, d, 0, isHovered, "R-ARM");
+                } else {
+                    const ImU32 frameCol = isHovered ? IM_COL32(100, 180, 255, 240) : IM_COL32(48, 68, 92, 140);
+                    draw->AddRect(ImVec2(sMinX, sMinY), ImVec2(sMaxX, sMaxY), frameCol, 3.0f, 0, isHovered ? 2.0f : 1.0f);
+                    const ImVec2 nameSz = ImGui::CalcTextSize(spec.name);
+                    draw->AddText(ImVec2((sMinX + sMaxX) * 0.5f - nameSz.x * 0.5f, (sMinY + sMaxY) * 0.5f - nameSz.y * 0.5f),
+                                  isHovered ? IM_COL32(255, 255, 255, 240) : IM_COL32(130, 155, 180, 180), spec.name);
+                }
             }
         }
     }
@@ -6159,10 +6632,34 @@ static void drawInventoryLabels() {
               IM_COL32(14, 18, 24, 210), IM_COL32(45, 60, 80, 180), 12.0f, 4.0f);
 }
 
+static void drawPickupPrompt() {
+    if (g_pickupHover < 0 || static_cast<size_t>(g_pickupHover) >= g_pickups.size()) return;
+    const WorldPickup& pk = g_pickups[static_cast<size_t>(g_pickupHover)];
+    if (!pk.alive) return;
+    const ItemDef* def = itemDefAt(g_itemDefs, pk.defIndex);
+    const char* itemName = def ? def->name.c_str() : "Item";
+
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    if (!draw) return;
+
+    std::string key = keyName(g_keybindings[static_cast<int>(KeyAction::Interact)].key1);
+    if (key == "-") key = "F";
+    char text[128];
+    snprintf(text, sizeof(text), "[%s] Pick up %s", key.c_str(), itemName);
+
+    const float cx = static_cast<float>(g_extent.width) * 0.5f;
+    const float cy = static_cast<float>(g_extent.height) * 0.5f + 36.0f;
+    drawBadge(draw, cx, cy, text,
+              IM_COL32(255, 255, 255, 255),
+              IM_COL32(20, 26, 36, 235),
+              IM_COL32(100, 180, 255, 245),
+              9.0f, 4.0f);
+}
+
 // Build this frame's menu, if it is showing. Recorded later in the UI pass.
 static void buildUiFrame() {
     g_uiDrawPending = false;
-    if (!g_uiReady || !(g_paused || g_menuForced || g_inventoryOpen)) return;
+    if (!g_uiReady || !(g_paused || g_menuForced || g_inventoryOpen || g_pickupHover >= 0)) return;
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -6170,7 +6667,7 @@ static void buildUiFrame() {
     if (g_paused || g_menuForced) {
         const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
         ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(460.0f, 520.0f), ImGuiCond_Always);
         ImGui::Begin("Paused", nullptr,
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                          ImGuiWindowFlags_NoSavedSettings);
@@ -6181,12 +6678,17 @@ static void buildUiFrame() {
             PostQuitMessage(0);
         }
         ImGui::Separator();
-        if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) drawVisualsPanel();
+        if (ImGui::CollapsingHeader("Keybinds", ImGuiTreeNodeFlags_DefaultOpen)) drawKeybindsPanel();
+        if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_None)) drawVisualsPanel();
         ImGui::End();
     }
 
     if (g_inventoryOpen && g_invDisplay.valid) {
         drawInventoryLabels();
+    }
+
+    if (!g_paused && !g_inventoryOpen && g_pickupHover >= 0) {
+        drawPickupPrompt();
     }
 
     ImGui::Render();
@@ -7970,29 +8472,31 @@ static SimInput buildSimInput() {
 
     // Held movement keys -> analog wish axes.
     float fwd = 0.0f, right = 0.0f;
-    if (g_keys['W'] || g_keys[VK_UP]) fwd += 1.0f;
-    if (g_keys['S'] || g_keys[VK_DOWN]) fwd -= 1.0f;
-    if (g_keys['D'] || g_keys[VK_RIGHT]) right += 1.0f;
-    if (g_keys['A'] || g_keys[VK_LEFT]) right -= 1.0f;
+    if (isActionHeld(KeyAction::MoveForward) || g_keys['W'] || g_keys[VK_UP]) fwd += 1.0f;
+    if (isActionHeld(KeyAction::MoveBackward) || g_keys['S'] || g_keys[VK_DOWN]) fwd -= 1.0f;
+    if (isActionHeld(KeyAction::MoveRight) || g_keys['D'] || g_keys[VK_RIGHT]) right += 1.0f;
+    if (isActionHeld(KeyAction::MoveLeft) || g_keys['A'] || g_keys[VK_LEFT]) right -= 1.0f;
     in.moveForward = std::max(-1.0f, std::min(1.0f, fwd));
     in.moveRight = std::max(-1.0f, std::min(1.0f, right));
-    in.sprint = g_keys[VK_SHIFT] != 0;
-    in.crouch = g_keys[VK_CONTROL] != 0;
-    in.ads = in.ads || (g_keys['X'] != 0);
+    in.sprint = isActionHeld(KeyAction::Sprint) || (g_keys[VK_SHIFT] != 0);
+    in.crouch = isActionHeld(KeyAction::Crouch) || (g_keys[VK_CONTROL] != 0);
+    in.ads = in.ads || isActionHeld(KeyAction::AimDownSights) || (g_keys['X'] != 0);
 
     // Dash and stance-cycle are edges: they are detected here, in the view, where
     // the press actually happened, and consumed by the sim on the next tick. The
-    // sim never learns a key is held, only that a press arrived. Q/E stay reserved
-    // for lean and E for interact, so dash is C and the stance cycle is F.
-    if (g_keys['C'] && !g_dashHeldPrev) g_pendingInput.dash = true;
-    g_dashHeldPrev = g_keys['C'] != 0;
-    if (g_keys['F'] && !g_stanceHeldPrev) g_pendingInput.stanceCycle = true;
-    g_stanceHeldPrev = g_keys['F'] != 0;
+    // sim never learns a key is held, only that a press arrived.
+    const bool dashHeld = isActionHeld(KeyAction::Dash) || (g_keys['C'] != 0);
+    if (dashHeld && !g_dashHeldPrev) g_pendingInput.dash = true;
+    g_dashHeldPrev = dashHeld;
+
+    const bool stanceHeld = isActionHeld(KeyAction::StanceCycle) || (g_keys['V'] != 0);
+    if (stanceHeld && !g_stanceHeldPrev) g_pendingInput.stanceCycle = true;
+    g_stanceHeldPrev = stanceHeld;
 
     // Held lean keys -> one axis, so a view cannot send contradictory Q and E.
     float lean = 0.0f;
-    if (g_keys['Q']) lean += 1.0f;
-    if (g_keys['E']) lean -= 1.0f;
+    if (isActionHeld(KeyAction::LeanLeft) || g_keys['Q']) lean += 1.0f;
+    if (isActionHeld(KeyAction::LeanRight) || g_keys['E']) lean -= 1.0f;
     in.leanAxis = lean;
     return in;
 }
@@ -8138,6 +8642,8 @@ static void simulateOnce(float dt, const SimInput& in) {
         updateProjectiles(dt);
         if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
             g_projLivePeak = static_cast<int>(g_projectiles.size());
+        if (!g_projectiles.empty())
+            g_debris.meshDirty = true;
     }
     {
         ScopedSection s(SEC_DEBRIS_SIM);
@@ -8233,10 +8739,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         // Smoke/stress always run on defaults so their captures and timings
         // do not depend on whatever a player last chose.
         vis::registerEngineParams(g_visReg, g_vis);
+        initDefaultKeybindings();
         if (!g_smoke) {
             bool readable = false;
             const std::string saved = jsonReadText(g_exeDir + "\\visual_settings.json", &readable);
             if (readable) g_visReg.fromJson(saved);
+            loadKeybindings();
         }
         createWindow();
         createInstance();
