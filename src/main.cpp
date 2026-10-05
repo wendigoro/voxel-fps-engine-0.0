@@ -1252,7 +1252,7 @@ static bool projectToScreen(const Vec3& p, float& outX, float& outY) {
     const float w = g_width > 0 ? static_cast<float>(g_width) : static_cast<float>(g_extent.width);
     const float h = g_height > 0 ? static_cast<float>(g_height) : static_cast<float>(g_extent.height);
     outX = (cx / cw * 0.5f + 0.5f) * w;
-    outY = (1.0f - (cy / cw * 0.5f + 0.5f)) * h;
+    outY = (cy / cw * 0.5f + 0.5f) * h;
     return true;
 }
 
@@ -6000,28 +6000,195 @@ static void drawVisualsPanel() {
     }
 }
 
+static bool projectLatticePoint(float lx, float ly, float lz, float& sx, float& sy) {
+    if (!g_invDisplay.valid) return false;
+    const Vec3 p = g_invDisplay.origin + g_invDisplay.right * (lx * VOXEL_SIZE) +
+                   g_invDisplay.up * (ly * VOXEL_SIZE) +
+                   g_invDisplay.fwd * (lz * VOXEL_SIZE);
+    return projectToScreen(p, sx, sy);
+}
+
+static void drawBadge(ImDrawList* draw, float cx, float cy, const char* text, ImU32 colText,
+                      ImU32 colBg, ImU32 colBorder, float padX = 7.0f, float padY = 3.5f) {
+    const ImVec2 textSize = ImGui::CalcTextSize(text);
+    const float x = cx - textSize.x * 0.5f;
+    const float y = cy - textSize.y * 0.5f;
+    const ImVec2 bMin(x - padX, y - padY);
+    const ImVec2 bMax(x + textSize.x + padX, y + textSize.y + padY);
+    draw->AddRectFilled(bMin, bMax, colBg, 4.0f);
+    draw->AddRect(bMin, bMax, colBorder, 4.0f);
+    draw->AddText(ImVec2(x, y), colText, text);
+}
+
+static void drawInventoryLabels() {
+    if (!g_invDisplay.valid) return;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    if (!draw) return;
+
+    const Inventory& inv = g_inventory;
+
+    // 1. Prominent Section Headers anchored above each region in 3D lattice space
+    // Left Section: WEAPONS (anchored above rifle rack)
+    float wx = 0.0f, wy = 0.0f;
+    if (projectLatticePoint(-11.5f, 8.4f, 0.0f, wx, wy)) {
+        drawBadge(draw, wx, wy - 12.0f, "WEAPONS", IM_COL32(255, 220, 130, 255),
+                  IM_COL32(18, 22, 28, 225), IM_COL32(190, 140, 50, 225), 10.0f, 4.5f);
+    }
+
+    // Center Section: ARMOR (anchored above helmet)
+    float ax = 0.0f, ay = 0.0f;
+    if (projectLatticePoint(-7.0f, 9.4f, 0.0f, ax, ay)) {
+        drawBadge(draw, ax, ay - 12.0f, "ARMOR", IM_COL32(140, 215, 255, 255),
+                  IM_COL32(18, 22, 28, 225), IM_COL32(50, 140, 210, 225), 10.0f, 4.5f);
+    }
+
+    // Right Section: BACKPACK (anchored above storage volume)
+    float bx = 0.0f, by = 0.0f;
+    if (projectLatticePoint(1.0f, static_cast<float>(inv.vol.sy) + 0.6f, 0.0f, bx, by)) {
+        drawBadge(draw, bx, by - 12.0f, "BACKPACK", IM_COL32(160, 240, 160, 255),
+                  IM_COL32(18, 22, 28, 225), IM_COL32(70, 170, 80, 225), 10.0f, 4.5f);
+    }
+
+    // 2. Individual Slot Tag Indicators
+    for (int s = 0; s < kEquipSlotCount; ++s) {
+        const auto& spec = kEquipSlotSpecs[s];
+        const bool isHovered = g_invHover.slot && g_invHover.slotIndex == s;
+
+        float anchorX = spec.x0 + spec.sx * 0.5f;
+        float anchorY = static_cast<float>(spec.y0);
+        if (slotIsWeapon(spec.slot)) {
+            // Weapon labels sit to the left of the weapon rack
+            anchorX = static_cast<float>(spec.x0) - 0.2f;
+            anchorY = spec.y0 + spec.sy * 0.5f;
+        } else if (spec.slot == EquipSlot::Backpack) {
+            anchorX = spec.x0 + spec.sx * 0.5f;
+            anchorY = static_cast<float>(spec.y0) + spec.sy * 0.5f;
+        } else {
+            // Armor zones sit to the right of the zone or above/below
+            anchorX = spec.x0 + spec.sx * 0.5f;
+            anchorY = static_cast<float>(spec.y0) + spec.sy * 0.5f;
+        }
+
+        float sx = 0.0f, sy = 0.0f;
+        if (projectLatticePoint(anchorX, anchorY, 0.0f, sx, sy)) {
+            const char* label = spec.name;
+            ImU32 textCol = isHovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 190, 205, 200);
+            ImU32 bgCol = isHovered ? IM_COL32(35, 45, 60, 230) : IM_COL32(14, 18, 24, 180);
+            ImU32 borderCol = isHovered ? IM_COL32(100, 180, 255, 240) : IM_COL32(50, 65, 85, 160);
+
+            if (slotIsWeapon(spec.slot)) {
+                const ImVec2 ts = ImGui::CalcTextSize(label);
+                drawBadge(draw, sx - ts.x * 0.5f - 8.0f, sy, label, textCol, bgCol, borderCol, 5.0f, 2.5f);
+            } else if (spec.slot == EquipSlot::Backpack) {
+                drawBadge(draw, sx, sy - 18.0f, "FRAME", textCol, bgCol, borderCol, 4.0f, 2.0f);
+            }
+        }
+    }
+
+    // Storage capacity badge below the storage lattice
+    float stX = 0.0f, stY = 0.0f;
+    if (projectLatticePoint(static_cast<float>(inv.vol.sx) * 0.5f, 0.0f, static_cast<float>(inv.vol.sz) * 0.5f, stX, stY)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "STORAGE (%d/%d)", inv.usedCells(), inv.vol.cells());
+        drawBadge(draw, stX, stY + 16.0f, buf, IM_COL32(180, 215, 190, 225),
+                  IM_COL32(14, 20, 18, 195), IM_COL32(50, 100, 65, 185), 6.0f, 2.5f);
+    }
+
+    // 3. Live Cursor Hover Inspection Badge
+    if (g_invHover.overCell) {
+        const float hx = static_cast<float>(g_mouseX);
+        const float hy = static_cast<float>(g_mouseY) - 30.0f;
+
+        if (g_invHover.slot) {
+            const int s = g_invHover.slotIndex;
+            const auto& spec = kEquipSlotSpecs[s];
+            const int defIdx = inv.slotDef[s];
+            char info[128];
+            if (defIdx >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                if (d) {
+                    if (slotIsArmor(spec.slot)) {
+                        snprintf(info, sizeof(info), "%s: %s (+%.0f Armor)", spec.name, d->name.c_str(), d->armorPoints);
+                    } else if (slotIsWeapon(spec.slot)) {
+                        snprintf(info, sizeof(info), "%s: %s (%d rnds)", spec.name, d->name.c_str(), d->magazineSize);
+                    } else {
+                        snprintf(info, sizeof(info), "%s: %s", spec.name, d->name.c_str());
+                    }
+                } else {
+                    snprintf(info, sizeof(info), "%s: Equipped", spec.name);
+                }
+            } else if (inv.held >= 0) {
+                const int heldDef = inv.items[static_cast<size_t>(inv.held)].defIndex;
+                if (canEquip(g_itemDefs, heldDef, spec.slot)) {
+                    snprintf(info, sizeof(info), "%s [LMB: Equip]", spec.name);
+                } else {
+                    snprintf(info, sizeof(info), "%s [Cannot Equip Here]", spec.name);
+                }
+            } else {
+                snprintf(info, sizeof(info), "%s (Empty)", spec.name);
+            }
+            drawBadge(draw, hx, hy, info, IM_COL32(255, 255, 255, 255),
+                      IM_COL32(22, 28, 38, 240), IM_COL32(80, 140, 220, 230), 8.0f, 4.0f);
+        } else if (g_invHover.lattice) {
+            const int inst = invIndexAt(inv, g_invHover.x, g_invHover.y, g_invHover.z);
+            char info[128];
+            if (inst >= 0 && inst < static_cast<int>(inv.items.size())) {
+                const ItemDef* d = itemDefAt(g_itemDefs, inv.items[inst].defIndex);
+                if (d) {
+                    snprintf(info, sizeof(info), "%s [LMB: Lift, RMB: Stow]", d->name.c_str());
+                } else {
+                    snprintf(info, sizeof(info), "Item [LMB: Lift]");
+                }
+            } else if (inv.held >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, inv.items[static_cast<size_t>(inv.held)].defIndex);
+                const char* dname = d ? d->name.c_str() : "Item";
+                snprintf(info, sizeof(info), "Place %s [LMB, R: rotate]", dname);
+            } else {
+                snprintf(info, sizeof(info), "Cell (%d, %d, %d)", g_invHover.x, g_invHover.y, g_invHover.z);
+            }
+            drawBadge(draw, hx, hy, info, IM_COL32(220, 235, 245, 255),
+                      IM_COL32(20, 24, 30, 240), IM_COL32(70, 95, 125, 220), 8.0f, 4.0f);
+        }
+    }
+
+    // 4. Bottom Controls Legend Banner
+    const float scrW = static_cast<float>(g_extent.width);
+    const float scrH = static_cast<float>(g_extent.height);
+    const char* hint = "TAB: Close  |  LMB: Pick / Place  |  RMB: Stow  |  R: Rotate Held";
+    drawBadge(draw, scrW * 0.5f, scrH - 24.0f, hint, IM_COL32(180, 195, 215, 230),
+              IM_COL32(14, 18, 24, 210), IM_COL32(45, 60, 80, 180), 12.0f, 4.0f);
+}
+
 // Build this frame's menu, if it is showing. Recorded later in the UI pass.
 static void buildUiFrame() {
     g_uiDrawPending = false;
-    if (!g_uiReady || !(g_paused || g_menuForced)) return;
+    if (!g_uiReady || !(g_paused || g_menuForced || g_inventoryOpen)) return;
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
-    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Always);
-    ImGui::Begin("Paused", nullptr,
-                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoSavedSettings);
-    if (ImGui::Button("Resume")) setPaused(false);
-    ImGui::SameLine();
-    if (ImGui::Button("Quit")) {
-        g_running = false;
-        PostQuitMessage(0);
+
+    if (g_paused || g_menuForced) {
+        const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Always);
+        ImGui::Begin("Paused", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoSavedSettings);
+        if (ImGui::Button("Resume")) setPaused(false);
+        ImGui::SameLine();
+        if (ImGui::Button("Quit")) {
+            g_running = false;
+            PostQuitMessage(0);
+        }
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) drawVisualsPanel();
+        ImGui::End();
     }
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) drawVisualsPanel();
-    ImGui::End();
+
+    if (g_inventoryOpen && g_invDisplay.valid) {
+        drawInventoryLabels();
+    }
+
     ImGui::Render();
     g_uiDrawPending = true;
 }
@@ -6035,7 +6202,7 @@ static void recordUiPass(VkCommandBuffer cmd, uint32_t imageIndex) {
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
     vkCmdEndRenderPass(cmd);
-    ++g_uiFrames;
+    if (g_paused || g_menuForced) ++g_uiFrames;
 }
 
 static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
