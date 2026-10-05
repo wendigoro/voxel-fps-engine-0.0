@@ -496,11 +496,12 @@ static bool g_pickupPressed = false;   // G: take the world item under the cross
 
 // Inventory lattice mesh: unit cubes emitted camera-relative into their own
 // overlay pass. 36 lattice cells + 8 equipment slot markers + margin.
-static constexpr uint32_t kInventoryMaxVerts = 4096;
+static constexpr uint32_t kInventoryMaxVerts = 8192;
 static VkBuffer g_inventoryVB = VK_NULL_HANDLE;
 static VkDeviceMemory g_inventoryMem = VK_NULL_HANDLE;
 static void* g_inventoryMapped = nullptr;
 static uint32_t g_inventoryVertexCount = 0;
+static uint32_t g_inventorySlotVertexCount = 0;
 static uint32_t g_inventoryOverlayFrames = 0; // frames that actually submitted the pass
 static constexpr float kInventoryMatId = rc::attr(rc::RenderClass::InventoryLattice);
 static constexpr float kPickupMatId = rc::attr(rc::RenderClass::WorldPickup); // main pass, not the overlay
@@ -1248,8 +1249,10 @@ static bool projectToScreen(const Vec3& p, float& outX, float& outY) {
     const float cy = vp.m[1] * p.x + vp.m[5] * p.y + vp.m[9] * p.z + vp.m[13];
     const float cw = vp.m[3] * p.x + vp.m[7] * p.y + vp.m[11] * p.z + vp.m[15];
     if (cw <= 1e-6f) return false;
-    outX = (cx / cw * 0.5f + 0.5f) * static_cast<float>(g_extent.width);
-    outY = (1.0f - (cy / cw * 0.5f + 0.5f)) * static_cast<float>(g_extent.height);
+    const float w = g_width > 0 ? static_cast<float>(g_width) : static_cast<float>(g_extent.width);
+    const float h = g_height > 0 ? static_cast<float>(g_height) : static_cast<float>(g_extent.height);
+    outX = (cx / cw * 0.5f + 0.5f) * w;
+    outY = (1.0f - (cy / cw * 0.5f + 0.5f)) * h;
     return true;
 }
 
@@ -1272,6 +1275,57 @@ static bool cellScreenRect(const InventoryDisplay& d, float x0, float y0, float 
         y1p = std::max(y1p, sy);
     }
     return true;
+}
+
+
+// Layout specification for character armor configuration zones and equipment rig.
+struct EquipSlotSpec {
+    EquipSlot slot;
+    const char* name;
+    int x0, y0, z0;
+    int sx, sy, sz;
+    bool hasSec;
+    int secX0, secY0, secZ0;
+    int secSX, secSY, secSZ;
+};
+
+static constexpr EquipSlotSpec kEquipSlotSpecs[kEquipSlotCount] = {
+    // Primary0 (0): main rifle holster upper left
+    { EquipSlot::Primary0, "Primary 0", -13, 6, 0, 3, 2, 2, false, 0, 0, 0, 0, 0, 0 },
+    // Primary1 (1): secondary weapon mid left
+    { EquipSlot::Primary1, "Primary 1", -13, 3, 0, 3, 2, 2, false, 0, 0, 0, 0, 0, 0 },
+    // Small (2): sidearm lower left
+    { EquipSlot::Small,    "Sidearm",   -13, 0, 0, 2, 2, 3, false, 0, 0, 0, 0, 0, 0 },
+    // ArmorLegs (3): legs lower center
+    { EquipSlot::ArmorLegs,"Legs",      -8, 1, 0, 3, 3, 3, false, 0, 0, 0, 0, 0, 0 },
+    // ArmorChest (4): chest mid center
+    { EquipSlot::ArmorChest,"Chest",    -8, 4, 0, 3, 3, 3, false, 0, 0, 0, 0, 0, 0 },
+    // ArmorArms (5): arms flanking chest: left arm -9, right arm -5
+    { EquipSlot::ArmorArms, "Arms",     -9, 4, 0, 1, 3, 3, true, -5, 4, 0, 1, 3, 3 },
+    // ArmorHead (6): head top center
+    { EquipSlot::ArmorHead, "Head",     -8, 7, 0, 3, 2, 3, false, 0, 0, 0, 0, 0, 0 },
+    // Backpack (7): pack frame between mannequin and pack volume
+    { EquipSlot::Backpack,  "Backpack", -3, 1, 0, 2, 3, 2, false, 0, 0, 0, 0, 0, 0 },
+};
+
+static void emitSlotBrackets(const Vec3& origin, const Vec3& dRight, const Vec3& dUp, const Vec3& dFwd,
+                             int bx0, int by0, int bz0, int bsx, int bsy,
+                             float cr, float cg, float cb, uint32_t& wi) {
+    const int xMin = bx0;
+    const int xMax = bx0 + bsx - 1;
+    const int yMin = by0;
+    const int yMax = by0 + bsy - 1;
+    emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMin), static_cast<float>(yMin),
+                      static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
+    if (xMax != xMin)
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMax), static_cast<float>(yMin),
+                          static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
+    if (yMax != yMin)
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMin), static_cast<float>(yMax),
+                          static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
+    if (xMax != xMin && yMax != yMin)
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMax), static_cast<float>(yMax),
+                          static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
 }
 
 // Rebuild the lattice mesh. Rebuilt every frame while open (cheap at ~1.6k
@@ -1317,7 +1371,7 @@ static void updateInventoryMesh() {
     // 0.003 x 0.003 x 0.004 world units; the distance sets its screen size.
     const float k = kOverlayDepthScale;
     const float dist = 0.006f * k;
-    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f * k) + right * (0.0046f * k);
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f * k) + right * (0.0032f * k);
 
     g_invDisplay.origin = origin;
     g_invDisplay.right = dRight;
@@ -1329,7 +1383,6 @@ static void updateInventoryMesh() {
     // ties break toward the cell closest to the lattice centre so the front face
     // of the volume wins over the back one.
     const Inventory& inv = g_inventory;
-    const int markerCol0 = -(inv.vol.sx + 2);
     g_invHover = InventoryHover{};
     {
         const float mx = static_cast<float>(g_mouseX);
@@ -1358,15 +1411,52 @@ static void updateInventoryMesh() {
             }
         }
         for (int s = 0; s < kEquipSlotCount; ++s) {
-            float ax, ay, bx, by;
-            if (!cellScreenRect(g_invDisplay, static_cast<float>(markerCol0 + (s & 1)),
-                                static_cast<float>(s >> 1), 0.0f, ax, ay, bx, by))
-                continue;
-            if (mx < ax || mx > bx || my < ay || my > by) continue;
-            g_invHover.slot = true;
-            g_invHover.slotIndex = s;
-            g_invHover.lattice = false;
-            break;
+            const auto& spec = kEquipSlotSpecs[s];
+            const int defIdx = inv.slotDef[s];
+            auto testSlotCell = [&](int cx, int cy, int cz) {
+                float ax, ay, bx, by;
+                if (!cellScreenRect(g_invDisplay, static_cast<float>(cx),
+                                    static_cast<float>(cy), static_cast<float>(cz), ax, ay, bx, by))
+                    return;
+                if (mx < ax || mx > bx || my < ay || my > by) return;
+                const int depth = cz * 4 + 2;
+                if (depth < bestDepth) {
+                    bestDepth = depth;
+                    g_invHover.slot = true;
+                    g_invHover.slotIndex = s;
+                    g_invHover.lattice = false;
+                }
+            };
+
+            if (defIdx >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                if (d && d->shape.valid()) {
+                    for (int iz = 0; iz < d->shape.sz; ++iz) {
+                        for (int iy = 0; iy < d->shape.sy; ++iy) {
+                            for (int ix = 0; ix < d->shape.sx; ++ix) {
+                                if (!d->shape.solid(ix, iy, iz)) continue;
+                                testSlotCell(spec.x0 + ix, spec.y0 + iy, spec.z0 + iz);
+                                if (spec.hasSec) {
+                                    testSlotCell(spec.secX0 + ix, spec.secY0 + iy, spec.secZ0 + iz);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int iy = 0; iy < spec.sy; ++iy) {
+                    for (int ix = 0; ix < spec.sx; ++ix) {
+                        testSlotCell(spec.x0 + ix, spec.y0 + iy, spec.z0);
+                    }
+                }
+                if (spec.hasSec) {
+                    for (int iy = 0; iy < spec.secSY; ++iy) {
+                        for (int ix = 0; ix < spec.secSX; ++ix) {
+                            testSlotCell(spec.secX0 + ix, spec.secY0 + iy, spec.secZ0);
+                        }
+                    }
+                }
+            }
         }
         g_invHover.overCell = g_invHover.lattice || g_invHover.slot;
     }
@@ -1437,35 +1527,89 @@ static void updateInventoryMesh() {
         }
     }
 
-    // Equipment slot markers: 8 one-cell cubes in a 2x4 block left of the volume.
+    const uint32_t wiBeforeSlots = wi;
+
+    // Character Armor Configuration & Equipment Rig (Pure Lattice Visuals)
     for (int s = 0; s < kEquipSlotCount; ++s) {
+        const auto& spec = kEquipSlotSpecs[s];
         const int defIdx = inv.slotDef[s];
-        float cr, cg, cb;
-        if (defIdx >= 0) {
-            const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
-            if (d) {
-                cr = d->cr * 1.15f;
-                cg = d->cg * 1.15f;
-                cb = d->cb * 1.15f;
+        const bool isHovered = g_invHover.slot && g_invHover.slotIndex == s;
+
+        float tintR = 0.0f, tintG = 0.0f, tintB = 0.0f;
+        bool overrideColor = false;
+        if (isHovered && inv.held >= 0) {
+            const int heldDef = inv.items[static_cast<size_t>(inv.held)].defIndex;
+            if (canEquip(g_itemDefs, heldDef, spec.slot)) {
+                overrideColor = true;
+                tintR = 0.25f; tintG = 0.90f; tintB = 0.40f; // Green: fits
             } else {
-                cr = cg = cb = 0.8f;
+                overrideColor = true;
+                tintR = 0.90f; tintG = 0.25f; tintB = 0.25f; // Red: invalid
+            }
+        }
+
+        if (defIdx >= 0) {
+            // Equipped piece: emit 3D unit-cube shape of the item
+            const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+            if (d && d->shape.valid()) {
+                float cr = overrideColor ? tintR : d->cr * 1.15f;
+                float cg = overrideColor ? tintG : d->cg * 1.15f;
+                float cb = overrideColor ? tintB : d->cb * 1.15f;
+                if (isHovered && !overrideColor) {
+                    cr = std::min(1.0f, cr + 0.30f);
+                    cg = std::min(1.0f, cg + 0.34f);
+                    cb = std::min(1.0f, cb + 0.38f);
+                }
+                for (int iz = 0; iz < d->shape.sz; ++iz) {
+                    for (int iy = 0; iy < d->shape.sy; ++iy) {
+                        for (int ix = 0; ix < d->shape.sx; ++ix) {
+                            if (!d->shape.solid(ix, iy, iz)) continue;
+                            emitInventoryCube(origin, dRight, dUp, dFwd,
+                                              static_cast<float>(spec.x0 + ix),
+                                              static_cast<float>(spec.y0 + iy),
+                                              static_cast<float>(spec.z0 + iz),
+                                              cr, cg, cb,
+                                              static_cast<float>(kInventoryMatId), wi);
+                            if (spec.hasSec) {
+                                emitInventoryCube(origin, dRight, dUp, dFwd,
+                                                  static_cast<float>(spec.secX0 + ix),
+                                                  static_cast<float>(spec.secY0 + iy),
+                                                  static_cast<float>(spec.secZ0 + iz),
+                                                  cr, cg, cb,
+                                                  static_cast<float>(kInventoryMatId), wi);
+                            }
+                        }
+                    }
+                }
             }
         } else {
-            cr = 0.16f;
-            cg = 0.17f;
-            cb = 0.20f; // empty slot
+            // Empty slot: emit zone bracket lattice in unit cubes
+            float cr, cg, cb;
+            if (overrideColor) {
+                cr = tintR; cg = tintG; cb = tintB;
+            } else if (isHovered) {
+                cr = 0.50f; cg = 0.70f; cb = 0.95f; // bright cyan hover
+            } else if (slotIsArmor(spec.slot)) {
+                cr = 0.14f; cg = 0.18f; cb = 0.24f; // armor frame blue/cyan
+            } else if (slotIsWeapon(spec.slot)) {
+                cr = 0.24f; cg = 0.19f; cb = 0.14f; // weapon frame amber
+            } else {
+                cr = 0.18f; cg = 0.20f; cb = 0.16f; // backpack frame olive
+            }
+            emitSlotBrackets(origin, dRight, dUp, dFwd, spec.x0, spec.y0, spec.z0, spec.sx, spec.sy, cr, cg, cb, wi);
+            if (spec.hasSec) {
+                emitSlotBrackets(origin, dRight, dUp, dFwd, spec.secX0, spec.secY0, spec.secZ0, spec.secSX, spec.secSY, cr, cg, cb, wi);
+            }
         }
-        if (g_invHover.slot && g_invHover.slotIndex == s) {
-            cr = std::min(1.0f, cr + 0.30f);
-            cg = std::min(1.0f, cg + 0.34f);
-            cb = std::min(1.0f, cb + 0.38f);
-        }
-        const float mx = static_cast<float>(markerCol0 + (s & 1));
-        const float my = static_cast<float>(s >> 1);
-        emitInventoryCube(origin, dRight, dUp, dFwd, mx, my, 0.0f, cr, cg, cb,
-                          static_cast<float>(kInventoryMatId), wi);
     }
 
+    // Pedestal base under mannequin legs
+    for (int x = -8; x <= -6; ++x) {
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(x), 0.0f, 0.0f,
+                          0.12f, 0.13f, 0.16f, static_cast<float>(kInventoryMatId), wi);
+    }
+
+    g_inventorySlotVertexCount = wi - wiBeforeSlots;
     g_inventoryVertexCount = emitHealthHud(wi);
 }
 
@@ -1766,13 +1910,26 @@ static void drainInventoryInput() {
     if (g_inventoryClick) {
         g_inventoryClick = false;
         if (g_inventory.held >= 0) {
-            if (g_invHover.lattice)
+            if (g_invHover.lattice) {
                 placeHeld(g_inventory, g_itemDefs, g_inventoryHandRot, g_invHover.x, g_invHover.y,
                           g_invHover.z);
+            } else if (g_invHover.slot) {
+                const int heldInst = g_inventory.held;
+                const int heldDef = g_inventory.items[static_cast<size_t>(heldInst)].defIndex;
+                const EquipSlot slot = static_cast<EquipSlot>(g_invHover.slotIndex);
+                if (canEquip(g_itemDefs, heldDef, slot)) {
+                    int displaced = -1;
+                    removePacked(g_inventory, heldInst);
+                    equipDef(g_inventory, g_itemDefs, heldDef, slot, displaced);
+                    if (displaced >= 0) {
+                        takeIntoHand(g_inventory, g_itemDefs, displaced);
+                    }
+                }
+            }
         } else if (g_invHover.lattice) {
             liftPacked(g_inventory, invIndexAt(g_inventory, g_invHover.x, g_invHover.y, g_invHover.z));
         } else if (g_invHover.slot) {
-            // Clicking a marker lifts what is in that equipment slot back out.
+            // Clicking an equipped slot lifts what is in that equipment slot back out.
             const int defIdx = g_inventory.slotDef[g_invHover.slotIndex];
             if (defIdx >= 0) {
                 const bool isPack = g_invHover.slotIndex == static_cast<int>(EquipSlot::Backpack);
@@ -2045,6 +2202,16 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     // The menu sees every message first (it tracks the mouse even when closed).
     if (g_uiReady && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return true;
     switch (msg) {
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) {
+            if (!g_cursorLocked || g_inventoryOpen || g_paused) {
+                SetCursor(LoadCursor(nullptr, IDC_ARROW));
+                return TRUE;
+            }
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
             g_width = std::max(1, static_cast<int>(LOWORD(lParam)));
@@ -2115,9 +2282,20 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 stowHeld(g_inventory, g_itemDefs);
                 g_inventoryHandRot = 0;
                 setCursorLock(false);
+                RECT cr{};
+                GetClientRect(hwnd, &cr);
+                POINT pt{ (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+                g_mouseX = static_cast<short>(pt.x);
+                g_mouseY = static_cast<short>(pt.y);
+                g_lastMouseX = g_mouseX;
+                g_lastMouseY = g_mouseY;
+                ClientToScreen(hwnd, &pt);
+                SetCursorPos(pt.x, pt.y);
+                SetCursor(LoadCursor(nullptr, IDC_ARROW));
             } else {
                 setCursorLock(true);
             }
+            return 0;
         }
         // R: rotate the held item while the lattice is up; otherwise cycle ammo.
         if (wParam == 'R') {
@@ -5307,7 +5485,7 @@ static InventorySmokeReport runInventorySmoke() {
     rep.overlayVerts = static_cast<int>(g_inventoryVertexCount);
     const int cells = g_inventory.vol.cells();
     rep.overlayLatticeVerts = cells * 36;
-    rep.overlaySlotVerts = kEquipSlotCount * 36;
+    rep.overlaySlotVerts = static_cast<int>(g_inventorySlotVertexCount);
     // HUD is appended to the same buffer: 10 health + 5 breath unit cells.
     rep.overlayHudVerts = (kHudHealthCells + kHudBreathCells) * 36;
     rep.hudBuilt = rep.overlayVerts ==
