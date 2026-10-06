@@ -38,6 +38,7 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
     private final JPanel weaponRow;
     private final JButton bakeSky;
     private final JButton bakeChar;
+    private final JComboBox<String> weaponSelectBox;
     private final JButton bakeWeapon;
     // Item mode (RULES.md rule 12). The grid the artist paints IS the packing
     // footprint, so there is no size control here - only the metadata the engine
@@ -211,8 +212,16 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             SkyAndCharacter.paintCharacter(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
             model.markDirty();
         });
-        bakeWeapon = new JButton("Bake starter rifle");
-        bakeWeapon.addActionListener(e -> model.bakeStarterWeapon());
+        weaponSelectBox = new JComboBox<>(new String[]{
+                "starter_rifle", "sidearm_light", "smg_light", "shotgun_light",
+                "marksman_rifle", "lmg_medium", "sniper_heavy", "cannon_heavy",
+                "carbine_energy", "railgun_energy"
+        });
+        bakeWeapon = new JButton("Bake weapon");
+        bakeWeapon.addActionListener(e -> {
+            String sel = (String) weaponSelectBox.getSelectedItem();
+            model.bakeWeapon(sel != null ? sel : "starter_rifle");
+        });
         bakeItem = new JButton("Bake starter pouch");
         bakeItem.addActionListener(e -> model.bakeStarterItem());
         exportItem = new JButton("Export item.json");
@@ -233,6 +242,7 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         bakes.setOpaque(false);
         bakes.add(bakeSky);
         bakes.add(bakeChar);
+        bakes.add(weaponSelectBox);
         bakes.add(bakeWeapon);
         bakes.add(bakeItem);
         bakes.add(exportItem);

@@ -258,18 +258,43 @@ public void newDocument(VoxDocument.Mode mode) {
         }
     }
 
-    public void bakeStarterWeapon() {
+    public void bakeWeapon(String weaponId) {
         if (document.mode != VoxDocument.Mode.WEAPON) {
             newDocument(VoxDocument.Mode.WEAPON);
             return;
         }
-        WeaponParts.paintStarterRifle(document.grid);
-        document.caliber = document.caliber == null ? "medium" : document.caliber;
-        document.ammoId = document.ammoId == null ? "medium_fmj" : document.ammoId;
-        document.fireMode = document.fireMode == null ? "semi" : document.fireMode;
+        document.grid.clear();
+        WeaponParts.paintWeapon(document.grid, weaponId);
+        if (weaponId != null) {
+            document.itemId = "weapon_" + weaponId;
+            if (weaponId.contains("light")) {
+                document.caliber = "light";
+                if (weaponId.contains("sidearm")) document.ammoId = "light_fmj";
+                else if (weaponId.contains("smg")) document.ammoId = "light_hp";
+                else if (weaponId.contains("shotgun")) document.ammoId = "light_ap";
+            } else if (weaponId.contains("heavy")) {
+                document.caliber = "heavy";
+                if (weaponId.contains("sniper")) document.ammoId = "heavy_fmj";
+                else if (weaponId.contains("cannon")) document.ammoId = "heavy_he";
+            } else if (weaponId.contains("energy")) {
+                document.caliber = "energy";
+                if (weaponId.contains("carbine")) document.ammoId = "energy_bolt";
+                else if (weaponId.contains("railgun")) document.ammoId = "energy_pierce";
+            } else {
+                document.caliber = "medium";
+                if (weaponId.contains("marksman")) document.ammoId = "medium_tracer";
+                else if (weaponId.contains("lmg")) document.ammoId = "medium_shred";
+                else document.ammoId = "medium_fmj";
+            }
+        }
         tools.activePart = WeaponParts.BARREL;
         markDirty();
         fireTools();
+        fireDoc();
+    }
+
+    public void bakeStarterWeapon() {
+        bakeWeapon("starter_rifle");
     }
 
     public void setItemId(String id) {

@@ -51,6 +51,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "char_model.hpp"
 #include "char_mesh.hpp"
 #include "weapon_model.hpp"
+#include "structural_matrix.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -432,6 +433,8 @@ static bool g_thirdPerson = false;
 static Vec3 g_charHeadWorldPos{};
 static float g_charLocomotionPhase = 0.0f;
 static Vec3 g_playerPosPrevTick{};
+static bool g_forceWeaponHold = true;
+static structural::MatrixSystem g_structuralMatrix;
 
 static inline float angleDiff(float target, float current) {
     float diff = target - current;
@@ -6932,7 +6935,7 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
                 renderPhase += cadence * alpha * static_cast<float>(TICK_DT) * (2.0f * static_cast<float>(M_PI));
                 if (renderPhase > 2.0f * static_cast<float>(M_PI)) renderPhase -= 2.0f * static_cast<float>(M_PI);
             }
-            const bool holdingWep = !g_weapons.empty() && !g_inventoryOpen;
+            const bool holdingWep = !g_weapons.empty() && !g_inventoryOpen && g_forceWeaponHold;
             const float reloadPh = (g_viewmodelAnim.isReloading && g_viewmodelAnim.reloadDuration > 0.0f)
                                        ? (g_viewmodelAnim.reloadTimer / g_viewmodelAnim.reloadDuration) : 0.0f;
             char_model::evaluateProceduralPose(
@@ -7608,6 +7611,7 @@ static bool reloadMapFile(const std::string& path) {
     }
     sendPalette(*g_world, g_viewPalette);
     g_mapPath = path;
+    g_structuralMatrix.initDefaultZones(*g_world);
     if (g_views) {
         for (auto& v : *g_views) {
             v.hasSnapshot = false;
@@ -7724,6 +7728,96 @@ static void handleEditorAction(const std::string& actionJson) {
     } else if (type == "SET_TIME_OF_DAY") {
         float tod = jsonExtractFloat(actionJson, "timeOfDay", g_timeOfDay);
         g_timeOfDay = std::clamp(tod, 0.0f, 1.0f);
+    } else if (type == "EQUIP_WEAPON") {
+        std::string weaponId = jsonExtractString(actionJson, "weaponId");
+        for (size_t i = 0; i < g_weapons.size(); ++i) {
+            if (g_weapons[i].id == weaponId) {
+                g_activeWeaponIndex = static_cast<int>(i);
+                g_viewmodelAnim.triggerEquip();
+                break;
+            }
+        }
+    } else if (type == "TRIGGER_RELOAD") {
+        g_viewmodelAnim.triggerReload();
+    } else if (type == "TRIGGER_RECOIL") {
+        g_viewmodelAnim.triggerRecoil(12.0f, 10.0f);
+    } else if (type == "TOGGLE_ADS") {
+        g_viewmodelAnim.adsAlpha = (g_viewmodelAnim.adsAlpha > 0.5f) ? 0.0f : 1.0f;
+    } else if (type == "SET_WEAPON_HOLD") {
+        g_forceWeaponHold = jsonExtractBool(actionJson, "holding", true);
+    } else if (type == "RECALC_STRUCTURAL_INTEGRITY") {
+        if (g_world) {
+            g_structuralMatrix.evaluateAll(*g_world);
+        }
+    } else if (type == "DEMOLISH_TEST_MEMBER") {
+        if (g_world) {
+            for (int y = 2; y <= 45; ++y) {
+                for (int z = 10; z <= 150; ++z) {
+                    for (int x = 10; x <= 180; ++x) {
+                        sim::Block b = g_world->get(x, y, z);
+                        if (b == sim::Block::Girder || b == sim::Block::Concrete) {
+                            g_world->set(x, y, z, sim::Block::Air);
+                            g_meshDirty = true;
+                            g_structuralMatrix.evaluateAll(*g_world);
+                            goto memberDemolished;
+                        }
+                    }
+                }
+            }
+        memberDemolished:;
+        }
+    } else if (type == "BAKE_WEAPON_MODEL") {
+        std::string weaponId = jsonExtractString(actionJson, "weaponId");
+        if (weaponId.empty() && !g_weapons.empty() && g_activeWeaponIndex >= 0) {
+            weaponId = g_weapons[g_activeWeaponIndex].id;
+        }
+        const weapon_view::WeaponModel* targetModel = nullptr;
+        for (const auto& wm : g_weaponModels) {
+            if (wm.id == weaponId) { targetModel = &wm; break; }
+        }
+        if (!targetModel && !g_weaponModels.empty()) {
+            targetModel = &g_weaponModels[0];
+        }
+        if (targetModel && g_world) {
+            Vec3 fwd = flatForward();
+            int startX = static_cast<int>(g_player.px * 1000.0f + fwd.x * 2.0f);
+            int startY = static_cast<int>(g_player.py * 1000.0f + 1.0f);
+            int startZ = static_cast<int>(g_player.pz * 1000.0f + fwd.z * 2.0f);
+            for (const auto& v : targetModel->voxels) {
+                int wx = startX + v.x - targetModel->sx / 2;
+                int wy = startY + v.y;
+                int wz = startZ + v.z - targetModel->sz / 2;
+                if (sim::World::inBounds(wx, wy, wz)) {
+                    sim::Block blk = sim::Block::SheetMetal;
+                    if (v.material == "girder") blk = sim::Block::Girder;
+                    else if (v.material == "concrete") blk = sim::Block::Concrete;
+                    else if (v.material == "wood" || v.material == "treated_wood") blk = sim::Block::Wood;
+                    g_world->set(wx, wy, wz, blk);
+                }
+            }
+            g_meshDirty = true;
+            g_structuralMatrix.evaluateAll(*g_world);
+        }
+    } else if (type == "BAKE_CHARACTER_MODEL") {
+        if (g_world) {
+            Vec3 fwd = flatForward();
+            int feetX = static_cast<int>(g_player.px * 1000.0f + fwd.x * 2.5f);
+            int feetY = static_cast<int>(g_player.py * 1000.0f);
+            int feetZ = static_cast<int>(g_player.pz * 1000.0f + fwd.z * 2.5f);
+            for (int dy = 0; dy < 16; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        int wx = feetX + dx, wy = feetY + dy, wz = feetZ + dz;
+                        if (sim::World::inBounds(wx, wy, wz)) {
+                            sim::Block blk = (dy >= 14) ? sim::Block::Wood : (dy >= 6 ? sim::Block::Concrete : sim::Block::SheetMetal);
+                            g_world->set(wx, wy, wz, blk);
+                        }
+                    }
+                }
+            }
+            g_meshDirty = true;
+            g_structuralMatrix.evaluateAll(*g_world);
+        }
     }
 }
 
@@ -9157,6 +9251,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         }
         g_world = &world;
         spawnPlayerOnMap(world);
+        g_structuralMatrix.initDefaultZones(world);
 
         // The view's chunk list. It starts empty of world knowledge: every
         // cell in it arrives via sendChunkSnapshot() below.
@@ -9376,6 +9471,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     } else {
                         snap += "\"pick\":{\"hit\":false},";
                     }
+                    snap += "\"structural\":" + g_structuralMatrix.toJson() + ",";
+                    if (!g_weapons.empty() && g_activeWeaponIndex >= 0 && g_activeWeaponIndex < static_cast<int>(g_weapons.size())) {
+                        const auto& w = g_weapons[g_activeWeaponIndex];
+                        snap += "\"activeWeapon\":{\"id\":\"" + w.id + "\",\"caliber\":\"" + w.caliber + "\",\"ammoId\":\"" + w.ammoId + "\",";
+                        snap += "\"damage\":" + std::to_string(w.damage) + ",\"impact\":" + std::to_string(w.impact) + ",";
+                        snap += "\"recoil\":" + std::to_string(w.recoil) + ",\"handling\":" + std::to_string(w.handling) + ",";
+                        snap += "\"weight\":" + std::to_string(w.weight) + ",\"optic\":" + std::to_string(w.optic) + ",";
+                        snap += "\"fireMode\":\"" + w.fireMode + "\",\"hitscan\":" + (w.hitscan ? "true" : "false") + "},";
+                    }
+                    snap += "\"character\":{\"holdingWeapon\":" + std::string(g_forceWeaponHold ? "true" : "false") + ",";
+                    snap += "\"isReloading\":" + std::string(g_viewmodelAnim.isReloading ? "true" : "false") + ",";
+                    snap += "\"adsAlpha\":" + std::to_string(g_viewmodelAnim.adsAlpha) + "},";
                     std::string vpJson = g_visReg.toJson();
                     while (!vpJson.empty() && (vpJson.back() == '\n' || vpJson.back() == '\r' || vpJson.back() == ' ')) {
                         vpJson.pop_back();
@@ -9411,6 +9518,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const bool visualParamsOk = vis::selfTest();
             const char_mesh::SelfTestReport charMeshRep = char_mesh::selfTest();
             const bool sublatticeOk = sublatticeImpactSelfTest();
+            const bool structuralOk = g_structuralMatrix.selfTest(world);
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -9765,6 +9873,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nchar_mesh_culled_faces=" << charMeshRep.culledFaces
                 << "\nchar_mesh_golden=" << std::hex << charMeshRep.goldenHash << std::dec
                 << "\nchar_mesh_ok=" << (charMeshRep.ok() ? 1 : 0)
+                << "\nstructural_integrity_ok=" << (structuralOk ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -9865,6 +9974,9 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             // Sublattice impacts contract: 1-2 impacted units based on impact angle (<=45 deg direct vs >45 deg oblique).
             // Exit 12 keeps CI triage separate.
             if (!sublatticeOk) { cleanup(); return 12; }
+            // Structural integrity matrix contract: Warehouse baseline sound, sensitivity to demolition, restoration.
+            // Exit 13 keeps CI triage separate.
+            if (!structuralOk) { cleanup(); return 13; }
         }
     } catch (const std::exception& e) {
         // Every automated run here is headless -- smoke, stress, capture, export --
