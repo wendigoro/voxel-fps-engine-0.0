@@ -1,0 +1,25 @@
+{
+  "id": "lmg_medium",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "medium",
+  "hitscan": 0,
+  "fire_mode": "auto",
+  "ammo_id": "medium_shred",
+  "stats": {
+    "damage": 26.0,
+    "impact": 38.0,
+    "recoil": 28.0,
+    "handling": 6.5,
+    "weight": 24.0,
+    "optic": 5.0
+  },
+  "parts": {
+    "barrel": 93,
+    "action": 246,
+    "bolt_chamber": 3,
+    "trigger": 1,
+    "grip_stock": 103,
+    "sight": 2
+  }
+}

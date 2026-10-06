@@ -1,0 +1,25 @@
+{
+  "id": "cannon_heavy",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "heavy",
+  "hitscan": 0,
+  "fire_mode": "semi",
+  "ammo_id": "heavy_he",
+  "stats": {
+    "damage": 55.0,
+    "impact": 75.0,
+    "recoil": 42.0,
+    "handling": 7.0,
+    "weight": 22.0,
+    "optic": 3.0
+  },
+  "parts": {
+    "barrel": 108,
+    "action": 269,
+    "bolt_chamber": 6,
+    "trigger": 1,
+    "grip_stock": 79,
+    "sight": 2
+  }
+}

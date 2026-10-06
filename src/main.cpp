@@ -2499,11 +2499,12 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             return 0;
         }
-        // R / ReloadOrRotate: rotate the held item while the lattice is up; otherwise cycle ammo.
+        // R / ReloadOrRotate: rotate the held item while the lattice is up; otherwise reload / cycle ammo.
         if (isActionKey(KeyAction::ReloadOrRotate, static_cast<int>(wParam)) || wParam == 'R') {
             if (g_inventoryOpen) {
                 g_inventoryHandRot = (g_inventoryHandRot + 1) & 3;
             } else {
+                g_viewmodelAnim.triggerReload();
                 g_pendingInput.cycleAmmo = true;
             }
         }
@@ -6426,6 +6427,51 @@ static bool itemScreenBounds(float ox, float oy, float oz, float sx, float sy, f
     return count > 0 && maxX > minX && maxY > minY;
 }
 
+static void drawWeaponSilhouetteIcon(ImDrawList* draw, float cx, float cy, float maxW, float maxH,
+                                     const std::string& weaponId, ImU32 col) {
+    const weapon_view::WeaponModel* wm = nullptr;
+    for (const auto& m : g_weaponModels) {
+        if (m.id == weaponId) { wm = &m; break; }
+    }
+    if (!wm || wm->voxels.empty()) return;
+
+    int minVx = 1000, maxVx = -1000, minVy = 1000, maxVy = -1000;
+    for (const auto& v : wm->voxels) {
+        minVx = std::min(minVx, v.x);
+        maxVx = std::max(maxVx, v.x);
+        minVy = std::min(minVy, v.y);
+        maxVy = std::max(maxVy, v.y);
+    }
+    const int spanX = maxVx - minVx + 1;
+    const int spanY = maxVy - minVy + 1;
+    if (spanX <= 0 || spanY <= 0) return;
+
+    const float scale = std::min(maxW / static_cast<float>(spanX), maxH / static_cast<float>(spanY));
+    const float totalW = static_cast<float>(spanX) * scale;
+    const float totalH = static_cast<float>(spanY) * scale;
+    const float startX = cx - totalW * 0.5f;
+    const float startY = cy + totalH * 0.5f;
+
+    std::vector<bool> filled(static_cast<size_t>(spanX * spanY), false);
+    for (const auto& v : wm->voxels) {
+        int ix = v.x - minVx;
+        int iy = v.y - minVy;
+        if (ix >= 0 && ix < spanX && iy >= 0 && iy < spanY) {
+            filled[static_cast<size_t>(iy * spanX + ix)] = true;
+        }
+    }
+
+    const float pad = std::max(0.5f, scale * 0.08f);
+    for (int iy = 0; iy < spanY; ++iy) {
+        for (int ix = 0; ix < spanX; ++ix) {
+            if (!filled[static_cast<size_t>(iy * spanX + ix)]) continue;
+            float px0 = startX + static_cast<float>(ix) * scale;
+            float py0 = startY - static_cast<float>(iy + 1) * scale;
+            draw->AddRectFilled(ImVec2(px0, py0), ImVec2(px0 + scale - pad, py0 + scale - pad), col);
+        }
+    }
+}
+
 static void drawItemCard(ImDrawList* draw, float minX, float minY, float maxX, float maxY,
                          const ItemDef* def, int rounds, bool isHovered, const char* extraBadge = nullptr) {
     if (!def) return;
@@ -6435,7 +6481,8 @@ static void drawItemCard(ImDrawList* draw, float minX, float minY, float maxX, f
 
     ImU32 catCol = IM_COL32(180, 200, 220, 220);
     const char* catTag = "ITEM";
-    if (def->cls == ItemClass::WeaponPrimary || def->cls == ItemClass::WeaponSmall) {
+    const bool isWeapon = (def->cls == ItemClass::WeaponPrimary || def->cls == ItemClass::WeaponSmall);
+    if (isWeapon) {
         catCol = IM_COL32(245, 180, 60, 240);
         catTag = (def->cls == ItemClass::WeaponSmall) ? "SIDEARM" : "WEAPON";
     } else if (def->cls == ItemClass::Armor) {
@@ -6476,21 +6523,33 @@ static void drawItemCard(ImDrawList* draw, float minX, float minY, float maxX, f
                             IM_COL32(10, 14, 20, 200), 2.0f);
         draw->AddText(ImVec2(midX - tagSz.x * 0.5f, minY + 4.0f), catCol, catTag);
 
-        // Item Name in center
+        // If weapon, draw distinctive voxel silhouette icon
+        float textCenterY = midY;
+        if (isWeapon && h >= 46.0f) {
+            const float iconH = std::min(22.0f, h * 0.30f);
+            const float iconW = std::min(w - 12.0f, 62.0f);
+            const float iconY = minY + tagSz.y + 7.0f + iconH * 0.5f;
+            const ImU32 silCol = isHovered ? IM_COL32(255, 255, 255, 245) : IM_COL32(245, 195, 75, 220);
+            drawWeaponSilhouetteIcon(draw, midX, iconY, iconW, iconH,
+                                     def->weaponId.empty() ? def->id : def->weaponId, silCol);
+            textCenterY = iconY + iconH * 0.5f + 7.0f;
+        }
+
+        // Item Name
         std::string displayName = def->name;
         ImVec2 nameSz = ImGui::CalcTextSize(displayName.c_str());
         if (nameSz.x > w - 8.0f && displayName.length() > 8) {
             displayName = displayName.substr(0, 7) + "..";
             nameSz = ImGui::CalcTextSize(displayName.c_str());
         }
-        draw->AddText(ImVec2(midX - nameSz.x * 0.5f, midY - nameSz.y * 0.5f),
+        draw->AddText(ImVec2(midX - nameSz.x * 0.5f, textCenterY - nameSz.y * 0.5f),
                       IM_COL32(245, 248, 252, 255), displayName.c_str());
 
         // Stat Badge at bottom (ammo count or armor rating or extra)
         char statStr[32] = {0};
         if (extraBadge) {
             snprintf(statStr, sizeof(statStr), "%s", extraBadge);
-        } else if (def->cls == ItemClass::WeaponPrimary || def->cls == ItemClass::WeaponSmall) {
+        } else if (isWeapon) {
             snprintf(statStr, sizeof(statStr), "%d rnds", rounds > 0 ? rounds : def->magazineSize);
         } else if (def->cls == ItemClass::Armor) {
             snprintf(statStr, sizeof(statStr), "+%.0f AP", def->armorPoints);
@@ -6503,15 +6562,21 @@ static void drawItemCard(ImDrawList* draw, float minX, float minY, float maxX, f
                           IM_COL32(180, 205, 225, 220), statStr);
         }
     } else {
-        // Compact slot display
-        std::string compactName = def->name;
-        ImVec2 sz = ImGui::CalcTextSize(compactName.c_str());
-        if (sz.x > w - 4.0f && compactName.length() > 6) {
-            compactName = compactName.substr(0, 5) + ".";
-            sz = ImGui::CalcTextSize(compactName.c_str());
+        // Compact slot display: draw silhouette if weapon
+        if (isWeapon && w >= 16.0f && h >= 14.0f) {
+            const ImU32 silCol = isHovered ? IM_COL32(255, 255, 255, 240) : IM_COL32(245, 195, 75, 210);
+            drawWeaponSilhouetteIcon(draw, midX, midY, w - 4.0f, h - 4.0f,
+                                     def->weaponId.empty() ? def->id : def->weaponId, silCol);
+        } else {
+            std::string compactName = def->name;
+            ImVec2 sz = ImGui::CalcTextSize(compactName.c_str());
+            if (sz.x > w - 4.0f && compactName.length() > 6) {
+                compactName = compactName.substr(0, 5) + ".";
+                sz = ImGui::CalcTextSize(compactName.c_str());
+            }
+            draw->AddText(ImVec2(midX - sz.x * 0.5f, midY - sz.y * 0.5f),
+                          IM_COL32(245, 248, 252, 255), compactName.c_str());
         }
-        draw->AddText(ImVec2(midX - sz.x * 0.5f, midY - sz.y * 0.5f),
-                      IM_COL32(245, 248, 252, 255), compactName.c_str());
     }
 }
 
@@ -6867,9 +6932,13 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
                 renderPhase += cadence * alpha * static_cast<float>(TICK_DT) * (2.0f * static_cast<float>(M_PI));
                 if (renderPhase > 2.0f * static_cast<float>(M_PI)) renderPhase -= 2.0f * static_cast<float>(M_PI);
             }
+            const bool holdingWep = !g_weapons.empty() && !g_inventoryOpen;
+            const float reloadPh = (g_viewmodelAnim.isReloading && g_viewmodelAnim.reloadDuration > 0.0f)
+                                       ? (g_viewmodelAnim.reloadTimer / g_viewmodelAnim.reloadDuration) : 0.0f;
             char_model::evaluateProceduralPose(
                 char_model::getCanonicalModel(), g_move, g_player, timeSec,
-                deltaYaw, aimPitch, bones, nullptr, renderPhase, &g_lastRHandSocket);
+                deltaYaw, aimPitch, bones, nullptr, renderPhase, &g_lastRHandSocket,
+                holdingWep, g_viewmodelAnim.recoilPitch, g_viewmodelAnim.isReloading, reloadPh);
 
             // In first person, collapse head and neck so local player camera has
             // an unobstructed view while chest, arms, legs, and feet remain visible looking down.
@@ -7912,12 +7981,12 @@ static void updateUBO(uint32_t frameIndex, float timeSec) {
     float aspect = g_extent.height > 0
                        ? static_cast<float>(g_extent.width) / static_cast<float>(g_extent.height)
                        : 1.0f;
-    // Optic ADS (hold X): tighter FOV from weapon optic stat.
+    // Optic ADS: smooth FOV zoom interpolated by adsAlpha from weapon optic stat.
     float fovDeg = DEFAULT_FOV_DEG;
-    if (g_ads) {
+    if (g_viewmodelAnim.adsAlpha > 0.0001f) {
         WeaponDef w = activeWeaponOrDefault();
         float zoom = std::min(45.0f, 8.0f + w.optic * 3.5f);
-        fovDeg = std::max(40.0f, DEFAULT_FOV_DEG - zoom);
+        fovDeg = DEFAULT_FOV_DEG - zoom * g_viewmodelAnim.adsAlpha;
     }
     Mat4 proj = Mat4::perspective(fovDeg * static_cast<float>(M_PI) / 180.0f, aspect, 0.0005f, 5.0f);
     Mat4 view = Mat4::lookAt(eye, center, {0, 1, 0});
@@ -8050,9 +8119,10 @@ static void updateWeaponMesh() {
         const float hipUp = -0.0018f;
         const float hipFwd = 0.0048f;
 
-        const float adsRight = -sightRelZ;
-        const float adsUp = -sightRelY;
-        const float adsFwd = 0.0036f;
+        // In ADS: center sight post exactly onto camera crosshair
+        const float adsRight = sightRelZ;  // Exactly cancels -axR * (sightZ - pivotZ) * cellScale
+        const float adsUp = -sightRelY;     // Exactly cancels +axU * (sightY - pivotY) * cellScale
+        const float adsFwd = 0.0028f;       // Clean eye relief down the sight line
 
         const float ads = g_viewmodelAnim.adsAlpha;
         const float restRight = hipRight + (adsRight - hipRight) * ads;
@@ -8060,20 +8130,24 @@ static void updateWeaponMesh() {
         const float restFwd = hipFwd + (adsFwd - hipFwd) * ads;
 
         const float t = g_viewmodelAnim.idleTimer;
-        const float swayDamp = (1.0f - ads * 0.80f);
+        const float swayDamp = (1.0f - ads * 0.92f);
         const float swayX = std::sin(t * 1.6f) * 0.00010f * swayDamp;
         const float swayY = std::cos(t * 3.2f) * 0.00007f * swayDamp;
         const float swayRoll = std::sin(t * 1.6f) * 0.015f * swayDamp;
 
         const float bt = g_viewmodelAnim.bobTimer;
-        const float bobDamp = (1.0f - ads * 0.85f);
-        const float bobX = std::sin(bt * 0.5f) * 0.00022f * bobDamp;
-        const float bobY = std::abs(std::sin(bt)) * 0.00025f * bobDamp;
-        const float bobRoll = std::cos(bt * 0.5f) * 0.025f * bobDamp;
+        const float bobDamp = (1.0f - ads * 0.95f);
+        const float bobX = std::sin(bt * 0.5f) * 0.00007f * bobDamp;
+        const float bobY = std::abs(std::sin(bt)) * 0.00008f * bobDamp;
+        const float bobRoll = std::cos(bt * 0.5f) * 0.008f * bobDamp;
 
         const float eq = g_viewmodelAnim.equipAlpha;
         const float equipDrop = (1.0f - eq) * 0.0040f;
         const float equipPitch = (1.0f - eq) * 0.35f;
+
+        const float relDrop = g_viewmodelAnim.reloadDrop;
+        const float relPitch = g_viewmodelAnim.reloadPitch;
+        const float relRoll = g_viewmodelAnim.reloadRoll;
 
         const float recZ = g_viewmodelAnim.recoilZ;
         const float recY = g_viewmodelAnim.recoilY;
@@ -8082,14 +8156,14 @@ static void updateWeaponMesh() {
         const float recRoll = g_viewmodelAnim.recoilRoll;
 
         const float totalRight = restRight + swayX + bobX + recYaw * 0.002f;
-        const float totalUp = restUp + swayY - bobY - equipDrop - recY;
+        const float totalUp = restUp + swayY - bobY - equipDrop - relDrop - recY;
         const float totalFwd = restFwd - recZ;
 
         const Vec3 weaponOrigin = camPos + right * totalRight + up * totalUp + fwd * totalFwd;
 
-        const float pitch = recPitch + equipPitch;
-        const float yaw = recYaw;
-        const float roll = swayRoll + bobRoll + recRoll;
+        const float pitch = (recPitch + equipPitch + relPitch) * (1.0f - ads * 0.40f);
+        const float yaw = recYaw * (1.0f - ads * 0.85f);
+        const float roll = (swayRoll + bobRoll + recRoll + relRoll) * (1.0f - ads * 0.90f);
 
         Vec3 axF = fwd;
         Vec3 axU = up;

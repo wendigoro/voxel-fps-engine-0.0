@@ -262,6 +262,14 @@ struct ViewModelAnim {
     float adsAlpha = 0.0f;       // 0.0 (hip) -> 1.0 (ADS)
     float equipAlpha = 1.0f;     // 0.0 (lowered) -> 1.0 (raised)
 
+    // Reload animation state
+    bool isReloading = false;
+    float reloadTimer = 0.0f;
+    float reloadDuration = 1.5f;
+    float reloadDrop = 0.0f;
+    float reloadPitch = 0.0f;
+    float reloadRoll = 0.0f;
+
     // Spring-damper recoil dynamics
     float recoilZ = 0.0f;        // Kick backward along line of sight (m)
     float recoilY = 0.0f;        // Kick downward / upward (m)
@@ -293,6 +301,13 @@ struct ViewModelAnim {
         equipAlpha = 0.0f;
     }
 
+    void triggerReload() {
+        if (!isReloading) {
+            isReloading = true;
+            reloadTimer = 0.0f;
+        }
+    }
+
     void update(float dt, const movement::MoveState& move, const PlayerBody& body, bool adsHeld) {
         idleTimer += dt;
 
@@ -303,6 +318,24 @@ struct ViewModelAnim {
         // Smooth weapon equip raise transition (~0.22s)
         const float equipSpeed = 4.5f;
         equipAlpha += (1.0f - equipAlpha) * std::clamp(dt * equipSpeed, 0.0f, 1.0f);
+
+        // Reload progress
+        if (isReloading) {
+            reloadTimer += dt;
+            if (reloadTimer >= reloadDuration) {
+                isReloading = false;
+                reloadTimer = 0.0f;
+                reloadDrop = 0.0f;
+                reloadPitch = 0.0f;
+                reloadRoll = 0.0f;
+            } else {
+                const float t = reloadTimer / reloadDuration;
+                const float s = std::sin(t * 3.14159265f);
+                reloadDrop = s * 0.0018f;
+                reloadRoll = s * -0.22f;
+                reloadPitch = s * 0.14f;
+            }
+        }
 
         // Movement bobbing
         const float horizSpeed = std::sqrt(body.vx * body.vx + body.vz * body.vz);

@@ -531,7 +531,11 @@ inline void evaluateProceduralPose(
     Mat4 outBones[kMaxBones],
     Vec3* outHeadPos = nullptr,
     float locomotionPhase = -1.0f,
-    Mat4* outRHandSocket = nullptr)
+    Mat4* outRHandSocket = nullptr,
+    bool holdingWeapon = false,
+    float weaponRecoil = 0.0f,
+    bool isReloading = false,
+    float reloadPhase = 0.0f)
 {
     Vec3 localTrans[BoneId::Count]{};
     Mat4 localRot[BoneId::Count];
@@ -632,15 +636,77 @@ inline void evaluateProceduralPose(
         // Foot ankle counter-flexion keeps foot level
         localRot[BoneId::RFoot] = Mat4::rotationX(-s * legSwingMax * 0.40f * moveWeight);
 
-        // Arms counter-swing opposite to legs (strictly contralateral):
-        // Left arm swings backward (+X rot) when left leg swings forward (s > 0)
-        localRot[BoneId::LUpperArm] = Mat4::rotationX(s * armSwingMax * moveWeight);
-        // Right arm swings forward (-X rot) when left leg swings forward (s > 0)
-        localRot[BoneId::RUpperArm] = Mat4::rotationX(-s * armSwingMax * moveWeight);
+        // Arms kinematics:
+        if (holdingWeapon) {
+            // Right arm: raised forward to grip weapon
+            float rUpperPitch = -0.58f;
+            float rUpperYaw = -0.15f;
+            float rForeBend = -0.52f;
+            float rHandPitch = -0.08f;
 
-        // Forearms natural forward flexion (+Z bend) with dynamic swing flexion:
-        localRot[BoneId::LForeArm] = Mat4::rotationX((-0.20f - std::max(0.0f, -s) * 0.35f) * moveWeight);
-        localRot[BoneId::RForeArm] = Mat4::rotationX((-0.20f - std::max(0.0f, s) * 0.35f) * moveWeight);
+            // Left arm: raised across chest supporting the front handguard
+            float lUpperPitch = -0.68f;
+            float lUpperYaw = 0.38f;
+            float lForeBend = -0.62f;
+            float lForeRoll = -0.22f;
+
+            // Subdued locomotion bobbing on arms (instead of huge swings)
+            if (moveWeight > 0.001f) {
+                float armBob = std::sin(animPhase) * 0.05f * moveWeight;
+                rUpperPitch += armBob;
+                lUpperPitch += armBob;
+            }
+
+            // Firing / recoil kick: arm punches back and muzzle pitches up
+            if (weaponRecoil > 0.0001f) {
+                rUpperPitch += weaponRecoil * 0.75f;
+                rForeBend -= weaponRecoil * 0.35f;
+                lUpperPitch += weaponRecoil * 0.55f;
+                lForeBend -= weaponRecoil * 0.25f;
+            }
+
+            // Reload animation: left arm leaves handguard, dips to waist pouch,
+            // grabs fresh mag, inserts into receiver, and returns to handguard
+            if (isReloading && reloadPhase > 0.0f && reloadPhase < 1.0f) {
+                float t = reloadPhase;
+                if (t < 0.45f) {
+                    // Phase 1 (0.0 -> 0.45): Reach down toward ammo pouch/belt
+                    float p1 = t / 0.45f;
+                    lUpperPitch = -0.68f + p1 * 0.75f; // drops down
+                    lUpperYaw = 0.38f - p1 * 0.20f;
+                    lForeBend = -0.62f + p1 * 0.35f;
+                } else if (t < 0.80f) {
+                    // Phase 2 (0.45 -> 0.80): Bring mag up to receiver magwell
+                    float p2 = (t - 0.45f) / 0.35f;
+                    lUpperPitch = 0.07f - p2 * 0.75f; // raises up to receiver
+                    lUpperYaw = 0.18f + p2 * 0.20f;
+                    lForeBend = -0.27f - p2 * 0.35f;
+                } else {
+                    // Phase 3 (0.80 -> 1.0): Return to handguard
+                    float p3 = (t - 0.80f) / 0.20f;
+                    lUpperPitch = -0.68f - p3 * 0.02f;
+                    lUpperYaw = 0.38f + p3 * 0.02f;
+                    lForeBend = -0.62f - p3 * 0.02f;
+                }
+            }
+
+            localRot[BoneId::RUpperArm] = Mat4::multiply(Mat4::rotationY(rUpperYaw), Mat4::rotationX(rUpperPitch));
+            localRot[BoneId::RForeArm] = Mat4::rotationX(rForeBend);
+            localRot[BoneId::RHand] = Mat4::rotationX(rHandPitch);
+
+            localRot[BoneId::LUpperArm] = Mat4::multiply(Mat4::rotationY(lUpperYaw), Mat4::rotationX(lUpperPitch));
+            localRot[BoneId::LForeArm] = Mat4::multiply(Mat4::rotationZ(lForeRoll), Mat4::rotationX(lForeBend));
+        } else {
+            // Arms counter-swing opposite to legs (strictly contralateral):
+            // Left arm swings backward (+X rot) when left leg swings forward (s > 0)
+            localRot[BoneId::LUpperArm] = Mat4::rotationX(s * armSwingMax * moveWeight);
+            // Right arm swings forward (-X rot) when left leg swings forward (s > 0)
+            localRot[BoneId::RUpperArm] = Mat4::rotationX(-s * armSwingMax * moveWeight);
+
+            // Forearms natural forward flexion (+Z bend) with dynamic swing flexion:
+            localRot[BoneId::LForeArm] = Mat4::rotationX((-0.20f - std::max(0.0f, -s) * 0.35f) * moveWeight);
+            localRot[BoneId::RForeArm] = Mat4::rotationX((-0.20f - std::max(0.0f, s) * 0.35f) * moveWeight);
+        }
 
         // Pelvis hip bob (2x frequency, drops during midstance of both feet) and lateral sway
         localTrans[BoneId::Pelvis].y -= std::abs(s) * hipBobMax * moveWeight;

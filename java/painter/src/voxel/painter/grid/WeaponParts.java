@@ -127,6 +127,182 @@ public final class WeaponParts {
         g.set(13, 6, 4, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
     }
 
+    public static void paintSidearmLight(VoxelGrid g) {
+        g.clear();
+        int cz = g.sizeZ() / 2;
+        for (int x = 2; x <= 5; x++)
+            for (int y = 1; y <= 4; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.TREATED_WOOD, MaterialPalette.defaultRgb(MaterialPalette.TREATED_WOOD), GRIP_STOCK);
+        g.set(6, 2, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), TRIGGER);
+        g.set(6, 3, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), TRIGGER);
+        for (int x = 4; x <= 14; x++)
+            for (int y = 4; y <= 5; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 5; x <= 13; x++)
+            for (int z = cz - 1; z <= cz + 1; z++)
+                g.set(x, 6, z, (x >= 7 && x <= 8) ? MaterialPalette.GIRDER : MaterialPalette.SHEET_METAL,
+                        MaterialPalette.defaultRgb((x >= 7 && x <= 8) ? MaterialPalette.GIRDER : MaterialPalette.SHEET_METAL),
+                        (x >= 7 && x <= 8) ? BOLT_CHAMBER : ACTION);
+        for (int x = 14; x <= 16; x++)
+            g.set(x, 5, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), BARREL);
+        g.set(5, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+        g.set(14, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintSmgLight(VoxelGrid g) {
+        g.clear();
+        int cz = g.sizeZ() / 2;
+        for (int x = 1; x <= 5; x++) {
+            g.set(x, 5, cz - 1, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), GRIP_STOCK);
+            g.set(x, 5, cz + 1, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), GRIP_STOCK);
+        }
+        for (int x = 5; x <= 7; x++)
+            for (int y = 1; y <= 4; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), GRIP_STOCK);
+        g.set(8, 2, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), TRIGGER);
+        for (int x = 9; x <= 10; x++)
+            for (int y = 0; y <= 3; y++)
+                g.set(x, y, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 6; x <= 16; x++)
+            for (int y = 5; y <= 6; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 10; x <= 12; x++)
+            g.set(x, 7, cz, MaterialPalette.GIRDER, MaterialPalette.defaultRgb(MaterialPalette.GIRDER), BOLT_CHAMBER);
+        for (int x = 17; x <= 22; x++)
+            for (int z = cz - 1; z <= cz + 1; z++)
+                g.set(x, 5, z, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), BARREL);
+        g.set(11, 8, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+        g.set(18, 8, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintShotgunLight(VoxelGrid g) {
+        g.clear();
+        int cz = g.sizeZ() / 2;
+        for (int x = 1; x <= 7; x++)
+            for (int y = 2; y <= 4; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.TREATED_WOOD, MaterialPalette.defaultRgb(MaterialPalette.TREATED_WOOD), GRIP_STOCK);
+        for (int x = 7; x <= 8; x++)
+            for (int y = 1; y <= 3; y++)
+                g.set(x, y, cz, MaterialPalette.TREATED_WOOD, MaterialPalette.defaultRgb(MaterialPalette.TREATED_WOOD), GRIP_STOCK);
+        g.set(9, 2, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), TRIGGER);
+        for (int x = 9; x <= 15; x++)
+            for (int y = 3; y <= 6; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 11; x <= 13; x++)
+            g.set(x, 6, cz, MaterialPalette.GIRDER, MaterialPalette.defaultRgb(MaterialPalette.GIRDER), BOLT_CHAMBER);
+        for (int x = 16; x <= 24; x++)
+            g.set(x, 4, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 17; x <= 20; x++)
+            for (int z = cz - 1; z <= cz + 1; z++)
+                g.set(x, 3, z, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), ACTION);
+        for (int x = 16; x <= 26; x++) {
+            g.set(x, 5, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), BARREL);
+            g.set(x, 6, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), BARREL);
+        }
+        g.set(10, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+        g.set(24, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintMarksmanRifle(VoxelGrid g) {
+        paintStarterRifle(g);
+        int cz = g.sizeZ() / 2;
+        // Extend barrel and add match optic
+        for (int x = 19; x <= 26; x++)
+            g.set(x, 4, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), BARREL);
+        for (int x = 9; x <= 16; x++)
+            g.set(x, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintLmgMedium(VoxelGrid g) {
+        paintStarterRifle(g);
+        int cz = g.sizeZ() / 2;
+        // Heavy drum mag below action
+        for (int x = 8; x <= 11; x++)
+            for (int y = 0; y <= 2; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+    }
+
+    public static void paintSniperHeavy(VoxelGrid g) {
+        paintStarterRifle(g);
+        int cz = g.sizeZ() / 2;
+        for (int x = 19; x <= 28; x++)
+            g.set(x, 4, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), BARREL);
+        for (int x = 8; x <= 18; x++)
+            g.set(x, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintCannonHeavy(VoxelGrid g) {
+        g.clear();
+        int cz = g.sizeZ() / 2;
+        for (int x = 2; x <= 6; x++)
+            for (int y = 1; y <= 4; y++)
+                g.set(x, y, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), GRIP_STOCK);
+        for (int x = 6; x <= 14; x++)
+            for (int y = 3; y <= 7; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 14; x <= 22; x++)
+            for (int y = 4; y <= 6; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), BARREL);
+        g.set(10, 8, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintCarbineEnergy(VoxelGrid g) {
+        g.clear();
+        int cz = g.sizeZ() / 2;
+        for (int x = 2; x <= 7; x++)
+            for (int y = 2; y <= 5; y++)
+                g.set(x, y, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), GRIP_STOCK);
+        for (int x = 7; x <= 15; x++)
+            for (int y = 3; y <= 6; y++)
+                for (int z = cz - 1; z <= cz + 1; z++)
+                    g.set(x, y, z, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 15; x <= 23; x++)
+            g.set(x, 4, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), BARREL);
+        g.set(11, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintRailgunEnergy(VoxelGrid g) {
+        g.clear();
+        int cz = g.sizeZ() / 2;
+        for (int x = 2; x <= 7; x++)
+            for (int y = 2; y <= 5; y++)
+                g.set(x, y, cz, MaterialPalette.CARBON_FIBER, MaterialPalette.defaultRgb(MaterialPalette.CARBON_FIBER), GRIP_STOCK);
+        for (int x = 7; x <= 15; x++)
+            for (int y = 3; y <= 6; y++)
+                g.set(x, y, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), ACTION);
+        for (int x = 15; x <= 26; x++) {
+            g.set(x, 5, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), BARREL);
+            g.set(x, 3, cz, MaterialPalette.SHEET_METAL, MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), BARREL);
+            g.set(x, 4, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), BARREL);
+        }
+        g.set(11, 7, cz, MaterialPalette.PLEXIGLASS, MaterialPalette.defaultRgb(MaterialPalette.PLEXIGLASS), SIGHT);
+    }
+
+    public static void paintWeapon(VoxelGrid g, String id) {
+        if (id == null) { paintStarterRifle(g); return; }
+        switch (id) {
+            case "sidearm_light" -> paintSidearmLight(g);
+            case "smg_light" -> paintSmgLight(g);
+            case "shotgun_light" -> paintShotgunLight(g);
+            case "marksman_rifle" -> paintMarksmanRifle(g);
+            case "lmg_medium" -> paintLmgMedium(g);
+            case "sniper_heavy" -> paintSniperHeavy(g);
+            case "cannon_heavy" -> paintCannonHeavy(g);
+            case "carbine_energy" -> paintCarbineEnergy(g);
+            case "railgun_energy" -> paintRailgunEnergy(g);
+            default -> paintStarterRifle(g);
+        }
+    }
+
     public static void exportWeaponJson(Path path, String id, Stats stats, String ammoId) throws IOException {
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");

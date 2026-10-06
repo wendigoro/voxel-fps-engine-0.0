@@ -1,0 +1,25 @@
+{
+  "id": "marksman_rifle",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "medium",
+  "hitscan": 0,
+  "fire_mode": "semi",
+  "ammo_id": "medium_tracer",
+  "stats": {
+    "damage": 32.0,
+    "impact": 42.0,
+    "recoil": 24.0,
+    "handling": 9.5,
+    "weight": 18.0,
+    "optic": 12.0
+  },
+  "parts": {
+    "barrel": 79,
+    "action": 87,
+    "bolt_chamber": 3,
+    "trigger": 1,
+    "grip_stock": 103,
+    "sight": 36
+  }
+}

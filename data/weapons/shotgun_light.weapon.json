@@ -1,0 +1,25 @@
+{
+  "id": "shotgun_light",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "light",
+  "hitscan": 0,
+  "fire_mode": "semi",
+  "ammo_id": "light_ap",
+  "stats": {
+    "damage": 24.0,
+    "impact": 32.0,
+    "recoil": 22.0,
+    "handling": 10.0,
+    "weight": 14.0,
+    "optic": 2.5
+  },
+  "parts": {
+    "barrel": 22,
+    "action": 102,
+    "bolt_chamber": 3,
+    "trigger": 1,
+    "grip_stock": 67,
+    "sight": 2
+  }
+}
