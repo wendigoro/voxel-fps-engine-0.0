@@ -530,7 +530,8 @@ inline void evaluateProceduralPose(
     float aimPitch,
     Mat4 outBones[kMaxBones],
     Vec3* outHeadPos = nullptr,
-    float locomotionPhase = -1.0f)
+    float locomotionPhase = -1.0f,
+    Mat4* outRHandSocket = nullptr)
 {
     Vec3 localTrans[BoneId::Count]{};
     Mat4 localRot[BoneId::Count];
@@ -760,6 +761,12 @@ inline void evaluateProceduralPose(
 
     if (outHeadPos) {
         *outHeadPos = global[BoneId::Head].pos;
+    }
+    if (outRHandSocket) {
+        *outRHandSocket = Mat4::multiply(
+            Mat4::translation(global[BoneId::RHand].pos),
+            global[BoneId::RHand].rot
+        );
     }
 
     // 9. Compute bone skinning matrices:

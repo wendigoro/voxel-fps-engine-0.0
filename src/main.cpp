@@ -50,6 +50,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "ballistics.hpp"
 #include "char_model.hpp"
 #include "char_mesh.hpp"
+#include "weapon_model.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1189,6 +1190,7 @@ static void paceFrame120() {
 
 static Vec3 cameraForward();
 static Vec3 cameraRight();
+static Vec3 cameraUp();
 
 static void ensureSkyTileBuffer() {
     if (g_skyTileVB) return;
@@ -1777,6 +1779,26 @@ static void ensurePickupBuffer() {
                  g_pickupVB, g_pickupMem);
     vkMapMemory(g_device, g_pickupMem, 0, size, 0, &g_pickupMapped);
     if (g_pickupMapped) std::memset(g_pickupMapped, 0, static_cast<size_t>(size));
+}
+
+// Weapon models & viewmodel rendering (Models layer)
+static std::vector<weapon_view::WeaponModel> g_weaponModels;
+static weapon_view::ViewModelAnim g_viewmodelAnim;
+static VkBuffer g_weaponVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_weaponMem = VK_NULL_HANDLE;
+static void* g_weaponMapped = nullptr;
+static uint32_t g_weaponVertexCount = 0;
+static constexpr uint32_t kWeaponMaxVerts = 16384;
+static char_model::Mat4 g_lastRHandSocket = char_model::Mat4::identity();
+
+static void ensureWeaponBuffer() {
+    if (g_weaponVB) return;
+    VkDeviceSize size = sizeof(Vertex) * kWeaponMaxVerts;
+    createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_weaponVB, g_weaponMem);
+    vkMapMemory(g_device, g_weaponMem, 0, size, 0, &g_weaponMapped);
+    if (g_weaponMapped) std::memset(g_weaponMapped, 0, static_cast<size_t>(size));
 }
 
 // World AABB of a pickup's solid cells, in world units.
@@ -3870,6 +3892,7 @@ static std::string activeCaliberId(const WeaponDef& w) {
 }
 
 static void applyRecoilKick(const WeaponDef& w) {
+    g_viewmodelAnim.triggerRecoil(w.recoil, w.handling);
     // Kick accumulates on a temporary offset (not permanent aim). Handling/weight/ADS
     // damp the punch; handling also speeds the smooth return after the last shot.
     const float damp = 1.0f / (1.0f + std::max(0.0f, w.weight) * 0.08f +
@@ -4100,6 +4123,35 @@ static void tryLoadWeapons() {
     g_activeAmmoIndex = 0;
     for (int i = 0; i < 4; ++i) {
         if (normalizeCaliber(w0.caliber) == kCaliberIds[i]) { g_activeCaliberIndex = i; break; }
+    }
+
+    g_weaponModels.clear();
+    for (const auto& w : g_weapons) {
+        weapon_view::WeaponModel wm;
+        bool found = false;
+        const std::string voxPaths[] = {
+            g_exeDir + "\\..\\data\\voxfmt\\" + w.id + ".vox.json",
+            g_exeDir + "\\voxfmt\\" + w.id + ".vox.json",
+            g_exeDir + "\\..\\data\\voxfmt\\smoke_weapon.vox.json",
+            g_exeDir + "\\voxfmt\\smoke_weapon.vox.json",
+            g_exeDir + "\\weapons\\" + w.id + ".vox.json",
+            g_exeDir + "\\..\\data\\weapons\\" + w.id + ".vox.json"
+        };
+        for (const auto& p : voxPaths) {
+            if (weapon_view::loadWeaponModelFromFile(p, wm)) {
+                wm.id = w.id;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (w.id == "sidearm_light" || w.caliber == "light") {
+                wm = weapon_view::buildProceduralPistol(w.id);
+            } else {
+                wm = weapon_view::buildProceduralRifle(w.id);
+            }
+        }
+        g_weaponModels.push_back(wm);
     }
 }
 
@@ -6817,7 +6869,7 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
             }
             char_model::evaluateProceduralPose(
                 char_model::getCanonicalModel(), g_move, g_player, timeSec,
-                deltaYaw, aimPitch, bones, nullptr, renderPhase);
+                deltaYaw, aimPitch, bones, nullptr, renderPhase, &g_lastRHandSocket);
 
             // In first person, collapse head and neck so local player camera has
             // an unobstructed view while chest, arms, legs, and feet remain visible looking down.
@@ -6853,6 +6905,13 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelineLayout, 0, 1,
                                 &g_descSets[frameIndex], 0, nullptr);
+    }
+ 
+    // Weapon model rendering (Models layer: first-person viewmodel or 3rd-person attached to RHand)
+    if (g_weaponVB != VK_NULL_HANDLE && g_weaponVertexCount > 0) {
+        VkDeviceSize wOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_weaponVB, &wOff);
+        vkCmdDraw(cmd, g_weaponVertexCount, 1, 0, 0);
     }
 
     // Visual debris cubes (8x8x8 chips) after world mesh, before sky
@@ -7226,6 +7285,13 @@ static Vec3 cameraForward() {
 
 static Vec3 cameraRight() {
     return cameraForward().cross(Vec3(0, 1, 0)).normalized();
+}
+
+static Vec3 cameraUp() {
+    Vec3 f = cameraForward();
+    Vec3 r = cameraRight();
+    if (r.length() < 1e-5f) r = Vec3(1, 0, 0);
+    return r.normalized().cross(f).normalized();
 }
 
 // Flat look vectors (movement stays grounded; pitch does not fly).
@@ -7913,6 +7979,162 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
     std::memcpy(g_uboMapped[frameIndex], &ubo, sizeof(ubo));
 }
 
+static void updateWeaponMesh() {
+    ensureWeaponBuffer();
+    if (!g_weaponMapped) return;
+    g_weaponVertexCount = 0;
+
+    const WeaponDef activeWeapon = activeWeaponOrDefault();
+    if (g_weaponModels.empty()) return;
+
+    const weapon_view::WeaponModel* model = nullptr;
+    for (const auto& wm : g_weaponModels) {
+        if (wm.id == activeWeapon.id) {
+            model = &wm;
+            break;
+        }
+    }
+    if (!model && !g_weaponModels.empty()) {
+        model = &g_weaponModels[0];
+    }
+    if (!model || !model->valid()) return;
+
+    Vertex* verts = reinterpret_cast<Vertex*>(g_weaponMapped);
+    uint32_t wi = 0;
+
+    if (g_thirdPerson && !g_captureActive) {
+        // Third-person mode: attached to character right hand socket
+        const float charScale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
+        const char_model::Mat4 scaleMat = char_model::Mat4::scaling(charScale);
+        const float modelYaw = g_legYaw;
+        const char_model::Mat4 rotMat = char_model::Mat4::rotationY(static_cast<float>(M_PI) - modelYaw);
+        const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+        const Vec3 interpPos = lerpEye(g_playerPosPrevTick, Vec3(g_player.px, g_player.py, g_player.pz), alpha);
+        const char_model::Mat4 transMat = char_model::Mat4::translation(interpPos.x, interpPos.y, interpPos.z);
+        const char_model::Mat4 charWorldMat = char_model::Mat4::multiply(transMat, char_model::Mat4::multiply(rotMat, scaleMat));
+
+        const float cellScale = 0.020f;
+        const char_model::Mat4 gripRot = char_model::Mat4::rotationY(-static_cast<float>(M_PI) * 0.5f);
+        const char_model::Mat4 gripTrans = char_model::Mat4::translation(
+            -static_cast<float>(model->pivotX) * cellScale,
+            -static_cast<float>(model->pivotY) * cellScale,
+            -static_cast<float>(model->pivotZ) * cellScale
+        );
+        const char_model::Mat4 gripMat = char_model::Mat4::multiply(gripRot, gripTrans);
+        const char_model::Mat4 weaponModelMat = char_model::Mat4::multiply(charWorldMat, char_model::Mat4::multiply(g_lastRHandSocket, gripMat));
+
+        const Vec3 base(weaponModelMat.m[12], weaponModelMat.m[13], weaponModelMat.m[14]);
+        const Vec3 wX = Vec3(weaponModelMat.m[0], weaponModelMat.m[1], weaponModelMat.m[2]).normalized();
+        const Vec3 wY = Vec3(weaponModelMat.m[4], weaponModelMat.m[5], weaponModelMat.m[6]).normalized();
+        const Vec3 wZ = Vec3(weaponModelMat.m[8], weaponModelMat.m[9], weaponModelMat.m[10]).normalized();
+        const float worldEdge = cellScale * charScale;
+
+        for (const auto& v : model->voxels) {
+            emitUnitCube(verts, wi, kWeaponMaxVerts, base, wX, wY, wZ,
+                         static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z),
+                         worldEdge, v.cr, v.cg, v.cb, static_cast<float>(kPickupMatId));
+        }
+    } else if (!g_captureActive) {
+        // First-person viewmodel: anchored to camera display basis
+        const Vec3 camPos = renderEye();
+        const Vec3 fwd = cameraForward();
+        const Vec3 right = cameraRight();
+        const Vec3 up = cameraUp();
+
+        const float cellScale = 0.00018f;
+
+        const float sightRelY = static_cast<float>(model->sightY - model->pivotY) * cellScale;
+        const float sightRelZ = static_cast<float>(model->sightZ - model->pivotZ) * cellScale;
+
+        const float hipRight = 0.0022f;
+        const float hipUp = -0.0018f;
+        const float hipFwd = 0.0048f;
+
+        const float adsRight = -sightRelZ;
+        const float adsUp = -sightRelY;
+        const float adsFwd = 0.0036f;
+
+        const float ads = g_viewmodelAnim.adsAlpha;
+        const float restRight = hipRight + (adsRight - hipRight) * ads;
+        const float restUp = hipUp + (adsUp - hipUp) * ads;
+        const float restFwd = hipFwd + (adsFwd - hipFwd) * ads;
+
+        const float t = g_viewmodelAnim.idleTimer;
+        const float swayDamp = (1.0f - ads * 0.80f);
+        const float swayX = std::sin(t * 1.6f) * 0.00010f * swayDamp;
+        const float swayY = std::cos(t * 3.2f) * 0.00007f * swayDamp;
+        const float swayRoll = std::sin(t * 1.6f) * 0.015f * swayDamp;
+
+        const float bt = g_viewmodelAnim.bobTimer;
+        const float bobDamp = (1.0f - ads * 0.85f);
+        const float bobX = std::sin(bt * 0.5f) * 0.00022f * bobDamp;
+        const float bobY = std::abs(std::sin(bt)) * 0.00025f * bobDamp;
+        const float bobRoll = std::cos(bt * 0.5f) * 0.025f * bobDamp;
+
+        const float eq = g_viewmodelAnim.equipAlpha;
+        const float equipDrop = (1.0f - eq) * 0.0040f;
+        const float equipPitch = (1.0f - eq) * 0.35f;
+
+        const float recZ = g_viewmodelAnim.recoilZ;
+        const float recY = g_viewmodelAnim.recoilY;
+        const float recPitch = g_viewmodelAnim.recoilPitch;
+        const float recYaw = g_viewmodelAnim.recoilYaw;
+        const float recRoll = g_viewmodelAnim.recoilRoll;
+
+        const float totalRight = restRight + swayX + bobX + recYaw * 0.002f;
+        const float totalUp = restUp + swayY - bobY - equipDrop - recY;
+        const float totalFwd = restFwd - recZ;
+
+        const Vec3 weaponOrigin = camPos + right * totalRight + up * totalUp + fwd * totalFwd;
+
+        const float pitch = recPitch + equipPitch;
+        const float yaw = recYaw;
+        const float roll = swayRoll + bobRoll + recRoll;
+
+        Vec3 axF = fwd;
+        Vec3 axU = up;
+        Vec3 axR = right;
+
+        if (std::abs(pitch) > 1e-5f) {
+            const float cp = std::cos(pitch);
+            const float sp = std::sin(pitch);
+            const Vec3 newF = axF * cp + axU * sp;
+            const Vec3 newU = axU * cp - axF * sp;
+            axF = newF.normalized();
+            axU = newU.normalized();
+        }
+        if (std::abs(yaw) > 1e-5f) {
+            const float cy = std::cos(yaw);
+            const float sy = std::sin(yaw);
+            const Vec3 newF = axF * cy + axR * sy;
+            const Vec3 newR = axR * cy - axF * sy;
+            axF = newF.normalized();
+            axR = newR.normalized();
+        }
+        if (std::abs(roll) > 1e-5f) {
+            const float cr = std::cos(roll);
+            const float sr = std::sin(roll);
+            const Vec3 newR = axR * cr + axU * sr;
+            const Vec3 newU = axU * cr - axR * sr;
+            axR = newR.normalized();
+            axU = newU.normalized();
+        }
+
+        const Vec3 base = weaponOrigin - axF * (static_cast<float>(model->pivotX) * cellScale)
+                                       - axU * (static_cast<float>(model->pivotY) * cellScale)
+                                       + axR * (static_cast<float>(model->pivotZ) * cellScale);
+
+        const Vec3 negR = axR * -1.0f;
+        for (const auto& v : model->voxels) {
+            emitUnitCube(verts, wi, kWeaponMaxVerts, base, axF, axU, negR,
+                         static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z),
+                         cellScale, v.cr, v.cg, v.cb, static_cast<float>(kPickupMatId));
+        }
+    }
+
+    g_weaponVertexCount = wi;
+}
+
 
 static void flushDirtyMesh() {
     if (!g_meshDirty || !g_world || !g_views) return;
@@ -8038,6 +8260,9 @@ static void drawFrame(float timeSec) {
     {
         ScopedSection s(SEC_PICKUP);
         updatePickupMesh();
+        const float dt = static_cast<float>(TICK_DT);
+        g_viewmodelAnim.update(dt, g_move, g_player, g_ads);
+        updateWeaponMesh();
     }
     // Resolve g_invHover first (it needs this frame's camera basis), then act on
     // it, so a click always lands on the cell that was under the cursor.
@@ -8338,6 +8563,14 @@ if (g_skyTileVB) {
         g_pickupMem = VK_NULL_HANDLE;
         g_pickupMapped = nullptr;
     }
+    if (g_weaponVB) {
+        vkDestroyBuffer(g_device, g_weaponVB, nullptr);
+        vkUnmapMemory(g_device, g_weaponMem);
+        vkFreeMemory(g_device, g_weaponMem, nullptr);
+        g_weaponVB = VK_NULL_HANDLE;
+        g_weaponMem = VK_NULL_HANDLE;
+        g_weaponMapped = nullptr;
+    }
     if (g_inventoryVB) {
         if (g_inventoryMapped) { vkUnmapMemory(g_device, g_inventoryMem); g_inventoryMapped = nullptr; }
         vkDestroyBuffer(g_device, g_inventoryVB, nullptr);
@@ -8598,6 +8831,7 @@ static void simulateOnce(float dt, const SimInput& in) {
     }
     if (in.cycleWeapon && !g_weapons.empty()) {
         g_activeWeaponIndex = (g_activeWeaponIndex + 1) % static_cast<int>(g_weapons.size());
+        g_viewmodelAnim.triggerEquip();
     }
     if (in.cycleFireMode && !g_weapons.empty()) {
         WeaponDef& w = g_weapons[std::min(g_activeWeaponIndex,

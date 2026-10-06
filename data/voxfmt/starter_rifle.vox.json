@@ -1,0 +1,12 @@
+{
+  "format_version": 2,
+  "unit": 1,
+  "voxel_size": 0.001,
+  "mode": "weapon",
+  "dims": [24, 12, 12],
+  "anchors": {"pivot": [12, 0, 6]},
+  "caliber": "medium",
+  "ammo_id": "medium_fmj",
+  "parts_rle": {"palette": ["grip_stock", "trigger", "action", "barrel", "bolt_chamber", "sight"], "runs": [2,4,2,5,0,2,4,8,1,1,3,4,2,5,0,3,4,7,4,2,4,4,2,5,0,4,4,7,4,2,4,4,11,8,3,5,4,7,2,2,5,4,9,2,4,6,4,12,2,5]},
+  "cells_rle": {"palette": ["treated_wood", "sheet_metal", "carbon_fiber", "girder", "plexiglass"], "runs": [2,4,2,5,0,2,4,8,1,1,3,4,2,5,0,3,4,7,4,1,4,4,2,5,0,4,4,7,4,1,4,4,11,8,2,5,4,7,2,1,5,4,9,2,3,6,4,12,2,4]}
+}

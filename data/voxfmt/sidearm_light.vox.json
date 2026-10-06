@@ -1,0 +1,12 @@
+{
+  "format_version": 2,
+  "unit": 1,
+  "voxel_size": 0.001,
+  "mode": "weapon",
+  "dims": [16, 10, 8],
+  "anchors": {"pivot": [6, 0, 4]},
+  "caliber": "light",
+  "ammo_id": "light_fmj",
+  "parts_rle": {"palette": ["grip_stock", "trigger", "action", "barrel", "bolt_chamber", "sight"], "runs": [1,3,2,3,0,1,3,5,1,1,2,3,4,5,2,3,3,4,2,4,2,3,9,4,3,3,3,7,1,5]},
+  "cells_rle": {"palette": ["treated_wood", "sheet_metal", "carbon_fiber", "girder", "plexiglass"], "runs": [1,3,2,3,0,1,3,5,1,1,2,3,4,5,1,3,3,4,2,3,2,3,9,4,2,3,3,7,1,4]}
+}
