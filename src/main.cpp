@@ -52,6 +52,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "char_mesh.hpp"
 #include "weapon_model.hpp"
 #include "structural_matrix.hpp"
+#include "anim_clip.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -435,6 +436,10 @@ static float g_charLocomotionPhase = 0.0f;
 static Vec3 g_playerPosPrevTick{};
 static bool g_forceWeaponHold = true;
 static structural::MatrixSystem g_structuralMatrix;
+static anim::AnimController g_animController;
+static anim::PoseSample g_currentAnimPose;
+static float g_animAuthoredWeight = 0.85f;
+static void tryLoadAnimClips();
 
 static inline float angleDiff(float target, float current) {
     float diff = target - current;
@@ -2508,6 +2513,7 @@ static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 g_inventoryHandRot = (g_inventoryHandRot + 1) & 3;
             } else {
                 g_viewmodelAnim.triggerReload();
+                g_animController.playClip("rifle_reload", false, 0.15f);
                 g_pendingInput.cycleAmmo = true;
             }
         }
@@ -3897,6 +3903,7 @@ static std::string activeCaliberId(const WeaponDef& w) {
 
 static void applyRecoilKick(const WeaponDef& w) {
     g_viewmodelAnim.triggerRecoil(w.recoil, w.handling);
+    g_animController.triggerAdditive("rifle_fire", 1.0f, 1.0f);
     // Kick accumulates on a temporary offset (not permanent aim). Handling/weight/ADS
     // damp the punch; handling also speeds the smooth return after the last shot.
     const float damp = 1.0f / (1.0f + std::max(0.0f, w.weight) * 0.08f +
@@ -4156,6 +4163,31 @@ static void tryLoadWeapons() {
             }
         }
         g_weaponModels.push_back(wm);
+    }
+
+    tryLoadAnimClips();
+}
+
+// Load authored animation clips (data/anims/*.anim.json)
+static void tryLoadAnimClips() {
+    g_animController.clips.clear();
+    const std::string clipIds[] = { "rifle_idle", "rifle_fire", "rifle_reload", "walk" };
+    for (const auto& cid : clipIds) {
+        anim::AnimationClip clip;
+        const std::string paths[] = {
+            g_exeDir + "\\..\\data\\anims\\" + cid + ".anim.json",
+            g_exeDir + "\\anims\\" + cid + ".anim.json",
+            g_exeDir + "\\..\\..\\data\\anims\\" + cid + ".anim.json"
+        };
+        for (const auto& p : paths) {
+            if (anim::loadClipFromFile(p, clip)) {
+                g_animController.addClip(clip);
+                break;
+            }
+        }
+    }
+    if (!g_animController.clips.empty()) {
+        g_animController.playClip("rifle_idle", true, 0.0f);
     }
 }
 
@@ -6938,10 +6970,17 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
             const bool holdingWep = !g_weapons.empty() && !g_inventoryOpen && g_forceWeaponHold;
             const float reloadPh = (g_viewmodelAnim.isReloading && g_viewmodelAnim.reloadDuration > 0.0f)
                                        ? (g_viewmodelAnim.reloadTimer / g_viewmodelAnim.reloadDuration) : 0.0f;
+            char_model::AuthoredPoseOverride ov;
+            for (int b = 0; b < char_model::BoneId::Count; ++b) {
+                ov.trans[b] = g_currentAnimPose.pos[b];
+                ov.rot[b] = g_currentAnimPose.rot[b].toMat4();
+            }
+            ov.weight = g_animAuthoredWeight;
+
             char_model::evaluateProceduralPose(
                 char_model::getCanonicalModel(), g_move, g_player, timeSec,
                 deltaYaw, aimPitch, bones, nullptr, renderPhase, &g_lastRHandSocket,
-                holdingWep, g_viewmodelAnim.recoilPitch, g_viewmodelAnim.isReloading, reloadPh);
+                holdingWep, g_viewmodelAnim.recoilPitch, g_viewmodelAnim.isReloading, reloadPh, &ov);
 
             // In first person, collapse head and neck so local player camera has
             // an unobstructed view while chest, arms, legs, and feet remain visible looking down.
@@ -7412,9 +7451,17 @@ static void syncCameraToPlayer() {
     const float timeSec = static_cast<float>(g_tick) * TICK_DT;
     char_model::Vec3 headModelPos{};
     char_model::Mat4 dummyBones[char_model::kMaxBones];
+    char_model::AuthoredPoseOverride ov;
+    for (int b = 0; b < char_model::BoneId::Count; ++b) {
+        ov.trans[b] = g_currentAnimPose.pos[b];
+        ov.rot[b] = g_currentAnimPose.rot[b].toMat4();
+    }
+    ov.weight = g_animAuthoredWeight;
+
     char_model::evaluateProceduralPose(
         char_model::getCanonicalModel(), g_move, g_player, timeSec,
-        deltaYaw, aimPitch, dummyBones, &headModelPos, g_charLocomotionPhase);
+        deltaYaw, aimPitch, dummyBones, &headModelPos, g_charLocomotionPhase, nullptr,
+        false, 0.0f, false, 0.0f, &ov);
 
     const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
     const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
@@ -7739,10 +7786,31 @@ static void handleEditorAction(const std::string& actionJson) {
         }
     } else if (type == "TRIGGER_RELOAD") {
         g_viewmodelAnim.triggerReload();
+        g_animController.playClip("rifle_reload", false, 0.15f);
     } else if (type == "TRIGGER_RECOIL") {
         g_viewmodelAnim.triggerRecoil(12.0f, 10.0f);
+        g_animController.triggerAdditive("rifle_fire", 1.0f, 1.0f);
     } else if (type == "TOGGLE_ADS") {
         g_viewmodelAnim.adsAlpha = (g_viewmodelAnim.adsAlpha > 0.5f) ? 0.0f : 1.0f;
+    } else if (type == "SET_ANIM_CLIP") {
+        const std::string clipId = jsonExtractString(actionJson, "clipId", "");
+        if (!clipId.empty()) {
+            const bool loop = jsonExtractBool(actionJson, "loop", true);
+            const float blend = jsonExtractFloat(actionJson, "blend", 0.15f);
+            g_animController.playClip(clipId, false, blend);
+        }
+        if (jsonxHasKey(actionJson, "scrubTime")) {
+            g_animController.clipTime = jsonExtractFloat(actionJson, "scrubTime", 0.0f);
+        }
+        if (jsonxHasKey(actionJson, "isPlaying")) {
+            g_animController.isPlaying = jsonExtractBool(actionJson, "isPlaying", true);
+        }
+        if (jsonxHasKey(actionJson, "speed")) {
+            g_animController.playbackSpeed = jsonExtractFloat(actionJson, "speed", 1.0f);
+        }
+        if (jsonxHasKey(actionJson, "weight")) {
+            g_animAuthoredWeight = jsonExtractFloat(actionJson, "weight", 0.85f);
+        }
     } else if (type == "SET_WEAPON_HOLD") {
         g_forceWeaponHold = jsonExtractBool(actionJson, "holding", true);
     } else if (type == "RECALC_STRUCTURAL_INTEGRITY") {
@@ -8165,6 +8233,10 @@ static void updateWeaponMesh() {
     Vertex* verts = reinterpret_cast<Vertex*>(g_weaponMapped);
     uint32_t wi = 0;
 
+    g_currentAnimPose = g_animController.evaluatePose();
+    const float boltOffset = g_currentAnimPose.pos[anim::kBoneWeaponBolt].x;
+    const float magOffsetY = g_currentAnimPose.pos[anim::kBoneWeaponMag].y;
+
     if (g_thirdPerson && !g_captureActive) {
         // Third-person mode: attached to character right hand socket
         const float charScale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
@@ -8193,8 +8265,16 @@ static void updateWeaponMesh() {
         const float worldEdge = cellScale * charScale;
 
         for (const auto& v : model->voxels) {
+            float vx = static_cast<float>(v.x);
+            float vy = static_cast<float>(v.y);
+            float vz = static_cast<float>(v.z);
+            if (v.part == "bolt_chamber" || v.part == "action") {
+                vx += boltOffset / cellScale;
+            } else if (v.part == "magazine") {
+                vy += magOffsetY / cellScale;
+            }
             emitUnitCube(verts, wi, kWeaponMaxVerts, base, wX, wY, wZ,
-                         static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z),
+                         vx, vy, vz,
                          worldEdge, v.cr, v.cg, v.cb, static_cast<float>(kPickupMatId));
         }
     } else if (!g_captureActive) {
@@ -8294,8 +8374,16 @@ static void updateWeaponMesh() {
 
         const Vec3 negR = axR * -1.0f;
         for (const auto& v : model->voxels) {
+            float vx = static_cast<float>(v.x);
+            float vy = static_cast<float>(v.y);
+            float vz = static_cast<float>(v.z);
+            if (v.part == "bolt_chamber" || v.part == "action") {
+                vx += boltOffset / cellScale;
+            } else if (v.part == "magazine") {
+                vy += magOffsetY / cellScale;
+            }
             emitUnitCube(verts, wi, kWeaponMaxVerts, base, axF, axU, negR,
-                         static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z),
+                         vx, vy, vz,
                          cellScale, v.cr, v.cg, v.cb, static_cast<float>(kPickupMatId));
         }
     }
@@ -8430,6 +8518,7 @@ static void drawFrame(float timeSec) {
         updatePickupMesh();
         const float dt = static_cast<float>(TICK_DT);
         g_viewmodelAnim.update(dt, g_move, g_player, g_ads);
+        g_animController.update(dt);
         updateWeaponMesh();
     }
     // Resolve g_invHover first (it needs this frame's camera basis), then act on
@@ -9483,6 +9572,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     snap += "\"character\":{\"holdingWeapon\":" + std::string(g_forceWeaponHold ? "true" : "false") + ",";
                     snap += "\"isReloading\":" + std::string(g_viewmodelAnim.isReloading ? "true" : "false") + ",";
                     snap += "\"adsAlpha\":" + std::to_string(g_viewmodelAnim.adsAlpha) + "},";
+                    {
+                        std::string activeClipId = (g_animController.activeClipIndex >= 0 && g_animController.activeClipIndex < static_cast<int>(g_animController.clips.size()))
+                            ? g_animController.clips[g_animController.activeClipIndex].id : "none";
+                        float clipDur = (g_animController.activeClipIndex >= 0 && g_animController.activeClipIndex < static_cast<int>(g_animController.clips.size()))
+                            ? g_animController.clips[g_animController.activeClipIndex].durationSec : 1.0f;
+                        snap += "\"anim\":{\"activeClip\":\"" + activeClipId + "\",\"clipTime\":" + std::to_string(g_animController.clipTime) + ",";
+                        snap += "\"duration\":" + std::to_string(clipDur) + ",\"isPlaying\":" + (g_animController.isPlaying ? "true" : "false") + ",";
+                        snap += "\"weight\":" + std::to_string(g_animAuthoredWeight) + "},";
+                    }
                     std::string vpJson = g_visReg.toJson();
                     while (!vpJson.empty() && (vpJson.back() == '\n' || vpJson.back() == '\r' || vpJson.back() == ' ')) {
                         vpJson.pop_back();
@@ -9519,6 +9617,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const char_mesh::SelfTestReport charMeshRep = char_mesh::selfTest();
             const bool sublatticeOk = sublatticeImpactSelfTest();
             const bool structuralOk = g_structuralMatrix.selfTest(world);
+            const bool animClipsOk = anim::selfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -9874,6 +9973,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nchar_mesh_golden=" << std::hex << charMeshRep.goldenHash << std::dec
                 << "\nchar_mesh_ok=" << (charMeshRep.ok() ? 1 : 0)
                 << "\nstructural_integrity_ok=" << (structuralOk ? 1 : 0)
+                << "\nanim_clips_ok=" << (animClipsOk ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -9977,6 +10077,9 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             // Structural integrity matrix contract: Warehouse baseline sound, sensitivity to demolition, restoration.
             // Exit 13 keeps CI triage separate.
             if (!structuralOk) { cleanup(); return 13; }
+            // Authored animation clips contract: Quat normalization, slerp, JSON loader, controller tracks, blending.
+            // Exit 14 keeps CI triage separate.
+            if (!animClipsOk) { cleanup(); return 14; }
         }
     } catch (const std::exception& e) {
         // Every automated run here is headless -- smoke, stress, capture, export --

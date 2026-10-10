@@ -146,6 +146,13 @@ if (Test-Path $uiSrc) {
   New-Item -ItemType Directory -Force -Path $uiDst | Out-Null
   Copy-Item (Join-Path $uiSrc "*") $uiDst -Force -Recurse
 }
+# Authored animation clips
+$animsSrc = Join-Path $Root "data\anims"
+$animsDst = Join-Path $Build "anims"
+if (Test-Path $animsSrc) {
+  New-Item -ItemType Directory -Force -Path $animsDst | Out-Null
+  Copy-Item (Join-Path $animsSrc "*") $animsDst -Force -Recurse
+}
 
 $exe = Get-Item (Join-Path $Build "voxel_engine.exe")
 Write-Host "BUILD_OK $($exe.FullName) ($([math]::Round($exe.Length/1KB)) KB)" -ForegroundColor Green

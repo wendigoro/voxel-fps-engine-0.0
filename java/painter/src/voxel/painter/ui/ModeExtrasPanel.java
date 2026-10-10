@@ -38,6 +38,7 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
     private final JPanel weaponRow;
     private final JButton bakeSky;
     private final JButton bakeChar;
+    private final JComboBox<String> animClipBox;
     private final JComboBox<String> weaponSelectBox;
     private final JButton bakeWeapon;
     // Item mode (RULES.md rule 12). The grid the artist paints IS the packing
@@ -119,6 +120,9 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         charRow.add(feetX);
         charRow.add(feetY);
         charRow.add(feetZ);
+        charRow.add(dim("clip"));
+        animClipBox = new JComboBox<>(new String[]{"rifle_idle", "rifle_fire", "rifle_reload", "walk"});
+        charRow.add(animClipBox);
         c.gridy = 2;
         add(charRow, c);
 

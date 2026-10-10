@@ -2,7 +2,7 @@
   "schema": "imagoro.image/v1",
   "imageId": "imagoro.command-center",
   "imageVersion": "0.1.0",
-  "builtAt": "2026-10-06T18:06:33.872Z",
+  "builtAt": "2026-10-10T00:50:18.214Z",
   "renderer": "react",
   "shell": {
     "entry": "src/sections.ts",
@@ -532,21 +532,21 @@
       "ms": 2
     },
     {
-      "path": "assets/index-CLSR1nMS.js",
-      "sha256": "a8b5b69c253b35b100b97810d51b68345bc55df358c1a08ef5a60419e4235da4",
-      "bytes": 187520,
-      "ms": 33
+      "path": "assets/index-COrJahG2.js",
+      "sha256": "30a0892a1934caee3e6889d03cf991dd5c6052b4fdc6226907cff9cc582fa31f",
+      "bytes": 190275,
+      "ms": 42
     },
     {
       "path": "index.html",
-      "sha256": "4d21453b60146d18e0d88d61ef064550828dd7779267091860ee6e90704b7bd5",
+      "sha256": "0b76a208aec24993bf94f8028805c726739f14cb28390538f6544cec0cc0e0ec",
       "bytes": 417,
       "ms": 0
     }
   ],
   "integrity": {
     "algorithm": "sha256",
-    "digest": "945c3ea877bd2d72b042181a0fab2f1191b680a084acca627bfcfd2f91e95639",
+    "digest": "c1b062c62fc60d0210e31a5eb7f95230fdec07f1e6dca09e91292d3ca56f870a",
     "files": 3
   }
 }

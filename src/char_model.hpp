@@ -517,6 +517,19 @@ inline const Model& getCanonicalModel() {
     return s_model;
 }
 
+// Authored animation clip pose override (translations + rotation matrices)
+struct AuthoredPoseOverride {
+    Vec3 trans[BoneId::Count]{};
+    Mat4 rot[BoneId::Count];
+    float weight = 0.0f; // 0.0 = procedural only, 1.0 = authored clip only
+
+    AuthoredPoseOverride() {
+        for (int b = 0; b < BoneId::Count; ++b) {
+            rot[b] = Mat4::identity();
+        }
+    }
+};
+
 // Procedural locomotion baseline for character model posing (view-side only, Models layer).
 // Evaluates skeletal bone transforms from player movement intent and body state.
 // The simulation never reads these transforms; they are uploaded to the BonePalette SSBO
@@ -535,7 +548,8 @@ inline void evaluateProceduralPose(
     bool holdingWeapon = false,
     float weaponRecoil = 0.0f,
     bool isReloading = false,
-    float reloadPhase = 0.0f)
+    float reloadPhase = 0.0f,
+    const AuthoredPoseOverride* overridePose = nullptr)
 {
     Vec3 localTrans[BoneId::Count]{};
     Mat4 localRot[BoneId::Count];
@@ -803,6 +817,19 @@ inline void evaluateProceduralPose(
 
         const Mat4 headAim = Mat4::multiply(Mat4::rotationY(deltaYaw * 0.15f), Mat4::rotationX(-aimPitch * 0.20f));
         localRot[BoneId::Head] = Mat4::multiply(headAim, localRot[BoneId::Head]);
+    }
+
+    // Authored animation clip blending:
+    // If an authored clip override is active, blend procedural kinematics into authored track.
+    if (overridePose && overridePose->weight > 1e-4f) {
+        const float w = std::clamp(overridePose->weight, 0.0f, 1.0f);
+        const float invW = 1.0f - w;
+        for (int b = 0; b < BoneId::Count; ++b) {
+            localTrans[b] = localTrans[b] * invW + overridePose->trans[b] * w;
+            for (int i = 0; i < 16; ++i) {
+                localRot[b].m[i] = localRot[b].m[i] * invW + overridePose->rot[b].m[i] * w;
+            }
+        }
     }
 
     // 8. Forward kinematics pass: propagate joint positions and rotations
