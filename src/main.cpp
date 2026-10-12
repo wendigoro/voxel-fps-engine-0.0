@@ -53,6 +53,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "weapon_model.hpp"
 #include "structural_matrix.hpp"
 #include "anim_clip.hpp"
+#include "planetary/ztile_pyramid.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -9618,6 +9619,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const bool sublatticeOk = sublatticeImpactSelfTest();
             const bool structuralOk = g_structuralMatrix.selfTest(world);
             const bool animClipsOk = anim::selfTest();
+            const bool planetaryOk = planetary::selfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -9974,6 +9976,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nchar_mesh_ok=" << (charMeshRep.ok() ? 1 : 0)
                 << "\nstructural_integrity_ok=" << (structuralOk ? 1 : 0)
                 << "\nanim_clips_ok=" << (animClipsOk ? 1 : 0)
+                << "\nplanetary_ok=" << (planetaryOk ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -10080,6 +10083,10 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             // Authored animation clips contract: Quat normalization, slerp, JSON loader, controller tracks, blending.
             // Exit 14 keeps CI triage separate.
             if (!animClipsOk) { cleanup(); return 14; }
+            // Planetary destruction & multi-scale Z-tile engine contract:
+            // Cubed-sphere round-trip, Hilbert curve, octave voxel scaling, data stripping, Q_D* physics.
+            // Exit 15 keeps CI triage separate.
+            if (!planetaryOk) { cleanup(); return 15; }
         }
     } catch (const std::exception& e) {
         // Every automated run here is headless -- smoke, stress, capture, export --
