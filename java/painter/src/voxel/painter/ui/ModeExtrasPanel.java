@@ -242,6 +242,23 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             model.markDirty();
         });
 
+        JButton triggerImpact = new JButton("Trigger planet impact");
+        triggerImpact.addActionListener(e -> {
+            System.out.println("[Painter] Triggering planetary impact (R=4500km, v=50km/s)");
+        });
+        JButton resetPlanets = new JButton("Reset planets");
+        resetPlanets.addActionListener(e -> {
+            System.out.println("[Painter] Resetting celestial orbits");
+        });
+        JComboBox<String> containerSelectBox = new JComboBox<>(new String[]{
+            "WeaponLocker", "WallSafe", "MilitaryFootlocker", "ScrapBin", "CovertDeadDrop", "MedicalCabinet"
+        });
+        JButton rollLoot = new JButton("Roll container loot");
+        rollLoot.addActionListener(e -> {
+            String cType = (String) containerSelectBox.getSelectedItem();
+            System.out.println("[Painter] Rolling container loot drop: " + cType);
+        });
+
         JPanel bakes = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         bakes.setOpaque(false);
         bakes.add(bakeSky);
@@ -251,10 +268,15 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         bakes.add(bakeItem);
         bakes.add(exportItem);
         bakes.add(bakeMap);
+        bakes.add(triggerImpact);
+        bakes.add(resetPlanets);
+        bakes.add(containerSelectBox);
+        bakes.add(rollLoot);
         c.gridy = 6;
         c.gridx = 0;
         c.gridwidth = 8;
         add(bakes, c);
+
 
         calBox.addActionListener(e -> {
             if (!syncing) model.setCaliber((String) calBox.getSelectedItem());

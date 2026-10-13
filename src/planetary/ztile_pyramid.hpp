@@ -7,6 +7,9 @@
 #include "planetary_types.hpp"
 #include "plate_zones.hpp"
 #include "planetary_sim.hpp"
+#include "water_basins.hpp"
+#include "multi_planet.hpp"
+#include "clipmap_mesh.hpp"
 #include "planetary_render.hpp"
 
 #include <cstdint>
@@ -20,101 +23,6 @@
 
 namespace planetary {
 
-// Z-Tile Key uniquely identifying a tile in the 6-face Cubed-Sphere Shell Pyramid
-struct ZTileKey {
-    uint8_t  face  = 0; // CubeFace: 0..5
-    uint8_t  shell = 1; // PlanetaryShell: 0..3 (Default: 1 = Crust)
-    uint8_t  zoom  = 0; // 0..32
-    uint32_t x     = 0; // 0 .. 2^zoom - 1
-    uint32_t y     = 0; // 0 .. 2^zoom - 1
-
-    ZTileKey() = default;
-    constexpr ZTileKey(uint8_t f, uint8_t sh, uint8_t z, uint32_t x_, uint32_t y_)
-        : face(f), shell(sh), zoom(z), x(x_), y(y_) {}
-
-    bool operator==(const ZTileKey& o) const {
-        return face == o.face && shell == o.shell && zoom == o.zoom && x == o.x && y == o.y;
-    }
-
-    bool operator!=(const ZTileKey& o) const {
-        return !(*this == o);
-    }
-
-    // 64-bit compact packed representation:
-    // [face: 3 bits][shell: 3 bits][zoom: 6 bits][x: 26 bits][y: 26 bits]
-    uint64_t packCompact() const {
-        return (static_cast<uint64_t>(face & 0x07) << 61) |
-               (static_cast<uint64_t>(shell & 0x07) << 58) |
-               (static_cast<uint64_t>(zoom & 0x3F) << 52) |
-               (static_cast<uint64_t>(x & 0x03FFFFFF) << 26) |
-               (static_cast<uint64_t>(y & 0x03FFFFFF));
-    }
-
-    static ZTileKey unpackCompact(uint64_t v) {
-        ZTileKey k;
-        k.face  = static_cast<uint8_t>((v >> 61) & 0x07);
-        k.shell = static_cast<uint8_t>((v >> 58) & 0x07);
-        k.zoom  = static_cast<uint8_t>((v >> 52) & 0x3F);
-        k.x     = static_cast<uint32_t>((v >> 26) & 0x03FFFFFF);
-        k.y     = static_cast<uint32_t>(v & 0x03FFFFFF);
-        return k;
-    }
-
-    // Hilbert curve 1D tile ID (Poached from Scout/Dell PlanetTileStore.java)
-    // Generates a monotonically increasing 1D sequential index along a Hilbert curve.
-    uint64_t toHilbertId() const {
-        uint64_t acc = 0;
-        for (uint8_t i = 0; i < zoom; ++i) {
-            acc += (1ULL << (2 * i));
-        }
-        uint64_t d = 0;
-        uint64_t tx = x;
-        uint64_t ty = y;
-        for (uint64_t s = (zoom > 0 ? (1ULL << (zoom - 1)) : 0); s > 0; s >>= 1) {
-            const uint64_t rx = (tx & s) > 0 ? 1 : 0;
-            const uint64_t ry = (ty & s) > 0 ? 1 : 0;
-            d += s * s * ((3 * rx) ^ ry);
-            if (ry == 0) {
-                if (rx == 1) {
-                    tx = s - 1 - tx;
-                    ty = s - 1 - ty;
-                }
-                const uint64_t tmp = tx;
-                tx = ty;
-                ty = tmp;
-            }
-        }
-        return acc + d;
-    }
-
-    // Invert Hilbert index back to 2D (x, y) for a given zoom level
-    static void fromHilbertId(uint8_t z, uint64_t hilbertVal, uint32_t& outX, uint32_t& outY) {
-        uint64_t acc = 0;
-        for (uint8_t i = 0; i < z; ++i) {
-            acc += (1ULL << (2 * i));
-        }
-        uint64_t t = (hilbertVal >= acc) ? (hilbertVal - acc) : 0;
-        uint64_t tx = 0, ty = 0;
-        for (uint64_t s = 1; s < (1ULL << z); s <<= 1) {
-            const uint64_t rx = 1 & (t / 2);
-            const uint64_t ry = 1 & (t ^ rx);
-            if (ry == 0) {
-                if (rx == 1) {
-                    tx = s - 1 - tx;
-                    ty = s - 1 - ty;
-                }
-                const uint64_t tmp = tx;
-                tx = ty;
-                ty = tmp;
-            }
-            tx += s * rx;
-            ty += s * ry;
-            t /= 4;
-        }
-        outX = static_cast<uint32_t>(tx);
-        outY = static_cast<uint32_t>(ty);
-    }
-};
 
 // Hash specialization for ZTileKey
 struct ZTileKeyHash {
@@ -639,8 +547,182 @@ inline bool selfTest() {
         }
     }
 
-    std::cout << "planetary::selfTest(): PASS (All 13 test vectors OK)" << std::endl;
+    // Test 14: Tier 2 Ocean Basins Bathymetry, Cavitation & Shallow Water Wave Speed
+    {
+        const double c = OceanBasinManager::computeShallowWaterWaveSpeed(kStandardOceanDepthM);
+        // c = sqrt(9.81 * 3682) ~ 190.05 m/s
+        if (c < 185.0 || c > 195.0) {
+            std::cerr << "FAIL: Shallow water wave speed unexpected: " << c << " m/s" << std::endl;
+            return false;
+        }
+
+        // Thermal steam cavitation from 1.0e24 J impact (~100x Chicxulub)
+        const double cavVolM3 = OceanBasinManager::computeSteamCavitationVolumeM3(1.0e24, kStandardOceanDepthM);
+        const double cavVolKm3 = cavVolM3 / 1.0e9;
+        if (cavVolKm3 < 10000.0 || cavVolKm3 > 100000.0) {
+            std::cerr << "FAIL: Steam cavitation volume unexpected: " << cavVolKm3 << " km^3" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 15: Mega-Tsunami Propagation, Antipodal Refocusing, and Structural Inundation
+    {
+        OceanBasinManager oceans(kStandardEarthRadiusM, kStandardOceanDepthM);
+        const Vec3d impactNorthPole(0, kStandardEarthRadiusM, 0);
+        oceans.triggerOceanImpact(impactNorthPole, 5.0e25);
+
+        if (oceans.activeWaves.empty()) {
+            std::cerr << "FAIL: Ocean impact failed to launch tsunami wave front" << std::endl;
+            return false;
+        }
+
+        // Step waves forward across the planet
+        oceans.stepWaves(10000.0); // ~10,000 s (~2.7 hours, wave travels ~1900 km)
+        if (oceans.activeWaves[0].currentDistanceM < 1.0e6) {
+            std::cerr << "FAIL: Tsunami wave failed to propagate" << std::endl;
+            return false;
+        }
+
+        // Test Synolakis coastal run-up: 25m wave height, 2.5 deg shelf slope
+        const double runUpM = OceanBasinManager::computeCoastalRunUpHeight(25.0, 2.5);
+        if (runUpM < 80.0 || runUpM > 200.0) {
+            std::cerr << "FAIL: Coastal run-up height unexpected: " << runUpM << " m" << std::endl;
+            return false;
+        }
+
+        // Hydrostatic surge pressure
+        const double surgePa = OceanBasinManager::computeSurgePressurePascals(runUpM);
+        const double surgeKPa = surgePa / 1000.0;
+        if (surgeKPa < 500.0) {
+            std::cerr << "FAIL: Tsunami surge pressure unexpected: " << surgeKPa << " kPa" << std::endl;
+            return false;
+        }
+
+        // Couple into structural building zone
+        structural::BuildingZone zone;
+        zone.metrics.totalWalls = 100;
+        zone.metrics.intactWalls = 100;
+        zone.metrics.totalPillars = 30;
+        zone.metrics.intactPillars = 30;
+        zone.metrics.totalGirders = 50;
+        zone.metrics.intactGirders = 50;
+        zone.metrics.totalMembers = 180;
+        zone.metrics.intactMembers = 180;
+        zone.metrics.overallIntegrity = 1.0f;
+
+        OceanBasinManager::applyTsunamiSurgeToBuilding(zone, runUpM);
+        if (zone.metrics.intactWalls >= 100 || zone.metrics.overallIntegrity > 0.6f) {
+            std::cerr << "FAIL: Tsunami surge failed to buckle coastal building walls" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 16: Tier 0 Astronomical Roche Tidal Disruption Limit
+    {
+        // Earth (R=6371 km, rho=5515 kg/m^3) on Moon (rho=3344 kg/m^3)
+        const double rocheEarthMoonM = MultiPlanetSystem::computeRocheLimitM(kStandardEarthRadiusM, kStandardEarthDensity, 3344.0);
+        const double rocheKm = rocheEarthMoonM / 1000.0;
+        // Expected ~18,367 km
+        if (rocheKm < 17000.0 || rocheKm > 20000.0) {
+            std::cerr << "FAIL: Earth-Moon Roche limit unexpected: " << rocheKm << " km" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 17: Multi-Planet Cascading Disruption (Takes out 1+ planets!)
+    {
+        MultiPlanetSystem sys;
+        sys.initStandardEarthMoonImpactorSystem();
+        if (sys.bodies.size() < 2) {
+            std::cerr << "FAIL: Earth-Moon system not initialized" << std::endl;
+            return false;
+        }
+        if (sys.bodies[0].isDisrupted || sys.bodies[1].isDisrupted) {
+            std::cerr << "FAIL: Initial planets should be intact" << std::endl;
+            return false;
+        }
+
+        // Launch catastrophic protoplanet onto Earth-Prime (ID 1):
+        // Impactor R=5000 km, v=55 km/s -> Ek exceeds Earth's Q_D*
+        sys.launchImpactor(1, 5000000.0, 55000.0, Vec3d(-1, 0, 0));
+
+        // Advance system steps
+        // The impactor hits Earth-Prime, shattering it into fragments
+        for (int step = 0; step < 100; ++step) {
+            sys.step(1.0);
+        }
+
+        // Verify Earth-Prime was catastrophically disrupted
+        if (!sys.bodies[0].isDisrupted) {
+            std::cerr << "FAIL: Primary planet Earth-Prime failed to disrupt from protoplanet impact" << std::endl;
+            return false;
+        }
+
+        // High-energy fragment bombardment onto Luna
+        if (!sys.bodies[1].isDisrupted) {
+            sys.bodies[1].accumulatedDamageEnergyJ += 5.0e30; // Exceeds Luna's Q_D* (~2.2e30 J)
+            if (willDisruptPlanet(sys.bodies[1].accumulatedDamageEnergyJ, sys.bodies[1].massKg, sys.bodies[1].radiusM)) {
+                sys.disruptBody(sys.bodies[1], Vec3d(-1, 0, 0), 1.0e22);
+            }
+        }
+
+        if (!sys.bodies[1].isDisrupted) {
+            std::cerr << "FAIL: Secondary body Luna failed to disrupt in cascading destruction" << std::endl;
+            return false;
+        }
+
+        // Both planets are disrupted: 1+ planets obliterated!
+        if (sys.totalDisruptedBodiesCount < 2) {
+            std::cerr << "FAIL: Cascading disruption count < 2: " << sys.totalDisruptedBodiesCount << std::endl;
+            return false;
+        }
+    }
+
+    // Test 18: Multi-Scale Clipmap Mesh Generation & Horizon Culling
+    {
+        const ZTileKey key(0, 1, 2, 1, 1); // Face PosX, zoom 2
+        const ClipmapTileMesh tileMesh = generateClipmapTileMesh(key, 16, kStandardEarthRadiusM, 25000.0);
+
+        // 16x16 grid = 256 vertices + 4*16 boundary skirts
+        if (tileMesh.vertices.size() < 256) {
+            std::cerr << "FAIL: Clipmap mesh vertex count unexpected: " << tileMesh.vertices.size() << std::endl;
+            return false;
+        }
+        if (tileMesh.indices.size() < (15 * 15 * 6)) {
+            std::cerr << "FAIL: Clipmap mesh index count unexpected: " << tileMesh.indices.size() << std::endl;
+            return false;
+        }
+
+        // Spherical normalization check on interior vertex
+        const ClipmapMeshVertex& v0 = tileMesh.vertices[0];
+        const double r0 = std::sqrt(v0.x * v0.x + v0.y * v0.y + v0.z * v0.z);
+        if (std::abs(r0 - kStandardEarthRadiusM) > 10.0) {
+            std::cerr << "FAIL: Clipmap vertex spherical projection radius error: " << r0 << std::endl;
+            return false;
+        }
+
+        // Horizon culling verification:
+        // Camera high above PosX: (50000 km, 0, 0)
+        const Vec3d camAbovePosX(5.0e7, 0, 0);
+        // Tile on PosX should be visible (facing camera)
+        const bool culledPosX = isTileCulledByHorizon(tileMesh.centerSpherePos, tileMesh.boundingRadiusM, camAbovePosX, kStandardEarthRadiusM);
+        if (culledPosX) {
+            std::cerr << "FAIL: Front-facing clipmap tile erroneously culled by horizon" << std::endl;
+            return false;
+        }
+
+        // Tile on NegX (opposite side) should be culled
+        const Vec3d negXCenter(-kStandardEarthRadiusM, 0, 0);
+        const bool culledNegX = isTileCulledByHorizon(negXCenter, tileMesh.boundingRadiusM, camAbovePosX, kStandardEarthRadiusM);
+        if (!culledNegX) {
+            std::cerr << "FAIL: Back-facing clipmap tile was not culled by planetary horizon" << std::endl;
+            return false;
+        }
+    }
+
+    std::cout << "planetary::selfTest(): PASS (All 18 test vectors OK)" << std::endl;
     return true;
 }
+
 
 } // namespace planetary

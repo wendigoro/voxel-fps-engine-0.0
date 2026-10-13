@@ -89,6 +89,103 @@ enum class CrustMaterial : uint8_t {
     WaterLiquid         = 9
 };
 
+// Z-Tile Key uniquely identifying a tile in the 6-face Cubed-Sphere Shell Pyramid
+struct ZTileKey {
+    uint8_t  face  = 0; // CubeFace: 0..5
+    uint8_t  shell = 1; // PlanetaryShell: 0..3 (Default: 1 = Crust)
+    uint8_t  zoom  = 0; // 0..32
+    uint32_t x     = 0; // 0 .. 2^zoom - 1
+    uint32_t y     = 0; // 0 .. 2^zoom - 1
+
+    ZTileKey() = default;
+    constexpr ZTileKey(uint8_t f, uint8_t sh, uint8_t z, uint32_t x_, uint32_t y_)
+        : face(f), shell(sh), zoom(z), x(x_), y(y_) {}
+
+    bool operator==(const ZTileKey& o) const {
+        return face == o.face && shell == o.shell && zoom == o.zoom && x == o.x && y == o.y;
+    }
+
+    bool operator!=(const ZTileKey& o) const {
+        return !(*this == o);
+    }
+
+    // 64-bit compact packed representation:
+    // [face: 3 bits][shell: 3 bits][zoom: 6 bits][x: 26 bits][y: 26 bits]
+    uint64_t packCompact() const {
+        return (static_cast<uint64_t>(face & 0x07) << 61) |
+               (static_cast<uint64_t>(shell & 0x07) << 58) |
+               (static_cast<uint64_t>(zoom & 0x3F) << 52) |
+               (static_cast<uint64_t>(x & 0x03FFFFFF) << 26) |
+               (static_cast<uint64_t>(y & 0x03FFFFFF));
+    }
+
+    static ZTileKey unpackCompact(uint64_t v) {
+        ZTileKey k;
+        k.face  = static_cast<uint8_t>((v >> 61) & 0x07);
+        k.shell = static_cast<uint8_t>((v >> 58) & 0x07);
+        k.zoom  = static_cast<uint8_t>((v >> 52) & 0x3F);
+        k.x     = static_cast<uint32_t>((v >> 26) & 0x03FFFFFF);
+        k.y     = static_cast<uint32_t>(v & 0x03FFFFFF);
+        return k;
+    }
+
+    // Hilbert curve 1D tile ID (Poached from Scout/Dell PlanetTileStore.java)
+    // Generates a monotonically increasing 1D sequential index along a Hilbert curve.
+    uint64_t toHilbertId() const {
+        uint64_t acc = 0;
+        for (uint8_t i = 0; i < zoom; ++i) {
+            acc += (1ULL << (2 * i));
+        }
+        uint64_t d = 0;
+        uint64_t tx = x;
+        uint64_t ty = y;
+        for (uint64_t s = (zoom > 0 ? (1ULL << (zoom - 1)) : 0); s > 0; s >>= 1) {
+            const uint64_t rx = (tx & s) > 0 ? 1 : 0;
+            const uint64_t ry = (ty & s) > 0 ? 1 : 0;
+            d += s * s * ((3 * rx) ^ ry);
+            if (ry == 0) {
+                if (rx == 1) {
+                    tx = s - 1 - tx;
+                    ty = s - 1 - ty;
+                }
+                const uint64_t tmp = tx;
+                tx = ty;
+                ty = tmp;
+            }
+        }
+        return acc + d;
+    }
+
+    // Invert Hilbert index back to 2D (x, y) for a given zoom level
+    static void fromHilbertId(uint8_t z, uint64_t hilbertVal, uint32_t& outX, uint32_t& outY) {
+        uint64_t acc = 0;
+        for (uint8_t i = 0; i < z; ++i) {
+            acc += (1ULL << (2 * i));
+        }
+        uint64_t t = (hilbertVal >= acc) ? (hilbertVal - acc) : 0;
+        uint64_t tx = 0, ty = 0;
+        for (uint64_t s = 1; s < (1ULL << z); s <<= 1) {
+            const uint64_t rx = 1 & (t / 2);
+            const uint64_t ry = 1 & (t ^ rx);
+            if (ry == 0) {
+                if (rx == 1) {
+                    tx = s - 1 - tx;
+                    ty = s - 1 - ty;
+                }
+                const uint64_t tmp = tx;
+                tx = ty;
+                ty = tmp;
+            }
+            tx += s * rx;
+            ty += s * ry;
+            t /= 4;
+        }
+        outX = static_cast<uint32_t>(tx);
+        outY = static_cast<uint32_t>(ty);
+    }
+};
+
+
 // 3D Cartesian Vector in Planetary-Centered Inertial Frame (meters)
 struct Vec3d {
     double x = 0.0;

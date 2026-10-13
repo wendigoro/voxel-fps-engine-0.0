@@ -438,6 +438,7 @@ static float g_charLocomotionPhase = 0.0f;
 static Vec3 g_playerPosPrevTick{};
 static bool g_forceWeaponHold = true;
 static structural::MatrixSystem g_structuralMatrix;
+static planetary::MultiPlanetSystem g_multiPlanetSystem;
 static anim::AnimController g_animController;
 static anim::PoseSample g_currentAnimPose;
 static float g_animAuthoredWeight = 0.85f;
@@ -7815,7 +7816,33 @@ static void handleEditorAction(const std::string& actionJson) {
         }
     } else if (type == "SET_WEAPON_HOLD") {
         g_forceWeaponHold = jsonExtractBool(actionJson, "holding", true);
-    } else if (type == "RECALC_STRUCTURAL_INTEGRITY") {
+    } else if (type == "TRIGGER_PLANETARY_IMPACT") {
+        const uint32_t targetId = static_cast<uint32_t>(jsonExtractFloat(actionJson, "targetId", 1.0f));
+        const double radiusM = static_cast<double>(jsonExtractFloat(actionJson, "radiusM", 4500000.0f));
+        const double speedMps = static_cast<double>(jsonExtractFloat(actionJson, "speedMps", 50000.0f));
+        g_multiPlanetSystem.launchImpactor(targetId, radiusM, speedMps);
+    } else if (type == "RESET_PLANETARY_SIM") {
+        g_multiPlanetSystem.initStandardEarthMoonImpactorSystem();
+    } else if (type == "STEP_PLANETARY_SIM") {
+        const double dt = static_cast<double>(jsonExtractFloat(actionJson, "dt", 1.0f));
+        g_multiPlanetSystem.step(dt);
+    } else if (type == "ROLL_CONTAINER_LOOT") {
+        const std::string contStr = jsonExtractString(actionJson, "container", "WeaponLocker");
+        loot::ContainerType contType = loot::ContainerType::WeaponLocker;
+        if (contStr == "WallSafe") contType = loot::ContainerType::WallSafe;
+        else if (contStr == "MilitaryFootlocker") contType = loot::ContainerType::MilitaryFootlocker;
+        else if (contStr == "ScrapBin") contType = loot::ContainerType::ScrapBin;
+        else if (contStr == "CovertDeadDrop") contType = loot::ContainerType::CovertDeadDrop;
+        else if (contStr == "MedicalCabinet") contType = loot::ContainerType::MedicalCabinet;
+        
+        static uint64_t s_lootSeed = 1337;
+        const auto drops = loot::openContainer(contType, s_lootSeed++);
+        for (const auto& item : drops) {
+            std::cout << "[IPC] Rolled container loot drop: " << item.name << " (" << loot::tierToString(item.tier) << ")" << std::endl;
+        }
+    }
+ else if (type == "RECALC_STRUCTURAL_INTEGRITY") {
+
         if (g_world) {
             g_structuralMatrix.evaluateAll(*g_world);
         }
@@ -9343,6 +9370,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         g_world = &world;
         spawnPlayerOnMap(world);
         g_structuralMatrix.initDefaultZones(world);
+        g_multiPlanetSystem.initStandardEarthMoonImpactorSystem();
 
         // The view's chunk list. It starts empty of world knowledge: every
         // cell in it arrives via sendChunkSnapshot() below.
@@ -9583,6 +9611,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                         snap += "\"duration\":" + std::to_string(clipDur) + ",\"isPlaying\":" + (g_animController.isPlaying ? "true" : "false") + ",";
                         snap += "\"weight\":" + std::to_string(g_animAuthoredWeight) + "},";
                     }
+                    snap += "\"planetary\":" + g_multiPlanetSystem.toJson() + ",";
                     std::string vpJson = g_visReg.toJson();
                     while (!vpJson.empty() && (vpJson.back() == '\n' || vpJson.back() == '\r' || vpJson.back() == ' ')) {
                         vpJson.pop_back();
