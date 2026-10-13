@@ -54,6 +54,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "structural_matrix.hpp"
 #include "anim_clip.hpp"
 #include "planetary/ztile_pyramid.hpp"
+#include "loot_system.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -9620,6 +9621,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const bool structuralOk = g_structuralMatrix.selfTest(world);
             const bool animClipsOk = anim::selfTest();
             const bool planetaryOk = planetary::selfTest();
+            const bool lootTablesOk = loot::selfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -9977,6 +9979,7 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nstructural_integrity_ok=" << (structuralOk ? 1 : 0)
                 << "\nanim_clips_ok=" << (animClipsOk ? 1 : 0)
                 << "\nplanetary_ok=" << (planetaryOk ? 1 : 0)
+                << "\nloot_tables_ok=" << (lootTablesOk ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -10087,6 +10090,10 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             // Cubed-sphere round-trip, Hilbert curve, octave voxel scaling, data stripping, Q_D* physics.
             // Exit 15 keeps CI triage separate.
             if (!planetaryOk) { cleanup(); return 15; }
+            // Cascading loot drop and container filtering system contract:
+            // Top-down tier cascade, container profile filtering, catalog completeness, and deterministic seeding.
+            // Exit 16 keeps CI triage separate.
+            if (!lootTablesOk) { cleanup(); return 16; }
         }
     } catch (const std::exception& e) {
         // Every automated run here is headless -- smoke, stress, capture, export --
