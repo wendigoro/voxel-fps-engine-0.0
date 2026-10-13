@@ -5,6 +5,9 @@
 // Governed by RULES.md: Authoritative on the simulation side, zero view-state feedback.
 
 #include "planetary_types.hpp"
+#include "plate_zones.hpp"
+#include "planetary_sim.hpp"
+#include "planetary_render.hpp"
 
 #include <cstdint>
 #include <cmath>
@@ -466,7 +469,177 @@ inline bool selfTest() {
         }
     }
 
-    std::cout << "planetary::selfTest(): PASS (All 6 test vectors OK)" << std::endl;
+    // Test 7: Tectonic Plate Graph & Seismic Shock Rupture
+    {
+        TectonicPlateGraph plates(kStandardEarthRadiusM);
+        if (plates.plates.size() < 8) {
+            std::cerr << "FAIL: Tectonic plates not initialized properly" << std::endl;
+            return false;
+        }
+        // Test plate lookup on North Pole (PosY) -> North American or Eurasian
+        const uint8_t polePlate = plates.getPlateAt(Vec3d(0, 1, 0));
+        if (polePlate != 1 && polePlate != 2) {
+            std::cerr << "FAIL: Pole plate unexpected: " << static_cast<int>(polePlate) << std::endl;
+            return false;
+        }
+
+        // Apply hypervelocity impact (e.g. 5.0e26 J)
+        const Vec3d epic(0, 0, kStandardEarthRadiusM); // PosZ
+        plates.applySeismicImpactShock(epic, 5.0e26);
+
+        // At least one plate should rupture and fault boundaries should be stressed
+        bool anyRupture = false;
+        for (const auto& p : plates.plates) {
+            if (p.isRuptured) { anyRupture = true; break; }
+        }
+        if (!anyRupture) {
+            std::cerr << "FAIL: High-energy seismic shock failed to rupture any tectonic plate" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 8: MVT Data Stripper Layer Filtering Contract
+    {
+        MvtDataStripper stripper;
+        // At macro zoom Z=10
+        if (stripper.filterLayer("roads", 10)) {
+            std::cerr << "FAIL: Stripper failed to strip roads at Z=10" << std::endl;
+            return false;
+        }
+        if (stripper.filterLayer("buildings", 10)) {
+            std::cerr << "FAIL: Stripper failed to strip buildings at Z=10" << std::endl;
+            return false;
+        }
+        if (stripper.filterLayer("foliage", 10)) {
+            std::cerr << "FAIL: Stripper failed to strip foliage at Z=10" << std::endl;
+            return false;
+        }
+        if (!stripper.filterLayer("landuse", 10)) {
+            std::cerr << "FAIL: Stripper erroneously stripped landuse at Z=10" << std::endl;
+            return false;
+        }
+        if (!stripper.filterLayer("water", 10)) {
+            std::cerr << "FAIL: Stripper erroneously stripped water at Z=10" << std::endl;
+            return false;
+        }
+        if (stripper.roadsStripped == 0 || stripper.buildingsStripped == 0 || stripper.biomesPreserved == 0) {
+            std::cerr << "FAIL: Stripper counter accounting mismatch" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 9: Hugoniot Shockwave Equation of State
+    {
+        float us = 0, p = 0;
+        computeHugoniotShock(CrustMaterial::GraniteContinental, 4000.0f, us, p);
+        // Us = C0 + s*Up = 3680 + 1.24 * 4000 = 8640 m/s
+        if (std::abs(us - 8640.0f) > 50.0f) {
+            std::cerr << "FAIL: Hugoniot shock speed unexpected: " << us << " m/s" << std::endl;
+            return false;
+        }
+        // P = 2650 * 8640 * 4000 / 1e9 ~ 91.58 GPa (exceeds 45 GPa melt threshold)
+        if (p < 80.0f || p > 105.0f) {
+            std::cerr << "FAIL: Hugoniot shock pressure unexpected: " << p << " GPa" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 10: Schmidt-Holsapple Crater Scaling
+    {
+        // 10 km asteroid at 25 km/s
+        const CraterDimensions crater = calculateCraterScaling(5000.0, 25000.0);
+        // Expect transient diameter ~ 80 - 150 km
+        if (crater.transientDiameterM < 50000.0 || crater.transientDiameterM > 250000.0) {
+            std::cerr << "FAIL: Crater transient diameter unexpected: " << crater.transientDiameterM << " m" << std::endl;
+            return false;
+        }
+        if (crater.transientDepthM < crater.transientDiameterM * 0.25 ||
+            crater.transientDepthM > crater.transientDiameterM * 0.40) {
+            std::cerr << "FAIL: Crater depth-to-diameter ratio out of bounds: " << crater.transientDepthM << std::endl;
+            return false;
+        }
+        if (crater.meltVolumeKm3 <= 0.0 || crater.vaporVolumeKm3 <= 0.0) {
+            std::cerr << "FAIL: Crater melt/vapor volumes non-positive" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 11: Antipodal Focusing Convergence & Amplification
+    {
+        const Vec3d impact(0, 0, kStandardEarthRadiusM);
+        const AntipodalFocusResult af = computeAntipodalFocus(impact, 2.0e26);
+        // Antipodal point should be -Z
+        if (std::abs(af.antipodalPoint.x) > 1e-3 || std::abs(af.antipodalPoint.y) > 1e-3 ||
+            std::abs(af.antipodalPoint.z - (-kStandardEarthRadiusM)) > 1.0) {
+            std::cerr << "FAIL: Antipodal point incorrect" << std::endl;
+            return false;
+        }
+        // Should have high focused acceleration and trigger blowout
+        if (af.groundAccelerationG < 2.0 || !af.extensionalCrustBlowout) {
+            std::cerr << "FAIL: Antipodal focusing failed to compute expected blowout" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 12: Catastrophic Disruption SPH / N-Body Orbital Simulation
+    {
+        PlanetaryDisruptionSim sim(kStandardEarthRadiusM, kStandardEarthMassKg);
+        // Impact with super-disruptive energy (colliding planetary body: R=4500km, v=50km/s -> Ek ~ 1.9e33 J > Q_D*)
+        sim.applyImpact(Vec3d(0, 1, 0), 4500000.0, 50000.0, 4000.0);
+        if (!sim.planetDisrupted) {
+            std::cerr << "FAIL: Protoplanetary impact failed to disrupt planet" << std::endl;
+            return false;
+        }
+        if (sim.fragments.size() != 32) {
+            std::cerr << "FAIL: Fragment count unexpected: " << sim.fragments.size() << std::endl;
+            return false;
+        }
+        // Step orbital dynamics for 60 seconds
+        const Vec3d initialPos1 = sim.fragments[1].positionM;
+        sim.stepOrbitalDynamics(60.0);
+        const Vec3d newPos1 = sim.fragments[1].positionM;
+        if ((newPos1 - initialPos1).length() < 1000.0) {
+            std::cerr << "FAIL: Orbital fragments failed to advance positions in orbit" << std::endl;
+            return false;
+        }
+        // Verify view snapshot extraction
+        const PlanetaryViewSnapshot snap = extractPlanetarySnapshot(sim);
+        if (!snap.isDisrupted || snap.orbitalShards.size() != 32) {
+            std::cerr << "FAIL: Planetary view snapshot extraction mismatch" << std::endl;
+            return false;
+        }
+    }
+
+    // Test 13: Seismic Ground Motion Coupling to Building Matrix
+    {
+        structural::BuildingZone zone;
+        zone.initWalls = 100;
+        zone.initGirders = 50;
+        zone.initPillars = 20;
+        zone.metrics.totalWalls = 100;
+        zone.metrics.intactWalls = 100;
+        zone.metrics.totalGirders = 50;
+        zone.metrics.intactGirders = 50;
+        zone.metrics.totalPillars = 20;
+        zone.metrics.intactPillars = 20;
+        zone.metrics.totalMembers = 170;
+        zone.metrics.intactMembers = 170;
+        zone.metrics.overallIntegrity = 1.0f;
+
+        const int initialWalls = zone.metrics.intactWalls;
+        // Apply severe seismic ground motion (0.95g PGA)
+        applySeismicGroundMotionToBuilding(zone, 0.95f, 8.0f);
+        if (zone.metrics.intactWalls >= initialWalls) {
+            std::cerr << "FAIL: Seismic ground motion failed to damage building walls" << std::endl;
+            return false;
+        }
+        if (zone.metrics.stressFactor <= 0.0f) {
+            std::cerr << "FAIL: Seismic ground motion produced non-positive stress" << std::endl;
+            return false;
+        }
+    }
+
+    std::cout << "planetary::selfTest(): PASS (All 13 test vectors OK)" << std::endl;
     return true;
 }
 
