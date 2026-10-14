@@ -534,6 +534,10 @@ static mapvox::Environment g_mapEnvironment;
 static std::vector<mapvox::PickupPlacement> g_mapPickups;
 static std::string g_mapPath; // file the world was loaded from (empty = procedural)
 static int g_mapPrefabsStamped = 0;
+// The prefab instances currently in the world: the map's own list plus any the
+// editor stamps. `g_mapPrefabsStamped` is the same population; the list is what
+// the editor scene hierarchy reads back.
+static std::vector<mapvox::PrefabPlacement> g_mapPrefabInstances;
 // --map <path>: load this map instead of the default warehouse_v1. Empty means
 // the default search list.
 static std::string g_mapOverridePath;
@@ -6820,7 +6824,11 @@ static void buildUiFrame() {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    if (g_paused || g_menuForced) {
+    // In editor mode the WebView2 panel replaces the Dear ImGui tooling (RFC
+    // "Execution Modes": editor => Dear ImGui disabled), so the pause menu and
+    // its Visuals/Keybinds panels are suppressed there. The viewport overlays
+    // (inventory, pickup prompt) are unaffected.
+    if ((g_paused || g_menuForced) && !g_editorMode) {
         const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
         ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(460.0f, 520.0f), ImGuiCond_Always);
@@ -7634,9 +7642,11 @@ static bool reloadMapFile(const std::string& path) {
     *g_world = makeEmptyWorld();
     mapvox::stampMapVox(mapDoc, *g_world, 0, 0, 0);
     g_mapPrefabsStamped = 0;
+    g_mapPrefabInstances.clear();
     for (const auto& pf : mapDoc.prefabs) {
         if (stampPrefabById(pf.id, *g_world, pf.x, pf.y, pf.z, pf.rot)) {
             ++g_mapPrefabsStamped;
+            g_mapPrefabInstances.push_back(pf);
         }
     }
     g_mapTerrain = mapDoc.terrain;
@@ -7706,6 +7716,184 @@ static void launchJavaPainterAsync() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Editor transactions (RFC "Sim/View Boundary" 5.1 / roadmap E.5).
+//
+// Every editor mutation of occupancy -- a paint, a carve, a prefab stamp -- is
+// recorded as one reversible transaction. The transaction holds the before and
+// after of each cell it touched; undo/redo replay those cells. The write itself
+// goes through sim::World::set/setAppearance, so the chunk-version mechanism the
+// view already uses still dirties exactly the meshes that changed -- the editor
+// authors occupancy, it does not bypass the authoritative grid (RULES.md,
+// "Authority and the view/sim split"). The editor runs only under --mode editor,
+// so none of this is reachable from the deterministic smoke/stress paths.
+// -----------------------------------------------------------------------------
+
+struct EditorCellEdit {
+    int x = 0, y = 0, z = 0;
+    sim::Block beforeBlock = sim::Block::Air;
+    uint8_t beforeAppearance = 0;
+    sim::Block afterBlock = sim::Block::Air;
+    uint8_t afterAppearance = 0;
+};
+
+struct EditorTransaction {
+    std::string label;
+    std::vector<EditorCellEdit> edits;
+};
+
+static constexpr size_t kEditorHistoryMax = 256;
+static std::vector<EditorTransaction> g_editorUndo;
+static std::vector<EditorTransaction> g_editorRedo;
+static bool g_editorRecording = false;             // capture writes while true
+static std::vector<EditorCellEdit> g_editorRecorded;
+
+static void applyEditorCell(const EditorCellEdit& e, bool forward) {
+    if (!g_world || !sim::World::inBounds(e.x, e.y, e.z)) return;
+    g_world->set(e.x, e.y, e.z, forward ? e.afterBlock : e.beforeBlock);
+    g_world->setAppearance(e.x, e.y, e.z, forward ? e.afterAppearance : e.beforeAppearance);
+}
+
+static void editorBeginRecord() {
+    g_editorRecorded.clear();
+    g_editorRecording = true;
+}
+
+static void editorNoteCell(const EditorCellEdit& e) {
+    if (g_editorRecording) g_editorRecorded.push_back(e);
+}
+
+// Apply one cell inside the open transaction. An edit that changes nothing is a
+// no-op and is not recorded, so a click with no effect leaves no undo step.
+static bool editorSetCell(int x, int y, int z, sim::Block block, uint8_t appearance) {
+    if (!g_world || !sim::World::inBounds(x, y, z)) return false;
+    EditorCellEdit e;
+    e.x = x; e.y = y; e.z = z;
+    e.beforeBlock = g_world->get(x, y, z);
+    e.beforeAppearance = g_world->getAppearance(x, y, z);
+    e.afterBlock = block;
+    e.afterAppearance = appearance;
+    if (e.beforeBlock == e.afterBlock && e.beforeAppearance == e.afterAppearance) return false;
+    applyEditorCell(e, true);
+    editorNoteCell(e);
+    return true;
+}
+
+// Close the open recording buffer as a single undoable step.
+static void editorCommit(const char* label) {
+    g_editorRecording = false;
+    if (g_editorRecorded.empty()) return;
+    EditorTransaction tx;
+    tx.label = label ? label : "Edit";
+    tx.edits = std::move(g_editorRecorded);
+    g_editorRecorded.clear();
+    g_editorUndo.push_back(std::move(tx));
+    if (g_editorUndo.size() > kEditorHistoryMax) g_editorUndo.erase(g_editorUndo.begin());
+    g_editorRedo.clear();
+    g_meshDirty = true;
+}
+
+static void editorDiscardRecording() {
+    g_editorRecording = false;
+    g_editorRecorded.clear();
+}
+
+static void editorUndo() {
+    if (g_editorUndo.empty()) return;
+    EditorTransaction tx = std::move(g_editorUndo.back());
+    g_editorUndo.pop_back();
+    for (auto it = tx.edits.rbegin(); it != tx.edits.rend(); ++it) applyEditorCell(*it, false);
+    g_editorRedo.push_back(std::move(tx));
+    g_meshDirty = true;
+}
+
+static void editorRedo() {
+    if (g_editorRedo.empty()) return;
+    EditorTransaction tx = std::move(g_editorRedo.back());
+    g_editorRedo.pop_back();
+    for (const EditorCellEdit& e : tx.edits) applyEditorCell(e, true);
+    g_editorUndo.push_back(std::move(tx));
+    g_meshDirty = true;
+}
+
+// Stamp a prefab as one undoable transaction. The document is loaded once, both
+// to stamp it and to bound the before/after capture to its own footprint (the
+// turn keeps the footprint inside max(sx, sz) on both axes), so the diff touches
+// no cell the stamp could not have written.
+static bool editorStampPrefab(const std::string& id, int x, int y, int z, int rot) {
+    if (!g_world || id.empty()) return false;
+    mapvox::Doc pd;
+    bool found = false;
+    for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                  g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+        if (mapvox::loadAssetVox(dir + id + ".vox.json", pd)) { found = true; break; }
+    }
+    if (!found) return false;
+
+    const int spanXZ = std::max(pd.sx, pd.sz);
+    const int x0 = std::clamp(x, 0, WORLD_W - 1), x1 = std::clamp(x + spanXZ, 0, WORLD_W - 1);
+    const int y0 = std::clamp(y, 0, WORLD_H - 1), y1 = std::clamp(y + pd.sy, 0, WORLD_H - 1);
+    const int z0 = std::clamp(z, 0, WORLD_D - 1), z1 = std::clamp(z + spanXZ, 0, WORLD_D - 1);
+
+    struct CellState { sim::Block b; uint8_t a; };
+    std::vector<CellState> before;
+    before.reserve(static_cast<size_t>(x1 - x0 + 1) * static_cast<size_t>(y1 - y0 + 1) *
+                   static_cast<size_t>(z1 - z0 + 1));
+    for (int yy = y0; yy <= y1; ++yy)
+        for (int zz = z0; zz <= z1; ++zz)
+            for (int xx = x0; xx <= x1; ++xx)
+                before.push_back({g_world->get(xx, yy, zz), g_world->getAppearance(xx, yy, zz)});
+
+    editorBeginRecord();
+    const mapvox::StampResult r = mapvox::stampMapVox(pd, *g_world, x, y, z, rot, false);
+
+    size_t i = 0;
+    for (int yy = y0; yy <= y1; ++yy) {
+        for (int zz = z0; zz <= z1; ++zz) {
+            for (int xx = x0; xx <= x1; ++xx, ++i) {
+                const sim::Block nb = g_world->get(xx, yy, zz);
+                const uint8_t na = g_world->getAppearance(xx, yy, zz);
+                if (nb == before[i].b && na == before[i].a) continue;
+                EditorCellEdit e;
+                e.x = xx; e.y = yy; e.z = zz;
+                e.beforeBlock = before[i].b; e.beforeAppearance = before[i].a;
+                e.afterBlock = nb; e.afterAppearance = na;
+                editorNoteCell(e);
+            }
+        }
+    }
+    if (r.written == 0 && g_editorRecorded.empty()) {
+        editorDiscardRecording();
+        return false;
+    }
+    g_mapPrefabInstances.push_back({id, x, y, z, rot});
+    ++g_mapPrefabsStamped;
+    return true;
+}
+
+// Prefab ids available to the editor, scanned from the same directories the
+// stamp path searches. Names are unique and sorted so the UI list is stable.
+static std::vector<std::string> scanPrefabIds() {
+    std::vector<std::string> ids;
+    const std::string suffix = ".vox.json";
+    for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                  g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = FindFirstFileA((dir + "*.vox.json").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            const std::string name = fd.cFileName;
+            if (name.size() <= suffix.size() ||
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+            const std::string id = name.substr(0, name.size() - suffix.size());
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
 static void handleEditorAction(const std::string& actionJson) {
     std::string type = jsonExtractString(actionJson, "type");
     if (type.empty()) return;
@@ -7744,19 +7932,43 @@ static void handleEditorAction(const std::string& actionJson) {
         int z = static_cast<int>(jsonExtractFloat(actionJson, "z", -1.0f));
         int b = static_cast<int>(jsonExtractFloat(actionJson, "block", 2.0f));
         int p = static_cast<int>(jsonExtractFloat(actionJson, "paletteIndex", 0.0f));
-        if (g_world && sim::World::inBounds(x, y, z)) {
-            g_world->set(x, y, z, static_cast<sim::Block>(b));
-            if (p != 0) g_world->setAppearance(x, y, z, static_cast<uint8_t>(p));
-            g_meshDirty = true;
-        }
+        editorBeginRecord();
+        if (editorSetCell(x, y, z, static_cast<sim::Block>(b), static_cast<uint8_t>(p)))
+            editorCommit("Paint voxel");
+        else
+            editorDiscardRecording();
     } else if (type == "DELETE_VOXEL") {
         int x = static_cast<int>(jsonExtractFloat(actionJson, "x", -1.0f));
         int y = static_cast<int>(jsonExtractFloat(actionJson, "y", -1.0f));
         int z = static_cast<int>(jsonExtractFloat(actionJson, "z", -1.0f));
-        if (g_world && sim::World::inBounds(x, y, z)) {
-            g_world->set(x, y, z, sim::Block::Air);
-            g_meshDirty = true;
+        editorBeginRecord();
+        if (editorSetCell(x, y, z, sim::Block::Air, 0))
+            editorCommit("Carve voxel");
+        else
+            editorDiscardRecording();
+    } else if (type == "PREFAB_STAMP") {
+        const std::string id = jsonExtractString(actionJson, "id");
+        const int rot = static_cast<int>(jsonExtractFloat(actionJson, "rot", 0.0f));
+        int x = 0, y = 0, z = 0;
+        if (jsonxHasKey(actionJson, "x") && jsonxHasKey(actionJson, "y") && jsonxHasKey(actionJson, "z")) {
+            x = static_cast<int>(jsonExtractFloat(actionJson, "x", 0.0f));
+            y = static_cast<int>(jsonExtractFloat(actionJson, "y", 0.0f));
+            z = static_cast<int>(jsonExtractFloat(actionJson, "z", 0.0f));
+        } else {
+            // No cell named: place at the crosshair's adjacent cell, the same
+            // cell the paint tool's "place adjacent" targets.
+            const PickResult pick = raycastVoxel(g_camPos, cameraForward(), 40.0f);
+            if (!pick.hit) return;
+            x = pick.adjX; y = pick.adjY; z = pick.adjZ;
         }
+        if (editorStampPrefab(id, x, y, z, rot))
+            editorCommit("Stamp prefab");
+        else
+            editorDiscardRecording();
+    } else if (type == "UNDO") {
+        editorUndo();
+    } else if (type == "REDO") {
+        editorRedo();
     } else if (type == "RELOAD_MAP") {
         reloadMapFile(g_mapPath);
     } else if (type == "LAUNCH_JAVA_PAINTER") {
@@ -9325,10 +9537,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     mapvox::stampMapVox(mapDoc, world, 0, 0, 0);
                     // Prefab instances: data/prefabs/<id>.vox.json, stamped in
                     // list order (a later prefab overwrites an earlier one).
+                    g_mapPrefabInstances.clear();
                     for (const auto& pf : mapDoc.prefabs) {
                         if (!stampPrefabById(pf.id, world, pf.x, pf.y, pf.z, pf.rot))
                             fail("map " + path + ": prefab \"" + pf.id + "\" not found or invalid");
                         ++g_mapPrefabsStamped;
+                        g_mapPrefabInstances.push_back(pf);
                     }
                     // Terrain, after the authored map and its prefabs: the
                     // generator fills only Air, so it lands around structure
@@ -9617,7 +9831,43 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     while (!vpJson.empty() && (vpJson.back() == '\n' || vpJson.back() == '\r' || vpJson.back() == ' ')) {
                         vpJson.pop_back();
                     }
-                    snap += "\"visualParams\":" + vpJson;
+                    snap += "\"visualParams\":" + vpJson + ",";
+                    snap += "\"undoDepth\":" + std::to_string(g_editorUndo.size()) + ",";
+                    snap += "\"redoDepth\":" + std::to_string(g_editorRedo.size()) + ",";
+                    {
+                        // Editor scene hierarchy + prefab catalogue. Read-only
+                        // view data: the sim owns the world, this is a summary
+                        // the UI draws (RFC E.4 "Scene Hierarchy block").
+                        const std::vector<std::string> prefabIds = scanPrefabIds();
+                        snap += "\"prefabs\":[";
+                        for (size_t i = 0; i < prefabIds.size(); ++i) {
+                            if (i) snap += ",";
+                            snap += "\"" + prefabIds[i] + "\"";
+                        }
+                        snap += "],";
+                        snap += "\"scene\":{";
+                        snap += "\"player\":{\"x\":" + std::to_string(g_player.px) +
+                                ",\"y\":" + std::to_string(g_player.py) +
+                                ",\"z\":" + std::to_string(g_player.pz) + "},";
+                        snap += "\"lights\":[";
+                        for (size_t i = 0; i < g_mapLights.size(); ++i) {
+                            const mapvox::LightPlacement& l = g_mapLights[i];
+                            if (i) snap += ",";
+                            snap += "{\"id\":\"light" + std::to_string(i) + "\",\"x\":" + std::to_string(l.x) +
+                                    ",\"y\":" + std::to_string(l.y) + ",\"z\":" + std::to_string(l.z) +
+                                    ",\"intensity\":" + std::to_string(l.intensity) + "}";
+                        }
+                        snap += "],";
+                        snap += "\"prefabs\":[";
+                        for (size_t i = 0; i < g_mapPrefabInstances.size(); ++i) {
+                            const mapvox::PrefabPlacement& pf = g_mapPrefabInstances[i];
+                            if (i) snap += ",";
+                            snap += "{\"id\":\"" + pf.id + "\",\"x\":" + std::to_string(pf.x) +
+                                    ",\"y\":" + std::to_string(pf.y) + ",\"z\":" + std::to_string(pf.z) +
+                                    ",\"rot\":" + std::to_string(pf.rot) + "}";
+                        }
+                        snap += "]}";
+                    }
                     snap += "}}";
                     g_webHost.postMessageJson(snap);
                 }
