@@ -10,6 +10,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 import javax.imageio.ImageIO;
 import javax.swing.JFileChooser;
@@ -32,6 +33,7 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.border.MatteBorder;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import voxel.painter.filter.BitcrushUpscale;
+import voxel.painter.grid.BlenderBridge;
 import voxel.painter.grid.Items;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.VoxDocument;
@@ -246,6 +248,8 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         file.add(item("Export weapon.json…", null, this::onExportWeapon));
         file.add(item("Export item.json…", null, this::onExportItem));
         file.addSeparator();
+        file.add(item("Fetch from Blender project (.blend)…", KeyStroke.getKeyStroke(KeyEvent.VK_B, InputEvent.CTRL_DOWN_MASK), this::onFetchBlender));
+        file.addSeparator();
         file.add(item("Exit", null, () -> System.exit(0)));
         bar.add(file);
 
@@ -425,6 +429,26 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         } catch (Exception ex) {
             JOptionPane.showMessageDialog(this, ex.getMessage(),
                     "Item export failed", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void onFetchBlender() {
+        Path repo = scripts.repoRoot();
+        Path defaultBlend = BlenderBridge.defaultBlendPath(repo);
+        List<String> objects = BlenderBridge.listObjects(repo, defaultBlend);
+        Object[] opts = objects.toArray();
+        Object pick = JOptionPane.showInputDialog(
+                this, "Select Blender mesh object to fetch:", "Fetch from Blender", JOptionPane.QUESTION_MESSAGE,
+                null, opts, opts.length > 0 ? opts[0] : "starter_rifle");
+        if (pick == null) return;
+        boolean ok = model.fetchFromBlender(repo, defaultBlend, pick.toString());
+        if (ok) {
+            syncModeTab();
+            appendLog("Fetched Blender object '" + pick + "' from " + (defaultBlend != null ? defaultBlend.getFileName() : "project"));
+        } else {
+            appendLog("Failed to fetch Blender object '" + pick + "'");
+            JOptionPane.showMessageDialog(this, "Could not fetch object '" + pick + "' from Blender project.",
+                    "Fetch failed", JOptionPane.ERROR_MESSAGE);
         }
     }
 

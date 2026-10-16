@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import voxel.painter.grid.BlenderBridge;
 import voxel.painter.grid.Items;
 import voxel.painter.grid.MapEntities;
 import voxel.painter.grid.MaterialPalette;
@@ -255,6 +256,22 @@ public void newDocument(VoxDocument.Mode mode) {
         if (fm.equals("semi") || fm.equals("auto") || fm.equals("bolt")) {
             document.fireMode = fm;
             fireDoc();
+        }
+    }
+
+    /**
+     * Fetches a 3D mesh object from a Blender project (.blend) and loads it into the editor.
+     */
+    public boolean fetchFromBlender(Path repoRoot, Path blendPath, String objectName) {
+        try {
+            if (repoRoot == null) repoRoot = ScriptRunner.resolveRepoRoot(null);
+            VoxDocument doc = BlenderBridge.fetchObject(repoRoot, blendPath, objectName);
+            setDocument(doc, null, false);
+            markDirty();
+            return true;
+        } catch (Exception e) {
+            System.err.println("[PainterModel] Blender fetch failed: " + e.getMessage());
+            return false;
         }
     }
 

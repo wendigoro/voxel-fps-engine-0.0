@@ -1,6 +1,7 @@
 package voxel.painter;
 
 import voxel.painter.filter.BitcrushUpscale;
+import voxel.painter.grid.BlenderBridge;
 import voxel.painter.grid.Items;
 import voxel.painter.grid.MapEntities;
 import voxel.painter.grid.MaterialPalette;
@@ -14,6 +15,7 @@ import voxel.painter.grid.WeaponParts;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /** Headless smoke: tools, sky, character, item mode, IO, bitcrush 32x filter. */
 public final class SmokeMain {
@@ -380,6 +382,18 @@ public final class SmokeMain {
         Files.copy(wJson, buildWeapons.resolve("starter_rifle.weapon.json"),
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
+        // --- blender project fetch ---
+        Path blendPath = root.resolve("data").resolve("blender").resolve("voxel_rig_and_models.blend");
+        VoxDocument fetchedRifle = BlenderBridge.fetchObject(root, blendPath, "starter_rifle");
+        if (fetchedRifle == null || fetchedRifle.grid.solidCount() == 0) {
+            throw new IllegalStateException("Blender fetch failed to return solid cells");
+        }
+        fetchedRifle.grid.assertCubicUnitInvariant();
+        List<String> blendObjs = BlenderBridge.listObjects(root, blendPath);
+        if (blendObjs.isEmpty() || !blendObjs.contains("starter_rifle")) {
+            throw new IllegalStateException("Blender listObjects missing starter_rifle");
+        }
+
         Path ok = root.resolve("build").resolve("painter").resolve("painter_smoke_ok.txt");
         Files.createDirectories(ok.getParent());
         String report = ""
@@ -400,6 +414,9 @@ public final class SmokeMain {
                 + "item_roundtrip_cells=" + packBack.grid.solidCount() + "\n"
                 + "item_roundtrip_pack=" + packBack.packSX + "," + packBack.packSY + "," + packBack.packSZ + "\n"
                 + "armor_zone=" + plate.armorZone + "\n"
+                + "blender_fetch_ok=1\n"
+                + "blender_objects=" + blendObjs.size() + "\n"
+                + "blender_rifle_solids=" + fetchedRifle.grid.solidCount() + "\n"
                 + "cubic_ok=1\n";
         Files.writeString(ok, report);
         System.out.print(report);

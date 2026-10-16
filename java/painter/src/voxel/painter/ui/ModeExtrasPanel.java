@@ -259,6 +259,22 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             System.out.println("[Painter] Rolling container loot drop: " + cType);
         });
 
+        JComboBox<String> blendObjectBox = new JComboBox<>(new String[]{
+            "starter_rifle", "Voxel_Character_Mesh", "shotgun_light", "carbine_energy",
+            "sidearm_light", "smg_light", "marksman_rifle", "lmg_medium",
+            "sniper_heavy", "cannon_heavy", "railgun_energy"
+        });
+        JButton fetchBlender = new JButton("Fetch Blender project");
+        fetchBlender.addActionListener(e -> {
+            String sel = (String) blendObjectBox.getSelectedItem();
+            boolean ok = model.fetchFromBlender(null, null, sel != null ? sel : "starter_rifle");
+            if (ok) {
+                System.out.println("[Painter] Successfully fetched Blender object: " + sel);
+            } else {
+                System.err.println("[Painter] Failed to fetch Blender object: " + sel);
+            }
+        });
+
         JPanel bakes = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         bakes.setOpaque(false);
         bakes.add(bakeSky);
@@ -272,6 +288,8 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         bakes.add(resetPlanets);
         bakes.add(containerSelectBox);
         bakes.add(rollLoot);
+        bakes.add(blendObjectBox);
+        bakes.add(fetchBlender);
         c.gridy = 6;
         c.gridx = 0;
         c.gridwidth = 8;
