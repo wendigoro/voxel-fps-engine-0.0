@@ -236,7 +236,10 @@ struct LatticeCell {
 // Skeleton bone joint metadata in bind pose.
 struct Bone {
     int8_t parent = -1;
-    Vec3 modelPos; // Joint anchor in model space (meters)
+    Vec3 modelPos;                // Joint head / anchor in model space (meters)
+    Vec3 tailPos;                 // Joint tail in model space (meters) for Blender armature editing
+    float rollDeg = 0.0f;         // Blender edit bone roll in degrees
+    const char* blenderName = ""; // Canonical Blender bone name (e.g. "UpperArm.L")
 };
 
 // Region information mapping body regions to primary and secondary bones for skinning.
@@ -395,71 +398,131 @@ inline Model generateHumanoid(uint32_t seed = 0) {
     // Right Hand (Y: 40..49)
     fillBox(cx + 10, cx + 14, 40, 49, cz - 2, cz + 1, Region_RHand, 3);
 
-    // Initialize Skeleton Hierarchy and Rest Joint Positions
+    // Initialize Skeleton Hierarchy and Rest Joint Positions (Blender armature metadata included)
     auto& sk = model.skeleton;
     sk[BoneId::Root].parent = -1;
     sk[BoneId::Root].modelPos = {0.0f, 0.0f, 0.0f};
+    sk[BoneId::Root].tailPos = {0.0f, 0.2f, 0.0f};
+    sk[BoneId::Root].rollDeg = 0.0f;
+    sk[BoneId::Root].blenderName = "Root";
 
     sk[BoneId::Pelvis].parent = BoneId::Root;
     sk[BoneId::Pelvis].modelPos = {0.0f, 56.0f * kCellSize, 0.0f};
+    sk[BoneId::Pelvis].tailPos = {0.0f, 66.0f * kCellSize, 0.0f};
+    sk[BoneId::Pelvis].rollDeg = 0.0f;
+    sk[BoneId::Pelvis].blenderName = "Pelvis";
 
     sk[BoneId::Spine].parent = BoneId::Pelvis;
     sk[BoneId::Spine].modelPos = {0.0f, 66.0f * kCellSize, 0.0f};
+    sk[BoneId::Spine].tailPos = {0.0f, 80.0f * kCellSize, 0.0f};
+    sk[BoneId::Spine].rollDeg = 0.0f;
+    sk[BoneId::Spine].blenderName = "Spine";
 
     sk[BoneId::Chest].parent = BoneId::Spine;
     sk[BoneId::Chest].modelPos = {0.0f, 80.0f * kCellSize, 0.0f};
+    sk[BoneId::Chest].tailPos = {0.0f, 91.0f * kCellSize, 0.0f};
+    sk[BoneId::Chest].rollDeg = 0.0f;
+    sk[BoneId::Chest].blenderName = "Chest";
 
     sk[BoneId::Neck].parent = BoneId::Chest;
     sk[BoneId::Neck].modelPos = {0.0f, 91.0f * kCellSize, 0.0f};
+    sk[BoneId::Neck].tailPos = {0.0f, 101.0f * kCellSize, 0.0f};
+    sk[BoneId::Neck].rollDeg = 0.0f;
+    sk[BoneId::Neck].blenderName = "Neck";
 
     sk[BoneId::Head].parent = BoneId::Neck;
     sk[BoneId::Head].modelPos = {0.0f, 101.0f * kCellSize, 0.0f};
+    sk[BoneId::Head].tailPos = {0.0f, 110.0f * kCellSize, 0.0f};
+    sk[BoneId::Head].rollDeg = 0.0f;
+    sk[BoneId::Head].blenderName = "Head";
 
     // Left Arm
     sk[BoneId::LShoulder].parent = BoneId::Chest;
     sk[BoneId::LShoulder].modelPos = {-9.0f * kCellSize, 86.0f * kCellSize, 0.0f};
+    sk[BoneId::LShoulder].tailPos = {-12.0f * kCellSize, 78.0f * kCellSize, 0.0f};
+    sk[BoneId::LShoulder].rollDeg = 0.0f;
+    sk[BoneId::LShoulder].blenderName = "Shoulder.L";
 
     sk[BoneId::LUpperArm].parent = BoneId::LShoulder;
     sk[BoneId::LUpperArm].modelPos = {-12.0f * kCellSize, 78.0f * kCellSize, 0.0f};
+    sk[BoneId::LUpperArm].tailPos = {-12.0f * kCellSize, 60.0f * kCellSize, 0.0f};
+    sk[BoneId::LUpperArm].rollDeg = 0.0f;
+    sk[BoneId::LUpperArm].blenderName = "UpperArm.L";
 
     sk[BoneId::LForeArm].parent = BoneId::LUpperArm;
     sk[BoneId::LForeArm].modelPos = {-12.0f * kCellSize, 60.0f * kCellSize, 0.0f};
+    sk[BoneId::LForeArm].tailPos = {-12.0f * kCellSize, 45.0f * kCellSize, 0.0f};
+    sk[BoneId::LForeArm].rollDeg = 0.0f;
+    sk[BoneId::LForeArm].blenderName = "Forearm.L";
 
     sk[BoneId::LHand].parent = BoneId::LForeArm;
     sk[BoneId::LHand].modelPos = {-12.0f * kCellSize, 45.0f * kCellSize, 0.0f};
+    sk[BoneId::LHand].tailPos = {-12.0f * kCellSize, 40.0f * kCellSize, 0.0f};
+    sk[BoneId::LHand].rollDeg = 0.0f;
+    sk[BoneId::LHand].blenderName = "Hand.L";
 
     // Right Arm
     sk[BoneId::RShoulder].parent = BoneId::Chest;
     sk[BoneId::RShoulder].modelPos = {9.0f * kCellSize, 86.0f * kCellSize, 0.0f};
+    sk[BoneId::RShoulder].tailPos = {12.0f * kCellSize, 78.0f * kCellSize, 0.0f};
+    sk[BoneId::RShoulder].rollDeg = 0.0f;
+    sk[BoneId::RShoulder].blenderName = "Shoulder.R";
 
     sk[BoneId::RUpperArm].parent = BoneId::RShoulder;
     sk[BoneId::RUpperArm].modelPos = {12.0f * kCellSize, 78.0f * kCellSize, 0.0f};
+    sk[BoneId::RUpperArm].tailPos = {12.0f * kCellSize, 60.0f * kCellSize, 0.0f};
+    sk[BoneId::RUpperArm].rollDeg = 0.0f;
+    sk[BoneId::RUpperArm].blenderName = "UpperArm.R";
 
     sk[BoneId::RForeArm].parent = BoneId::RUpperArm;
     sk[BoneId::RForeArm].modelPos = {12.0f * kCellSize, 60.0f * kCellSize, 0.0f};
+    sk[BoneId::RForeArm].tailPos = {12.0f * kCellSize, 45.0f * kCellSize, 0.0f};
+    sk[BoneId::RForeArm].rollDeg = 0.0f;
+    sk[BoneId::RForeArm].blenderName = "Forearm.R";
 
     sk[BoneId::RHand].parent = BoneId::RForeArm;
     sk[BoneId::RHand].modelPos = {12.0f * kCellSize, 45.0f * kCellSize, 0.0f};
+    sk[BoneId::RHand].tailPos = {12.0f * kCellSize, 40.0f * kCellSize, 0.0f};
+    sk[BoneId::RHand].rollDeg = 0.0f;
+    sk[BoneId::RHand].blenderName = "Hand.R";
 
     // Left Leg
     sk[BoneId::LThigh].parent = BoneId::Pelvis;
     sk[BoneId::LThigh].modelPos = {-5.0f * kCellSize, 40.0f * kCellSize, 0.0f};
+    sk[BoneId::LThigh].tailPos = {-5.0f * kCellSize, 17.0f * kCellSize, 0.0f};
+    sk[BoneId::LThigh].rollDeg = 0.0f;
+    sk[BoneId::LThigh].blenderName = "Thigh.L";
 
     sk[BoneId::LCalf].parent = BoneId::LThigh;
     sk[BoneId::LCalf].modelPos = {-5.0f * kCellSize, 17.0f * kCellSize, 0.0f};
+    sk[BoneId::LCalf].tailPos = {-5.0f * kCellSize, 3.5f * kCellSize, 1.5f * kCellSize};
+    sk[BoneId::LCalf].rollDeg = 0.0f;
+    sk[BoneId::LCalf].blenderName = "Calf.L";
 
     sk[BoneId::LFoot].parent = BoneId::LCalf;
     sk[BoneId::LFoot].modelPos = {-5.0f * kCellSize, 3.5f * kCellSize, 1.5f * kCellSize};
+    sk[BoneId::LFoot].tailPos = {-5.0f * kCellSize, 2.0f * kCellSize, 5.0f * kCellSize};
+    sk[BoneId::LFoot].rollDeg = 0.0f;
+    sk[BoneId::LFoot].blenderName = "Foot.L";
 
     // Right Leg
     sk[BoneId::RThigh].parent = BoneId::Pelvis;
     sk[BoneId::RThigh].modelPos = {5.0f * kCellSize, 40.0f * kCellSize, 0.0f};
+    sk[BoneId::RThigh].tailPos = {5.0f * kCellSize, 17.0f * kCellSize, 0.0f};
+    sk[BoneId::RThigh].rollDeg = 0.0f;
+    sk[BoneId::RThigh].blenderName = "Thigh.R";
 
     sk[BoneId::RCalf].parent = BoneId::RThigh;
     sk[BoneId::RCalf].modelPos = {5.0f * kCellSize, 17.0f * kCellSize, 0.0f};
+    sk[BoneId::RCalf].tailPos = {5.0f * kCellSize, 3.5f * kCellSize, 1.5f * kCellSize};
+    sk[BoneId::RCalf].rollDeg = 0.0f;
+    sk[BoneId::RCalf].blenderName = "Calf.R";
 
     sk[BoneId::RFoot].parent = BoneId::RCalf;
     sk[BoneId::RFoot].modelPos = {5.0f * kCellSize, 3.5f * kCellSize, 1.5f * kCellSize};
+    sk[BoneId::RFoot].tailPos = {5.0f * kCellSize, 2.0f * kCellSize, 5.0f * kCellSize};
+    sk[BoneId::RFoot].rollDeg = 0.0f;
+    sk[BoneId::RFoot].blenderName = "Foot.R";
 
     // Calculate Bind-Pose Matrices:
     // bindPose[b] converts model space to bone space: T(-joint.x, -joint.y, -joint.z)

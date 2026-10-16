@@ -125,32 +125,190 @@ struct Quat {
     }
 };
 
-// Map textual bone identifier from JSON to bone channel index
+// Coordinate space conversion helpers between Blender and Voxel Engine:
+// Blender: Right-handed, +X Right, +Y Forward, +Z Up
+// Voxel Engine / Vulkan: Right-handed, +X Right, +Y Up, +Z Forward
+//
+// Position mapping:
+//   pos_engine  = (pos_blender.x,  pos_blender.z, -pos_blender.y)
+//   pos_blender = (pos_engine.x, -pos_engine.z,  pos_engine.y)
+//
+// Quaternion mapping:
+//   quat_engine  = (quat_blender.x,  quat_blender.z, -quat_blender.y, quat_blender.w)
+//   quat_blender = (quat_engine.x, -quat_engine.z,  quat_engine.y, quat_engine.w)
+
+inline char_model::Vec3 blenderPosToEngine(const char_model::Vec3& p) {
+    return {p.x, p.z, -p.y};
+}
+
+inline char_model::Vec3 enginePosToBlender(const char_model::Vec3& p) {
+    return {p.x, -p.z, p.y};
+}
+
+inline Quat blenderQuatToEngine(const Quat& q) {
+    return Quat(q.x, q.z, -q.y, q.w).normalized();
+}
+
+inline Quat engineQuatToBlender(const Quat& q) {
+    return Quat(q.x, -q.z, q.y, q.w).normalized();
+}
+
+// Normalizes bone names across Blender conventions (.L/.R, DEF-, mixamorig:) into canonical engine identifiers
+inline std::string normalizeBoneNameForEngine(const std::string& rawName) {
+    if (rawName.empty()) return "";
+
+    std::string s;
+    s.reserve(rawName.size());
+    for (char c : rawName) {
+        s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    // Strip common armature/rig prefixes: "mixamorig:", "def-", "def_", "mch-", "org-", "bip01_"
+    if (s.rfind("mixamorig:", 0) == 0)      s = s.substr(10);
+    else if (s.rfind("def-", 0) == 0)       s = s.substr(4);
+    else if (s.rfind("def_", 0) == 0)       s = s.substr(4);
+    else if (s.rfind("mch-", 0) == 0)       s = s.substr(4);
+    else if (s.rfind("org-", 0) == 0)       s = s.substr(4);
+    else if (s.rfind("bip01_", 0) == 0)     s = s.substr(6);
+
+    // Detect lateral side (left / right)
+    bool isLeft = false;
+    bool isRight = false;
+
+    // Check prefix
+    if (s.rfind("left_", 0) == 0)        { isLeft = true; s = s.substr(5); }
+    else if (s.rfind("left", 0) == 0)    { isLeft = true; s = s.substr(4); }
+    else if (s.rfind("l_", 0) == 0)      { isLeft = true; s = s.substr(2); }
+    else if (s.rfind("right_", 0) == 0)  { isRight = true; s = s.substr(6); }
+    else if (s.rfind("right", 0) == 0)   { isRight = true; s = s.substr(5); }
+    else if (s.rfind("r_", 0) == 0)      { isRight = true; s = s.substr(2); }
+
+    // Check suffix if side was not determined by prefix
+    if (!isLeft && !isRight) {
+        if (s.size() >= 2 && (s.substr(s.size() - 2) == ".l" || s.substr(s.size() - 2) == "_l" || s.substr(s.size() - 2) == "-l")) {
+            isLeft = true;
+            s = s.substr(0, s.size() - 2);
+        } else if (s.size() >= 2 && (s.substr(s.size() - 2) == ".r" || s.substr(s.size() - 2) == "_r" || s.substr(s.size() - 2) == "-r")) {
+            isRight = true;
+            s = s.substr(0, s.size() - 2);
+        } else if (s.size() >= 5 && s.substr(s.size() - 5) == "_left") {
+            isLeft = true;
+            s = s.substr(0, s.size() - 5);
+        } else if (s.size() >= 6 && s.substr(s.size() - 6) == "_right") {
+            isRight = true;
+            s = s.substr(0, s.size() - 6);
+        }
+    }
+
+    // Clean any leading or trailing underscores, dashes, dots
+    while (!s.empty() && (s.front() == '_' || s.front() == '-' || s.front() == '.')) s.erase(0, 1);
+    while (!s.empty() && (s.back() == '_' || s.back() == '-' || s.back() == '.')) s.pop_back();
+
+    // Normalize synonyms
+    if (s == "hips" || s == "hip")                                                  s = "pelvis";
+    else if (s == "spine1" || s == "spine_01" || s == "lower_spine")                s = "spine";
+    else if (s == "spine2" || s == "spine_02" || s == "upper_spine" || s == "torso") s = "chest";
+    else if (s == "arm" || s == "upperarm" || s == "upper_arm")                     s = "upper_arm";
+    else if (s == "forearm" || s == "lowerarm" || s == "lower_arm")                 s = "forearm";
+    else if (s == "hand" || s == "wrist")                                           s = "hand";
+    else if (s == "thigh" || s == "upleg" || s == "up_leg" || s == "upperleg" || s == "upper_leg") s = "thigh";
+    else if (s == "calf" || s == "shin" || s == "leg" || s == "lowerleg" || s == "lower_leg") s = "calf";
+    else if (s == "foot" || s == "ankle")                                           s = "foot";
+    else if (s == "clavicle" || s == "shoulder")                                    s = "shoulder";
+    else if (s == "weapon" || s == "weaponroot")                                    s = "weapon_root";
+    else if (s == "bolt" || s == "weaponbolt")                                      s = "weapon_bolt";
+    else if (s == "mag" || s == "magazine" || s == "weaponmag")                     s = "weapon_mag";
+
+    if (isLeft) return "l_" + s;
+    if (isRight) return "r_" + s;
+    return s;
+}
+
+// Map textual bone identifier from JSON to bone channel index (supports Blender & Mixamo names)
 inline int boneNameToChannel(const std::string& name) {
-    if (name == "root")         return char_model::BoneId::Root;
-    if (name == "pelvis")       return char_model::BoneId::Pelvis;
-    if (name == "spine")        return char_model::BoneId::Spine;
-    if (name == "chest")        return char_model::BoneId::Chest;
-    if (name == "neck")         return char_model::BoneId::Neck;
-    if (name == "head")         return char_model::BoneId::Head;
-    if (name == "l_shoulder")   return char_model::BoneId::LShoulder;
-    if (name == "l_upper_arm")  return char_model::BoneId::LUpperArm;
-    if (name == "l_forearm")    return char_model::BoneId::LForeArm;
-    if (name == "l_hand")       return char_model::BoneId::LHand;
-    if (name == "r_shoulder")   return char_model::BoneId::RShoulder;
-    if (name == "r_upper_arm")  return char_model::BoneId::RUpperArm;
-    if (name == "r_forearm")    return char_model::BoneId::RForeArm;
-    if (name == "r_hand")       return char_model::BoneId::RHand;
-    if (name == "l_thigh")      return char_model::BoneId::LThigh;
-    if (name == "l_calf")       return char_model::BoneId::LCalf;
-    if (name == "l_foot")       return char_model::BoneId::LFoot;
-    if (name == "r_thigh")      return char_model::BoneId::RThigh;
-    if (name == "r_calf")       return char_model::BoneId::RCalf;
-    if (name == "r_foot")       return char_model::BoneId::RFoot;
-    if (name == "weapon_root")  return kBoneWeaponRoot;
-    if (name == "weapon_bolt")  return kBoneWeaponBolt;
-    if (name == "weapon_mag")   return kBoneWeaponMag;
+    const std::string norm = normalizeBoneNameForEngine(name);
+    if (norm == "root")         return char_model::BoneId::Root;
+    if (norm == "pelvis")       return char_model::BoneId::Pelvis;
+    if (norm == "spine")        return char_model::BoneId::Spine;
+    if (norm == "chest")        return char_model::BoneId::Chest;
+    if (norm == "neck")         return char_model::BoneId::Neck;
+    if (norm == "head")         return char_model::BoneId::Head;
+    if (norm == "l_shoulder")   return char_model::BoneId::LShoulder;
+    if (norm == "l_upper_arm")  return char_model::BoneId::LUpperArm;
+    if (norm == "l_forearm")    return char_model::BoneId::LForeArm;
+    if (norm == "l_hand")       return char_model::BoneId::LHand;
+    if (norm == "r_shoulder")   return char_model::BoneId::RShoulder;
+    if (norm == "r_upper_arm")  return char_model::BoneId::RUpperArm;
+    if (norm == "r_forearm")    return char_model::BoneId::RForeArm;
+    if (norm == "r_hand")       return char_model::BoneId::RHand;
+    if (norm == "l_thigh")      return char_model::BoneId::LThigh;
+    if (norm == "l_calf")       return char_model::BoneId::LCalf;
+    if (norm == "l_foot")       return char_model::BoneId::LFoot;
+    if (norm == "r_thigh")      return char_model::BoneId::RThigh;
+    if (norm == "r_calf")       return char_model::BoneId::RCalf;
+    if (norm == "r_foot")       return char_model::BoneId::RFoot;
+    if (norm == "weapon_root")  return kBoneWeaponRoot;
+    if (norm == "weapon_bolt")  return kBoneWeaponBolt;
+    if (norm == "weapon_mag")   return kBoneWeaponMag;
     return -1;
+}
+
+inline const char* channelToBoneName(int channel) {
+    switch (channel) {
+        case char_model::BoneId::Root:       return "root";
+        case char_model::BoneId::Pelvis:     return "pelvis";
+        case char_model::BoneId::Spine:      return "spine";
+        case char_model::BoneId::Chest:      return "chest";
+        case char_model::BoneId::Neck:       return "neck";
+        case char_model::BoneId::Head:       return "head";
+        case char_model::BoneId::LShoulder:  return "l_shoulder";
+        case char_model::BoneId::LUpperArm:  return "l_upper_arm";
+        case char_model::BoneId::LForeArm:   return "l_forearm";
+        case char_model::BoneId::LHand:      return "l_hand";
+        case char_model::BoneId::RShoulder:  return "r_shoulder";
+        case char_model::BoneId::RUpperArm:  return "r_upper_arm";
+        case char_model::BoneId::RForeArm:   return "r_forearm";
+        case char_model::BoneId::RHand:      return "r_hand";
+        case char_model::BoneId::LThigh:     return "l_thigh";
+        case char_model::BoneId::LCalf:      return "l_calf";
+        case char_model::BoneId::LFoot:      return "l_foot";
+        case char_model::BoneId::RThigh:     return "r_thigh";
+        case char_model::BoneId::RCalf:      return "r_calf";
+        case char_model::BoneId::RFoot:      return "r_foot";
+        case kBoneWeaponRoot:                return "weapon_root";
+        case kBoneWeaponBolt:                return "weapon_bolt";
+        case kBoneWeaponMag:                 return "weapon_mag";
+        default:                             return "unknown";
+    }
+}
+
+inline const char* channelToBlenderBoneName(int channel) {
+    switch (channel) {
+        case char_model::BoneId::Root:       return "Root";
+        case char_model::BoneId::Pelvis:     return "Pelvis";
+        case char_model::BoneId::Spine:      return "Spine";
+        case char_model::BoneId::Chest:      return "Chest";
+        case char_model::BoneId::Neck:       return "Neck";
+        case char_model::BoneId::Head:       return "Head";
+        case char_model::BoneId::LShoulder:  return "Shoulder.L";
+        case char_model::BoneId::LUpperArm:  return "UpperArm.L";
+        case char_model::BoneId::LForeArm:   return "Forearm.L";
+        case char_model::BoneId::LHand:      return "Hand.L";
+        case char_model::BoneId::RShoulder:  return "Shoulder.R";
+        case char_model::BoneId::RUpperArm:  return "UpperArm.R";
+        case char_model::BoneId::RForeArm:   return "Forearm.R";
+        case char_model::BoneId::RHand:      return "Hand.R";
+        case char_model::BoneId::LThigh:     return "Thigh.L";
+        case char_model::BoneId::LCalf:      return "Calf.L";
+        case char_model::BoneId::LFoot:      return "Foot.L";
+        case char_model::BoneId::RThigh:     return "Thigh.R";
+        case char_model::BoneId::RCalf:      return "Calf.R";
+        case char_model::BoneId::RFoot:      return "Foot.R";
+        case kBoneWeaponRoot:                return "Weapon_Root";
+        case kBoneWeaponBolt:                return "Weapon_Bolt";
+        case kBoneWeaponMag:                 return "Weapon_Mag";
+        default:                             return "Unknown";
+    }
 }
 
 struct Keyframe {
@@ -554,6 +712,48 @@ inline bool selfTest() {
     ctrl.update(0.5f);
     const PoseSample ps = ctrl.evaluatePose();
     if (std::abs(ps.pos[char_model::BoneId::Chest].y - 0.01f) > 1e-4f) return false;
+
+    // 6. Blender bone normalization and aliasing
+    if (boneNameToChannel("UpperArm.L") != char_model::BoneId::LUpperArm) return false;
+    if (boneNameToChannel("DEF-forearm.R") != char_model::BoneId::RForeArm) return false;
+    if (boneNameToChannel("mixamorig:LeftLeg") != char_model::BoneId::LCalf) return false;
+    if (boneNameToChannel("mixamorig:Hips") != char_model::BoneId::Pelvis) return false;
+    if (boneNameToChannel("Weapon_Root") != kBoneWeaponRoot) return false;
+    if (boneNameToChannel("DEF-thigh.L") != char_model::BoneId::LThigh) return false;
+
+    // 7. Blender coordinate space transformation roundtrip
+    const char_model::Vec3 testBlenderPos{1.25f, -0.75f, 2.5f};
+    const char_model::Vec3 enginePos = blenderPosToEngine(testBlenderPos);
+    // x_e = 1.25, y_e = 2.5, z_e = 0.75
+    if (std::abs(enginePos.x - 1.25f) > 1e-5f || std::abs(enginePos.y - 2.5f) > 1e-5f || std::abs(enginePos.z - 0.75f) > 1e-5f) return false;
+    const char_model::Vec3 roundtripBlenderPos = enginePosToBlender(enginePos);
+    if (std::abs(roundtripBlenderPos.x - testBlenderPos.x) > 1e-5f ||
+        std::abs(roundtripBlenderPos.y - testBlenderPos.y) > 1e-5f ||
+        std::abs(roundtripBlenderPos.z - testBlenderPos.z) > 1e-5f) return false;
+
+    const Quat testBlenderQuat(0.1f, 0.2f, 0.3f, 0.9f);
+    const Quat engineQuat = blenderQuatToEngine(testBlenderQuat);
+    const Quat roundtripBlenderQuat = engineQuatToBlender(engineQuat);
+    if (std::abs(testBlenderQuat.normalized().dot(roundtripBlenderQuat)) < 0.999f) return false;
+
+    // 8. JSON loading with Blender bone naming
+    const std::string blenderJson = R"({
+        "format_version": 1,
+        "id": "blender_test",
+        "name": "Blender Test Clip",
+        "duration_sec": 0.5,
+        "tracks": [
+            {
+                "bone": "UpperArm.L",
+                "frames": [
+                    { "time": 0.0, "pos": [0.0, 0.0, 0.0], "rot": [0.0, 0.0, 0.0, 1.0] }
+                ]
+            }
+        ]
+    })";
+    AnimationClip bClip;
+    if (!loadClipFromText(blenderJson, bClip)) return false;
+    if (bClip.tracks.empty() || bClip.tracks[0].channel != char_model::BoneId::LUpperArm) return false;
 
     return true;
 }
