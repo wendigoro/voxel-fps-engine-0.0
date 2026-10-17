@@ -7463,17 +7463,17 @@ static void syncCameraToPlayer() {
     const float timeSec = static_cast<float>(g_tick) * TICK_DT;
     char_model::Vec3 headModelPos{};
     char_model::Mat4 dummyBones[char_model::kMaxBones];
-    char_model::AuthoredPoseOverride ov;
-    for (int b = 0; b < char_model::BoneId::Count; ++b) {
-        ov.trans[b] = g_currentAnimPose.pos[b];
-        ov.rot[b] = g_currentAnimPose.rot[b].toMat4();
-    }
-    ov.weight = g_animAuthoredWeight;
 
+    // No authored pose override here. This runs inside the sim tick and sets
+    // g_camPos, which is the shot origin. g_currentAnimPose is view state: it
+    // advances with the frame dt in drawFrame, so feeding it in made shots,
+    // impacts and the stress sim_fingerprint depend on frame timing (RULES.md:
+    // the simulation never reads rendering state). Authored clips still drive
+    // the rendered body and weapon in recordCommandBuffer.
     char_model::evaluateProceduralPose(
         char_model::getCanonicalModel(), g_move, g_player, timeSec,
         deltaYaw, aimPitch, dummyBones, &headModelPos, g_charLocomotionPhase, nullptr,
-        false, 0.0f, false, 0.0f, &ov);
+        false, 0.0f, false, 0.0f, nullptr);
 
     const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
     const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
