@@ -383,7 +383,8 @@ def create_character_mesh(armature_obj: Optional[Any] = None) -> Any:
     return mesh_obj
 
 
-def export_action_to_anim_json(armature_obj: Any, action: Any, filepath: str, fps: float = 30.0) -> bool:
+def export_action_to_anim_json(armature_obj: Any, action: Any, filepath: str, fps: float = 30.0,
+                               clip_id: Optional[str] = None, loop: Optional[bool] = None) -> bool:
     """Export Blender Action to Voxel FPS Engine .anim.json format."""
     if bpy is None:
         raise RuntimeError("Blender (bpy) is required for animation export.")
@@ -399,7 +400,30 @@ def export_action_to_anim_json(armature_obj: Any, action: Any, filepath: str, fp
     duration_frames = max(1, frame_end - frame_start)
     duration_sec = duration_frames / fps
 
-    anim_id = os.path.splitext(os.path.basename(filepath))[0].replace(".anim", "")
+    if clip_id:
+        anim_id = clip_id
+    else:
+        raw_id = os.path.splitext(os.path.basename(filepath))[0].replace(".anim", "")
+        if raw_id.startswith("fetch_") or raw_id.startswith("blend_") or raw_id.startswith("tmp"):
+            low = action.name.lower()
+            if "walk" in low:
+                anim_id = "walk"
+            elif "fire" in low:
+                anim_id = "rifle_fire"
+            elif "reload" in low:
+                anim_id = "rifle_reload"
+            elif "idle" in low:
+                anim_id = "rifle_idle"
+            else:
+                anim_id = "".join(c if c.isalnum() else "_" for c in low).strip("_")
+        else:
+            anim_id = raw_id
+
+    if loop is None:
+        low = action.name.lower()
+        is_loop = not ("fire" in low or "reload" in low)
+    else:
+        is_loop = loop
 
     tracks_data: List[Dict[str, Any]] = []
 
@@ -459,7 +483,7 @@ def export_action_to_anim_json(armature_obj: Any, action: Any, filepath: str, fp
         "id": anim_id,
         "name": action.name,
         "duration_sec": round(duration_sec, 4),
-        "loop": True,
+        "loop": is_loop,
         "frame_rate": round(fps, 1),
         "tracks": tracks_data
     }

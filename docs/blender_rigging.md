@@ -175,3 +175,34 @@ The Java Painter provides bi-directional integration with Blender projects via [
    - [`BlenderBridge.fetchObject()`](file:///c:/Users/gryph/kepler/worktrees/voxel-salva-6d28d/java/painter/src/voxel/painter/grid/BlenderBridge.java) spawns Blender in background mode, extracts the mesh polygons/vertices, converts coordinates to cubic voxels, and loads the resulting `VoxDocument`.
    - Automated test verification is wired into [`SmokeMain`](file:///c:/Users/gryph/kepler/worktrees/voxel-salva-6d28d/java/painter/src/voxel/painter/SmokeMain.java) (`blender_fetch_ok=1`).
 
+---
+
+## 8. Animation Sub-Menu & Modifiers
+
+The Voxel Painter features a dedicated **Animation Sub-Menu** ([`AnimationSubMenuPanel`](file:///c:/Users/gryph/kepler/worktrees/voxel-salva-6d28d/java/painter/src/voxel/painter/ui/AnimationSubMenuPanel.java)) for inspecting, tuning, and exporting animation clips directly linked to the Blender project.
+
+### Features
+1. **Blender Action Fetching:**
+   - Discovers actions from `.blend` projects headlessly via [`BlenderBridge.listActions()`](file:///c:/Users/gryph/kepler/worktrees/voxel-salva-6d28d/java/painter/src/voxel/painter/grid/BlenderBridge.java) and `fetch_blend.py --list-actions`.
+   - Fetches skeletal keyframes from any action via `fetch_blend.py --action <ActionName>` and parses bone transforms into an in-memory [`AnimationClip`](file:///c:/Users/gryph/kepler/worktrees/voxel-salva-6d28d/java/painter/src/voxel/painter/anim/AnimationClip.java).
+2. **Animation Variables (Text Boxes & Spinners):**
+   - **Clip ID:** Identifier used in engine manifests (e.g. `rifle_fire`, `walk`).
+   - **Clip Name:** Descriptive display name for tooling.
+   - **Duration:** Readout in seconds, dynamically updated when playback speed is adjusted.
+   - **Frame Rate (FPS):** Sample frequency (10.0 to 120.0 FPS, default 30.0).
+   - **Loop:** Toggle for continuous looping vs. one-shot execution.
+   - **Target Rig Filter:** Filter tracks by target bone hierarchy (`All Bones`, `Humanoid Only`, `Weapon Only`).
+3. **Interactive Modifiers (Sliders with Live Readouts):**
+   - **Playback Speed (0.10x – 3.00x):** Scales duration and all keyframe timestamps non-destructively.
+   - **Motion Amplitude (0.10x – 2.00x):** Multiplies translation keyframe offsets $[x, y, z]$.
+   - **Additive Weight (0.00 – 1.00):** Scales translation offsets and computes numerical spherical linear interpolation (SLERP) against identity quaternion $[0, 0, 0, 1]$.
+   - **Cross-Fade Window (0.00s – 1.00s):** Transition blend window metadata.
+4. **Access Points:**
+   - **Menu Bar:** `Animation > Animation Sub-Menu & Modifiers…` (`Ctrl+M`).
+   - **Quick Action Fetch:** `Animation > Fetch Action from Blender project…` (`Ctrl+Shift+A`).
+   - **Mode Extras Panel:** "Animation sub-menu..." button in the bakes toolstrip.
+5. **Format Compliance & Export:**
+   - Exports directly to `.anim.json` format conforming to [`data/anims/schema.md`](file:///c:/Users/gryph/kepler/worktrees/voxel-salva-6d28d/data/anims/schema.md).
+   - Verified in headless test suite via [`SmokeMain`](file:///c:/Users/gryph/kepler/worktrees/voxel-salva-6d28d/java/painter/src/voxel/painter/SmokeMain.java) (`blender_anim_fetch_ok=1`).
+
+

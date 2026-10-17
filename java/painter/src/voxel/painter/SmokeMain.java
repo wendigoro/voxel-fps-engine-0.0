@@ -1,5 +1,6 @@
 package voxel.painter;
 
+import voxel.painter.anim.AnimationClip;
 import voxel.painter.filter.BitcrushUpscale;
 import voxel.painter.grid.BlenderBridge;
 import voxel.painter.grid.Items;
@@ -394,6 +395,27 @@ public final class SmokeMain {
             throw new IllegalStateException("Blender listObjects missing starter_rifle");
         }
 
+        // --- blender animation fetch & modifiers ---
+        List<String> blendActions = BlenderBridge.listActions(root, blendPath);
+        if (blendActions.isEmpty()) {
+            throw new IllegalStateException("Blender listActions returned empty list");
+        }
+        AnimationClip fireClip = BlenderBridge.fetchAnimation(root, blendPath, "Rifle Fire Impulse");
+        if (fireClip == null || fireClip.tracks.isEmpty() || fireClip.durationSec <= 0.0) {
+            throw new IllegalStateException("Blender fetchAnimation returned invalid clip");
+        }
+        // Test applying modifiers non-destructively
+        AnimationClip modded = fireClip.applyModifiers(2.0, 1.5, 0.8, 0.15, 60.0, true, "rifle_fire_fast", "Fast Fire", "All Bones");
+        if (Math.abs(modded.durationSec - (fireClip.durationSec / 2.0)) > 0.01) {
+            throw new IllegalStateException("applyModifiers playback speed scaling failed");
+        }
+        // Test JSON roundtrip
+        String jsonExport = modded.toJsonString();
+        AnimationClip roundtripClip = AnimationClip.parseJson(jsonExport);
+        if (roundtripClip.tracks.size() != modded.tracks.size() || !roundtripClip.id.equals(modded.id)) {
+            throw new IllegalStateException("AnimationClip parseJson roundtrip mismatch");
+        }
+
         Path ok = root.resolve("build").resolve("painter").resolve("painter_smoke_ok.txt");
         Files.createDirectories(ok.getParent());
         String report = ""
@@ -417,6 +439,9 @@ public final class SmokeMain {
                 + "blender_fetch_ok=1\n"
                 + "blender_objects=" + blendObjs.size() + "\n"
                 + "blender_rifle_solids=" + fetchedRifle.grid.solidCount() + "\n"
+                + "blender_anim_fetch_ok=1\n"
+                + "blender_actions=" + blendActions.size() + "\n"
+                + "blender_fire_tracks=" + fireClip.tracks.size() + "\n"
                 + "cubic_ok=1\n";
         Files.writeString(ok, report);
         System.out.print(report);

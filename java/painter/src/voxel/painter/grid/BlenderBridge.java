@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import voxel.painter.anim.AnimationClip;
 
 /**
  * Bridge between Java Painter and the local Blender instance.
@@ -177,5 +178,153 @@ public final class BlenderBridge {
         }
 
         throw new IOException("Unable to fetch object '" + objectName + "' from Blender project: " + blendPath);
+    }
+
+    /** Lists animation actions present inside a .blend project. */
+    public static List<String> listActions(Path repoRoot, Path blendPath) {
+        List<String> actions = new ArrayList<>();
+        Path blender = findBlenderExecutable();
+        Path script = repoRoot != null ? repoRoot.resolve("tools").resolve("blender").resolve("fetch_blend.py") : null;
+
+        if (blendPath == null) {
+            blendPath = defaultBlendPath(repoRoot);
+        }
+
+        if (blender != null && script != null && Files.exists(script) && blendPath != null && Files.exists(blendPath)) {
+            try {
+                Path tempOut = Files.createTempFile("blend_actions_", ".json");
+                ProcessBuilder pb = new ProcessBuilder(
+                    blender.toString(),
+                    blendPath.toString(),
+                    "--background",
+                    "--python", script.toString(),
+                    "--",
+                    "--list-actions",
+                    "--out", tempOut.toString()
+                );
+                pb.redirectErrorStream(true);
+                Process proc = pb.start();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("ACTIONS:")) {
+                            String listPart = line.substring("ACTIONS:".length()).trim();
+                            for (String item : listPart.split(",")) {
+                                String trimmed = item.trim();
+                                if (!trimmed.isEmpty()) actions.add(trimmed);
+                            }
+                        }
+                    }
+                }
+                proc.waitFor();
+                try { Files.deleteIfExists(tempOut); } catch (Exception ignored) {}
+            } catch (Exception e) {
+                System.err.println("[BlenderBridge] Action listing error: " + e.getMessage());
+            }
+        }
+
+        if (actions.isEmpty()) {
+            actions.addAll(List.of(
+                "Humanoid Walk Cycle", "Rifle Fire Impulse", "Rifle Idle Ready", "Rifle Tactical Reload"
+            ));
+        }
+        return actions;
+    }
+
+    /** Convenience fetch with defaults. */
+    public static AnimationClip fetchAnimation(Path repoRoot, Path blendPath, String actionName) throws IOException {
+        return fetchAnimation(repoRoot, blendPath, actionName, null, null, null, null);
+    }
+
+    /**
+     * Extracts a named animation action from a .blend project into an AnimationClip.
+     * Executes fetch_blend.py headlessly, then deserializes via AnimationClip.load().
+     */
+    public static AnimationClip fetchAnimation(Path repoRoot, Path blendPath, String actionName,
+                                               Path outPath, Double fps, Boolean loop, String clipId) throws IOException {
+        Path blender = findBlenderExecutable();
+        Path script = repoRoot != null ? repoRoot.resolve("tools").resolve("blender").resolve("fetch_blend.py") : null;
+
+        if (blendPath == null) {
+            blendPath = defaultBlendPath(repoRoot);
+        }
+
+        if (blender != null && script != null && Files.exists(script) && blendPath != null && Files.exists(blendPath)) {
+            Path tempOut = (outPath != null) ? outPath : Files.createTempFile("fetch_anim_", ".anim.json");
+            try {
+                List<String> cmd = new ArrayList<>();
+                cmd.add(blender.toString());
+                cmd.add(blendPath.toString());
+                cmd.add("--background");
+                cmd.add("--python");
+                cmd.add(script.toString());
+                cmd.add("--");
+                if (actionName != null && !actionName.isBlank()) {
+                    cmd.add("--action");
+                    cmd.add(actionName);
+                }
+                cmd.add("--out");
+                cmd.add(tempOut.toString());
+                if (fps != null && fps > 0) {
+                    cmd.add("--fps");
+                    cmd.add(String.valueOf(fps));
+                }
+                if (loop != null) {
+                    cmd.add("--loop");
+                    cmd.add(loop ? "true" : "false");
+                }
+                if (clipId != null && !clipId.isBlank()) {
+                    cmd.add("--clip-id");
+                    cmd.add(clipId);
+                }
+
+                ProcessBuilder pb = new ProcessBuilder(cmd);
+                pb.redirectErrorStream(true);
+                Process proc = pb.start();
+
+                StringBuilder logs = new StringBuilder();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        logs.append(line).append('\n');
+                    }
+                }
+                int exitCode = proc.waitFor();
+                if (exitCode == 0 && Files.exists(tempOut) && Files.size(tempOut) > 0) {
+                    AnimationClip clip = AnimationClip.load(tempOut);
+                    return clip;
+                }
+                System.err.println("[BlenderBridge] Blender anim fetch returned " + exitCode + ": " + logs);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Blender anim fetch interrupted", ie);
+            } finally {
+                if (outPath == null) {
+                    try { Files.deleteIfExists(tempOut); } catch (Exception ignored) {}
+                }
+            }
+        }
+
+        // Resilient fallback: search data/anims/
+        if (repoRoot != null && actionName != null) {
+            Path animsDir = repoRoot.resolve("data").resolve("anims");
+            Path targetFile = animsDir.resolve(actionName + ".anim.json");
+            if (!Files.exists(targetFile)) {
+                String low = actionName.toLowerCase(java.util.Locale.ROOT);
+                if (low.contains("fire")) targetFile = animsDir.resolve("rifle_fire.anim.json");
+                else if (low.contains("idle")) targetFile = animsDir.resolve("rifle_idle.anim.json");
+                else if (low.contains("reload")) targetFile = animsDir.resolve("rifle_reload.anim.json");
+                else if (low.contains("walk")) targetFile = animsDir.resolve("walk.anim.json");
+            }
+            if (Files.exists(targetFile)) {
+                AnimationClip clip = AnimationClip.load(targetFile);
+                if (outPath != null) {
+                    clip.save(outPath);
+                }
+                return clip;
+            }
+        }
+
+        throw new IOException("Unable to fetch animation action '" + actionName + "' from Blender project: " + blendPath);
     }
 }

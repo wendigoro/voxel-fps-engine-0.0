@@ -275,6 +275,11 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             }
         });
 
+        JButton animSubMenuBtn = new JButton("Animation sub-menu...");
+        animSubMenuBtn.addActionListener(e -> {
+            AnimationSubMenuPanel.showDialog(this, ScriptRunner.resolveRepoRoot(null), null);
+        });
+
         JPanel bakes = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         bakes.setOpaque(false);
         bakes.add(bakeSky);
@@ -290,6 +295,7 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         bakes.add(rollLoot);
         bakes.add(blendObjectBox);
         bakes.add(fetchBlender);
+        bakes.add(animSubMenuBtn);
         c.gridy = 6;
         c.gridx = 0;
         c.gridwidth = 8;

@@ -10,7 +10,7 @@ import sys
 import os
 import json
 import math
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 try:
     import bpy
@@ -29,10 +29,15 @@ def parse_args():
 
     parsed = {
         "object": None,
+        "action": None,
         "out": None,
         "list": False,
+        "list_actions": False,
         "voxel_size": 0.001,
         "grid_size": 32,
+        "clip_id": None,
+        "fps": 30.0,
+        "loop": None,
     }
 
     i = 0
@@ -41,12 +46,27 @@ def parse_args():
         if a == "--object" and i + 1 < len(args):
             parsed["object"] = args[i + 1]
             i += 2
+        elif a == "--action" and i + 1 < len(args):
+            parsed["action"] = args[i + 1]
+            i += 2
         elif a == "--out" and i + 1 < len(args):
             parsed["out"] = args[i + 1]
             i += 2
         elif a == "--list":
             parsed["list"] = True
             i += 1
+        elif a == "--list-actions":
+            parsed["list_actions"] = True
+            i += 1
+        elif a == "--clip-id" and i + 1 < len(args):
+            parsed["clip_id"] = args[i + 1]
+            i += 2
+        elif a == "--fps" and i + 1 < len(args):
+            parsed["fps"] = float(args[i + 1])
+            i += 2
+        elif a == "--loop" and i + 1 < len(args):
+            parsed["loop"] = args[i + 1].lower() in ("true", "1", "yes")
+            i += 2
         elif a == "--voxel-size" and i + 1 < len(args):
             parsed["voxel_size"] = float(args[i + 1])
             i += 2
@@ -63,6 +83,90 @@ def list_objects(out_path: str):
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2)
     print(f"MESH_OBJECTS: {','.join(mesh_objs)}")
+
+
+def list_actions(out_path: Optional[str]):
+    """List all actions in the opened .blend file."""
+    actions = [act.name for act in bpy.data.actions]
+    result = {"actions": actions}
+    if out_path:
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2)
+    print(f"ACTIONS: {','.join(actions)}")
+
+
+def find_action(target_name: str) -> Optional[Any]:
+    if not target_name:
+        return None
+    # 1. Exact match
+    act = bpy.data.actions.get(target_name)
+    if act:
+        return act
+    # 2. Case-insensitive match
+    target_lower = target_name.strip().lower()
+    for a in bpy.data.actions:
+        if a.name.lower() == target_lower:
+            return a
+    # 3. Canonical aliases
+    alias_map = {
+        "walk": ["walk", "humanoid walk", "walk cycle"],
+        "rifle_fire": ["rifle fire", "fire impulse", "rifle_fire", "fire"],
+        "rifle_idle": ["rifle idle", "idle ready", "rifle_idle", "idle"],
+        "rifle_reload": ["rifle reload", "tactical reload", "rifle_reload", "reload"],
+    }
+    for alias_key, patterns in alias_map.items():
+        if target_lower == alias_key:
+            for a in bpy.data.actions:
+                a_lower = a.name.lower()
+                if any(p in a_lower for p in patterns):
+                    return a
+    # 4. Substring match
+    for a in bpy.data.actions:
+        if target_lower in a.name.lower() or a.name.lower() in target_lower:
+            return a
+    return None
+
+
+def extract_action(action_name: str, out_path: Optional[str], clip_id: Optional[str] = None,
+                   fps: float = 30.0, loop: Optional[bool] = None):
+    """Extract an animation action from the .blend file into .anim.json."""
+    action = find_action(action_name)
+    if not action:
+        if bpy.data.actions:
+            action = bpy.data.actions[0]
+            print(f"Warning: Action '{action_name}' not found, falling back to '{action.name}'")
+        else:
+            print(f"Error: Target action '{action_name}' not found and no actions exist.")
+            sys.exit(1)
+
+    arm_obj = None
+    for obj in bpy.data.objects:
+        if obj.type == 'ARMATURE':
+            arm_obj = obj
+            break
+
+    if not arm_obj:
+        print("Error: No Armature object found in .blend file.")
+        sys.exit(1)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.append(script_dir)
+    import voxel_rig_anim
+
+    if not out_path:
+        import tempfile
+        out_path = os.path.join(tempfile.gettempdir(), f"{action.name}.anim.json")
+
+    success = voxel_rig_anim.export_action_to_anim_json(
+        arm_obj, action, out_path, fps=fps, clip_id=clip_id, loop=loop
+    )
+    if success:
+        print(f"FETCH_ACTION_OK: {action.name} -> {out_path}")
+        print("FETCH_BLEND_OK")
+    else:
+        print(f"Error: Failed to export action '{action.name}'")
+        sys.exit(1)
 
 
 def extract_object_voxels(obj: Any, voxel_size: float = 0.001) -> Dict[str, Any]:
@@ -169,6 +273,15 @@ def main():
 
     if parsed["list"]:
         list_objects(parsed["out"])
+        return
+
+    if parsed["list_actions"]:
+        list_actions(parsed["out"])
+        return
+
+    if parsed["action"]:
+        extract_action(parsed["action"], parsed["out"], clip_id=parsed["clip_id"],
+                       fps=parsed["fps"], loop=parsed["loop"])
         return
 
     target_name = parsed["object"]
