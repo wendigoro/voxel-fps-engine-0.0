@@ -36,7 +36,7 @@ Currently, engine workflows are fragmented across separate tools:
 ### 2.2 Goals
 - **Single Window UX:** Combine the 3D viewport and rich editor UI into one window with flexible layouts (docked sidebars, top toolbars, full-viewport game toggle).
 - **Fast Iteration:** React/Vite hot-reloading for UI widgets during development, without recompiling C++.
-- **Zero Simulation Compromise:** Zero impact on the 60 Hz / 120 Hz fixed-step deterministic simulation loops and golden hash baselines (smoke: `48052f2f495b732d`, stress: `d0d27027a069de8d`).
+- **Zero Simulation Compromise:** Zero impact on the 60 Hz / 120 Hz fixed-step deterministic simulation loops and golden hash baselines (smoke: `c74104775f89ae9f`, stress: `102f4bb7f500cd54`; see §10).
 - **Loose File Distribution:** Keep `data/` and web assets loose in `build/` for instant editing without forced binary resource embedding.
 
 ---
@@ -334,6 +334,6 @@ The build pipeline unifies under [`scripts/build.ps1`](../scripts/build.ps1):
 ## 10. Verification & Quality Gates
 
 Any implementation of this RFC must satisfy:
-1. **Deterministic Sim Invariance:** Gates `smoke_ok` (`48052f2f495b732d`) and `stress_ok` (`d0d27027a069de8d`) must pass bit-identically in `--mode validate` and `--mode headless`.
+1. **Deterministic Sim Invariance:** `sim_fingerprint` must be bit-identical run to run, **regardless of frame rate**: `--smoke` → `c74104775f89ae9f`, `--stress` → `102f4bb7f500cd54` (`.\launch.ps1 -Action SmokeAll` / `-Action Stress`; read `build\smoke_ok.txt` / `build\stress_ok.txt`). Refreshed 2026-10-16 at the p12 tip. The previous `main` baselines were `48052f2f495b732d` / `d0d27027a069de8d`; this branch changes the sim (e.g. `warehouse_v2` is the default map), so they no longer apply. To check frame-rate independence, compare a solo `--stress` run against one with a second engine instance running alongside: the frame counts differ but the fingerprint must not. Any authored or interpolated *view* state (animation pose, eye interpolation, mesh) reaching a sim-tick code path breaks this; see the 2026-10-16 regression, where authored animation fed `syncCameraToPlayer()`.
 2. **View Isolation:** `scripts/check_view_isolation.ps1` must confirm that no UI header or WebView2 symbol is included or referenced by any simulation module (`sim_*.hpp`, `ballistics.hpp`, `movement.hpp`).
 3. **Exit Code Compatibility:** Headless modes must strictly preserve standard exit codes (0 = Success, 1 = Exception, 2 = Movement, 3 = Jsonx, 4 = Map, 5 = Mesh workers, 6 = Ballistics, 7 = Incomplete run, 8 = Pause/Eye, 9 = Visual params, 10 = Terrain).
