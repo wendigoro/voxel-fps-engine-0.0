@@ -38,6 +38,8 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
     private final JPanel weaponRow;
     private final JButton bakeSky;
     private final JButton bakeChar;
+    private final JComboBox<String> animClipBox;
+    private final JComboBox<String> weaponSelectBox;
     private final JButton bakeWeapon;
     // Item mode (RULES.md rule 12). The grid the artist paints IS the packing
     // footprint, so there is no size control here - only the metadata the engine
@@ -118,6 +120,9 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
         charRow.add(feetX);
         charRow.add(feetY);
         charRow.add(feetZ);
+        charRow.add(dim("clip"));
+        animClipBox = new JComboBox<>(new String[]{"rifle_idle", "rifle_fire", "rifle_reload", "walk"});
+        charRow.add(animClipBox);
         c.gridy = 2;
         add(charRow, c);
 
@@ -211,8 +216,16 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             SkyAndCharacter.paintCharacter(doc.grid, doc.feetX, doc.feetY, doc.feetZ);
             model.markDirty();
         });
-        bakeWeapon = new JButton("Bake starter rifle");
-        bakeWeapon.addActionListener(e -> model.bakeStarterWeapon());
+        weaponSelectBox = new JComboBox<>(new String[]{
+                "starter_rifle", "sidearm_light", "smg_light", "shotgun_light",
+                "marksman_rifle", "lmg_medium", "sniper_heavy", "cannon_heavy",
+                "carbine_energy", "railgun_energy"
+        });
+        bakeWeapon = new JButton("Bake weapon");
+        bakeWeapon.addActionListener(e -> {
+            String sel = (String) weaponSelectBox.getSelectedItem();
+            model.bakeWeapon(sel != null ? sel : "starter_rifle");
+        });
         bakeItem = new JButton("Bake starter pouch");
         bakeItem.addActionListener(e -> model.bakeStarterItem());
         exportItem = new JButton("Export item.json");
@@ -229,18 +242,65 @@ public final class ModeExtrasPanel extends JPanel implements PainterModel.Listen
             model.markDirty();
         });
 
+        JButton triggerImpact = new JButton("Trigger planet impact");
+        triggerImpact.addActionListener(e -> {
+            System.out.println("[Painter] Triggering planetary impact (R=4500km, v=50km/s)");
+        });
+        JButton resetPlanets = new JButton("Reset planets");
+        resetPlanets.addActionListener(e -> {
+            System.out.println("[Painter] Resetting celestial orbits");
+        });
+        JComboBox<String> containerSelectBox = new JComboBox<>(new String[]{
+            "WeaponLocker", "WallSafe", "MilitaryFootlocker", "ScrapBin", "CovertDeadDrop", "MedicalCabinet"
+        });
+        JButton rollLoot = new JButton("Roll container loot");
+        rollLoot.addActionListener(e -> {
+            String cType = (String) containerSelectBox.getSelectedItem();
+            System.out.println("[Painter] Rolling container loot drop: " + cType);
+        });
+
+        JComboBox<String> blendObjectBox = new JComboBox<>(new String[]{
+            "starter_rifle", "Voxel_Character_Mesh", "shotgun_light", "carbine_energy",
+            "sidearm_light", "smg_light", "marksman_rifle", "lmg_medium",
+            "sniper_heavy", "cannon_heavy", "railgun_energy"
+        });
+        JButton fetchBlender = new JButton("Fetch Blender project");
+        fetchBlender.addActionListener(e -> {
+            String sel = (String) blendObjectBox.getSelectedItem();
+            boolean ok = model.fetchFromBlender(null, null, sel != null ? sel : "starter_rifle");
+            if (ok) {
+                System.out.println("[Painter] Successfully fetched Blender object: " + sel);
+            } else {
+                System.err.println("[Painter] Failed to fetch Blender object: " + sel);
+            }
+        });
+
+        JButton animSubMenuBtn = new JButton("Animation sub-menu...");
+        animSubMenuBtn.addActionListener(e -> {
+            AnimationSubMenuPanel.showDialog(this, ScriptRunner.resolveRepoRoot(null), null);
+        });
+
         JPanel bakes = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         bakes.setOpaque(false);
         bakes.add(bakeSky);
         bakes.add(bakeChar);
+        bakes.add(weaponSelectBox);
         bakes.add(bakeWeapon);
         bakes.add(bakeItem);
         bakes.add(exportItem);
         bakes.add(bakeMap);
+        bakes.add(triggerImpact);
+        bakes.add(resetPlanets);
+        bakes.add(containerSelectBox);
+        bakes.add(rollLoot);
+        bakes.add(blendObjectBox);
+        bakes.add(fetchBlender);
+        bakes.add(animSubMenuBtn);
         c.gridy = 6;
         c.gridx = 0;
         c.gridwidth = 8;
         add(bakes, c);
+
 
         calBox.addActionListener(e -> {
             if (!syncing) model.setCaliber((String) calBox.getSelectedItem());

@@ -242,4 +242,31 @@ public final class Items {
                     g.set(x, y, z, MaterialPalette.SHEET_METAL,
                             MaterialPalette.defaultRgb(MaterialPalette.SHEET_METAL), 0);
     }
+
+    /** Silhouette icon template for weapons in item mode. */
+    public static void paintWeaponSilhouette(VoxelGrid g, String weaponId) {
+        g.clear();
+        int mat = MaterialPalette.SHEET_METAL;
+        int rgb = MaterialPalette.defaultRgb(mat);
+        // Base receiver / barrel / grip silhouette layout
+        if ("sidearm_light".equals(weaponId)) {
+            for (int x = 0; x < 4; x++) g.set(x, 1, 0, mat, rgb, 0);
+            for (int x = 0; x < 2; x++) g.set(x, 0, 0, mat, rgb, 0);
+        } else if ("smg_light".equals(weaponId)) {
+            for (int x = 1; x < 6; x++) g.set(x, 2, 0, mat, rgb, 0);
+            for (int x = 2; x < 4; x++) g.set(x, 1, 0, mat, rgb, 0);
+            g.set(3, 0, 0, mat, rgb, 0); // stick mag
+        } else if ("shotgun_light".equals(weaponId)) {
+            for (int x = 0; x < 8; x++) g.set(x, 1, 0, mat, rgb, 0);
+            for (int x = 0; x < 3; x++) g.set(x, 0, 0, mat, rgb, 0); // stock
+            for (int x = 4; x < 6; x++) g.set(x, 0, 0, mat, rgb, 0); // pump
+        } else {
+            // General rifle / carbine / sniper silhouette
+            for (int x = 0; x < 8; x++) g.set(x, 1, 0, mat, rgb, 0); // barrel/receiver
+            for (int x = 0; x < 2; x++) g.set(x, 0, 0, mat, rgb, 0); // stock
+            g.set(2, 0, 0, mat, rgb, 0); // grip
+            g.set(4, 0, 0, mat, rgb, 0); // mag
+            g.set(3, 2, 0, mat, rgb, 0); // sight/optic
+        }
+    }
 }

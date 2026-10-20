@@ -7,19 +7,19 @@
   "fire_mode": "semi",
   "ammo_id": "light_fmj",
   "stats": {
-    "damage": 9.5,
-    "impact": 14.0,
-    "recoil": 7.0,
-    "handling": 16.0,
-    "weight": 6.0,
-    "optic": 1.0
+    "damage": 10.5,
+    "impact": 12.0,
+    "recoil": 8.0,
+    "handling": 18.0,
+    "weight": 5.5,
+    "optic": 1.5
   },
   "parts": {
-    "barrel": 4,
-    "action": 5,
-    "bolt_chamber": 2,
-    "trigger": 1,
-    "grip_stock": 3,
-    "sight": 1
+    "barrel": 3,
+    "action": 86,
+    "bolt_chamber": 6,
+    "trigger": 2,
+    "grip_stock": 42,
+    "sight": 2
   }
 }

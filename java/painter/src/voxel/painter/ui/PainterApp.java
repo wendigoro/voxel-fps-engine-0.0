@@ -10,6 +10,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 import javax.imageio.ImageIO;
 import javax.swing.JFileChooser;
@@ -31,7 +32,9 @@ import javax.swing.WindowConstants;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.MatteBorder;
 import javax.swing.filechooser.FileNameExtensionFilter;
+import voxel.painter.anim.AnimationClip;
 import voxel.painter.filter.BitcrushUpscale;
+import voxel.painter.grid.BlenderBridge;
 import voxel.painter.grid.Items;
 import voxel.painter.grid.MaterialPalette;
 import voxel.painter.grid.VoxDocument;
@@ -55,6 +58,7 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
     private final ModeExtrasPanel modeExtras;
     private Path lastDir;
     private boolean syncingTabs;
+    private AnimationClip currentAnimClip;
 
     public PainterApp(Path repoRoot) {
         super("Voxel Painter");
@@ -246,8 +250,20 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         file.add(item("Export weapon.json…", null, this::onExportWeapon));
         file.add(item("Export item.json…", null, this::onExportItem));
         file.addSeparator();
+        file.add(item("Fetch from Blender project (.blend)…", KeyStroke.getKeyStroke(KeyEvent.VK_B, InputEvent.CTRL_DOWN_MASK), this::onFetchBlender));
+        file.addSeparator();
         file.add(item("Exit", null, () -> System.exit(0)));
         bar.add(file);
+
+        JMenu animMenu = new JMenu("Animation");
+        animMenu.add(item("Animation Sub-Menu & Modifiers…",
+                KeyStroke.getKeyStroke(KeyEvent.VK_M, InputEvent.CTRL_DOWN_MASK),
+                this::onOpenAnimationSubMenu));
+        animMenu.add(item("Fetch Action from Blender project…",
+                KeyStroke.getKeyStroke(KeyEvent.VK_A, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK),
+                this::onFetchBlenderAction));
+        animMenu.add(item("Export Active Animation Clip (.anim.json)…", null, this::onExportAnimationClip));
+        bar.add(animMenu);
 
         JMenu actions = new JMenu("Dev");
         actions.add(item("Build engine", null,
@@ -425,6 +441,76 @@ public final class PainterApp extends JFrame implements PainterModel.Listener {
         } catch (Exception ex) {
             JOptionPane.showMessageDialog(this, ex.getMessage(),
                     "Item export failed", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void onFetchBlender() {
+        Path repo = scripts.repoRoot();
+        Path defaultBlend = BlenderBridge.defaultBlendPath(repo);
+        List<String> objects = BlenderBridge.listObjects(repo, defaultBlend);
+        Object[] opts = objects.toArray();
+        Object pick = JOptionPane.showInputDialog(
+                this, "Select Blender mesh object to fetch:", "Fetch from Blender", JOptionPane.QUESTION_MESSAGE,
+                null, opts, opts.length > 0 ? opts[0] : "starter_rifle");
+        if (pick == null) return;
+        boolean ok = model.fetchFromBlender(repo, defaultBlend, pick.toString());
+        if (ok) {
+            syncModeTab();
+            appendLog("Fetched Blender object '" + pick + "' from " + (defaultBlend != null ? defaultBlend.getFileName() : "project"));
+        } else {
+            appendLog("Failed to fetch Blender object '" + pick + "'");
+            JOptionPane.showMessageDialog(this, "Could not fetch object '" + pick + "' from Blender project.",
+                    "Fetch failed", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void onOpenAnimationSubMenu() {
+        AnimationSubMenuPanel.showDialog(this, scripts.repoRoot(), currentAnimClip);
+    }
+
+    private void onFetchBlenderAction() {
+        Path repo = scripts.repoRoot();
+        Path defaultBlend = BlenderBridge.defaultBlendPath(repo);
+        List<String> actions = BlenderBridge.listActions(repo, defaultBlend);
+        Object[] opts = actions.toArray();
+        Object pick = JOptionPane.showInputDialog(
+                this, "Select Blender animation action to fetch:", "Fetch Action from Blender",
+                JOptionPane.QUESTION_MESSAGE, null, opts, opts.length > 0 ? opts[0] : "Humanoid Walk Cycle");
+        if (pick == null) return;
+        try {
+            AnimationClip clip = BlenderBridge.fetchAnimation(repo, defaultBlend, pick.toString());
+            if (clip != null) {
+                currentAnimClip = clip;
+                appendLog("Fetched Blender animation action '" + pick + "' (" + clip.tracks.size() + " tracks, "
+                        + String.format(Locale.ROOT, "%.2fs", clip.durationSec) + ")");
+                AnimationSubMenuPanel.showDialog(this, repo, currentAnimClip);
+            }
+        } catch (Exception ex) {
+            appendLog("Failed to fetch Blender action '" + pick + "': " + ex.getMessage());
+            JOptionPane.showMessageDialog(this, "Could not fetch action: " + ex.getMessage(), "Fetch Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void onExportAnimationClip() {
+        if (currentAnimClip == null) {
+            JOptionPane.showMessageDialog(this, "No active animation clip loaded. Fetch an action from Blender first.",
+                    "No Clip", JOptionPane.INFORMATION_MESSAGE);
+            onFetchBlenderAction();
+            return;
+        }
+        JFileChooser fc = new JFileChooser(lastDir == null ? null : lastDir.toFile());
+        fc.setSelectedFile(new java.io.File(currentAnimClip.id + ".anim.json"));
+        if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        Path path = fc.getSelectedFile().toPath();
+        if (!path.getFileName().toString().endsWith(".anim.json") && !path.getFileName().toString().endsWith(".json")) {
+            path = path.resolveSibling(path.getFileName() + ".anim.json");
+        }
+        try {
+            currentAnimClip.save(path);
+            appendLog("Saved animation clip " + path + " tracks=" + currentAnimClip.tracks.size());
+            lastDir = path.getParent();
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Export failed", JOptionPane.ERROR_MESSAGE);
         }
     }
 

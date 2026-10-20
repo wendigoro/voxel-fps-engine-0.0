@@ -44,9 +44,18 @@
 // The backend header keeps this behind #if 0 so it need not pull in windows.h.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam,
                                                              LPARAM lParam);
+#include "webview_host.hpp"
 #include "sim_input.hpp"
 #include "movement.hpp"
 #include "ballistics.hpp"
+#include "char_model.hpp"
+#include "char_mesh.hpp"
+#include "weapon_model.hpp"
+#include "structural_matrix.hpp"
+#include "anim_clip.hpp"
+#include "planetary/ztile_pyramid.hpp"
+#include "loot_system.hpp"
+#include "engine_layers.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -264,9 +273,23 @@ struct QueueFamilyIndices {
     bool complete() const { return graphics >= 0 && present >= 0; }
 };
 
+static std::wstring utf8ToWide(const std::string& str) {
+    if (str.empty()) return L"";
+    int count = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
+    if (count <= 0) return L"";
+    std::wstring w(count - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &w[0], count);
+    return w;
+}
+
 // ---- globals / app state ----
 static HINSTANCE g_hInstance;
-static HWND g_hwnd;
+static HWND g_hMainWindow = nullptr;
+static HWND g_hViewportWnd = nullptr;
+static HWND g_hWebPanelWnd = nullptr;
+static HWND g_hwnd = nullptr; // Aliased to g_hViewportWnd for viewport operations
+static bool g_editorMode = false;
+static WebViewHost g_webHost;
 static bool g_running = true;
 static bool g_resized = false;
 static int g_width = WIDTH;
@@ -283,11 +306,151 @@ static int g_mouseX = 0, g_mouseY = 0, g_lastMouseX = 0, g_lastMouseY = 0;
 // The view's raw device state. The simulation never reads this: buildSimInput()
 // translates it into player intent, and that intent is all sim::tick() receives.
 static SimInput g_pendingInput;
+
+enum class KeyAction : int {
+    MoveForward = 0,
+    MoveBackward,
+    MoveLeft,
+    MoveRight,
+    Jump,
+    Sprint,
+    Crouch,
+    Dash,
+    StanceCycle,
+    LeanLeft,
+    LeanRight,
+    PrimaryFire,
+    AimDownSights,
+    ReloadOrRotate,
+    CycleWeapon,
+    CycleFireMode,
+    Interact,
+    ToggleInventory,
+    ThirdPerson,
+    Count
+};
+
+struct KeyActionDef {
+    KeyAction action;
+    const char* id;
+    const char* label;
+    const char* category;
+    int defaultKey1;
+    int defaultKey2;
+};
+
+static const KeyActionDef kKeyActionDefs[] = {
+    { KeyAction::MoveForward,     "move_forward",    "Move Forward",        "Movement",         'W',         VK_UP },
+    { KeyAction::MoveBackward,    "move_backward",   "Move Backward",       "Movement",         'S',         VK_DOWN },
+    { KeyAction::MoveLeft,        "move_left",       "Move Left",           "Movement",         'A',         VK_LEFT },
+    { KeyAction::MoveRight,       "move_right",      "Move Right",          "Movement",         'D',         VK_RIGHT },
+    { KeyAction::Jump,            "jump",            "Jump",                "Movement",         VK_SPACE,    0 },
+    { KeyAction::Sprint,          "sprint",          "Sprint",              "Movement",         VK_SHIFT,    0 },
+    { KeyAction::Crouch,          "crouch",          "Crouch",              "Movement",         VK_CONTROL,  0 },
+    { KeyAction::Dash,            "dash",            "Dash",                "Movement",         'C',         0 },
+    { KeyAction::StanceCycle,     "stance_cycle",    "Stance Cycle",        "Movement",         'V',         0 },
+    { KeyAction::LeanLeft,        "lean_left",       "Lean Left",           "Movement",         'Q',         0 },
+    { KeyAction::LeanRight,       "lean_right",      "Lean Right",          "Movement",         'E',         0 },
+
+    { KeyAction::PrimaryFire,     "primary_fire",    "Primary Fire",        "Combat",           VK_LBUTTON,  0 },
+    { KeyAction::AimDownSights,   "aim_down_sights", "Aim Down Sights",     "Combat",           VK_RBUTTON,  'X' },
+    { KeyAction::ReloadOrRotate,  "reload_rotate",   "Reload / Rotate",     "Combat",           'R',         0 },
+    { KeyAction::CycleWeapon,     "cycle_weapon",    "Cycle Weapon",        "Combat",           '1',         0 },
+    { KeyAction::CycleFireMode,   "cycle_fire_mode", "Cycle Fire Mode",     "Combat",           'B',         0 },
+
+    { KeyAction::Interact,        "interact",        "Interact / Pick Up",  "Interaction & UI", 'F',         'G' },
+    { KeyAction::ToggleInventory, "inventory",       "Inventory Lattice",   "Interaction & UI", VK_TAB,       0 },
+    { KeyAction::ThirdPerson,     "third_person",    "Third Person Camera", "Interaction & UI", 'T',         VK_F5 },
+};
+
+struct KeyBinding {
+    int key1 = 0;
+    int key2 = 0;
+};
+
+static KeyBinding g_keybindings[static_cast<int>(KeyAction::Count)];
+static int g_rebindingAction = -1;
+static int g_rebindingSlot = 0;
+static uint64_t g_rebindingFrame = 0;
+static std::string g_keybindStatus;
+
+static void initDefaultKeybindings() {
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        g_keybindings[i].key1 = kKeyActionDefs[i].defaultKey1;
+        g_keybindings[i].key2 = kKeyActionDefs[i].defaultKey2;
+    }
+}
+
+static bool isActionHeld(KeyAction act) {
+    const int idx = static_cast<int>(act);
+    if (idx < 0 || idx >= static_cast<int>(KeyAction::Count)) return false;
+    const int k1 = g_keybindings[idx].key1;
+    const int k2 = g_keybindings[idx].key2;
+    if (k1 > 0 && k1 < 256 && g_keys[k1]) return true;
+    if (k2 > 0 && k2 < 256 && g_keys[k2]) return true;
+    return false;
+}
+
+static bool isActionKey(KeyAction act, int vk) {
+    if (vk <= 0) return false;
+    const int idx = static_cast<int>(act);
+    if (idx < 0 || idx >= static_cast<int>(KeyAction::Count)) return false;
+    return g_keybindings[idx].key1 == vk || g_keybindings[idx].key2 == vk;
+}
+
+static std::string keyName(int vk) {
+    if (vk <= 0) return "-";
+    if (vk == VK_LBUTTON) return "Left Mouse";
+    if (vk == VK_RBUTTON) return "Right Mouse";
+    if (vk == VK_MBUTTON) return "Middle Mouse";
+    if (vk == VK_SPACE) return "Space";
+    if (vk == VK_SHIFT) return "Shift";
+    if (vk == VK_CONTROL) return "Ctrl";
+    if (vk == VK_MENU) return "Alt";
+    if (vk == VK_TAB) return "Tab";
+    if (vk == VK_ESCAPE) return "Esc";
+    if (vk == VK_RETURN) return "Enter";
+    if (vk == VK_BACK) return "Backspace";
+    if (vk == VK_DELETE) return "Del";
+    if (vk == VK_UP) return "Up Arrow";
+    if (vk == VK_DOWN) return "Down Arrow";
+    if (vk == VK_LEFT) return "Left Arrow";
+    if (vk == VK_RIGHT) return "Right Arrow";
+    if (vk >= VK_F1 && vk <= VK_F12) return "F" + std::to_string(vk - VK_F1 + 1);
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return std::string(1, static_cast<char>(vk));
+
+    char name[64]{};
+    UINT sc = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+    if (sc != 0 && GetKeyNameTextA(sc << 16, name, sizeof(name)) > 0) {
+        return std::string(name);
+    }
+    return "Key " + std::to_string(vk);
+}
 // Free-float first-person POV camera (radians)
 static float g_yaw = 0.0f;          // 0 = looking toward -Z
 static float g_pitch = -0.28f; // slightly down with higher fisheye POV
 static float g_moveSpeed = 0.045f;  // walk speed (world units/sec at 0.001 voxel scale)
 static float g_lookSens = 0.0035f;
+// View-side character model orientation, camera locking, and third-person perspective
+static float g_legYaw = 0.0f;
+static bool g_thirdPerson = false;
+static Vec3 g_charHeadWorldPos{};
+static float g_charLocomotionPhase = 0.0f;
+static Vec3 g_playerPosPrevTick{};
+static bool g_forceWeaponHold = true;
+static structural::MatrixSystem g_structuralMatrix;
+static planetary::MultiPlanetSystem g_multiPlanetSystem;
+static anim::AnimController g_animController;
+static anim::PoseSample g_currentAnimPose;
+static float g_animAuthoredWeight = 0.85f;
+static void tryLoadAnimClips();
+
+static inline float angleDiff(float target, float current) {
+    float diff = target - current;
+    while (diff > static_cast<float>(M_PI)) diff -= static_cast<float>(2.0 * M_PI);
+    while (diff < -static_cast<float>(M_PI)) diff += static_cast<float>(2.0 * M_PI);
+    return diff;
+}
 // Locked FPS camera follows physics player (eye). Initialized in spawnPlayer().
 static Vec3 g_camPos(
     WORLD_W * VOXEL_SIZE * 0.5f,
@@ -295,17 +458,7 @@ static Vec3 g_camPos(
     WORLD_D * VOXEL_SIZE * 0.72f);
 
 // Physics-bound player body (feet at py; hitbox is unit-grid AABB).
-struct PlayerBody {
-    float px = 0, py = 0, pz = 0; // feet center (world)
-    float vx = 0, vy = 0, vz = 0;
-    bool onGround = false;
-    float lean = 0.0f;       // current lean -1..+1 (Q left, E right)
-    float leanTarget = 0.0f;
-    float eyeHeight = 0.0165f; // ~16.5 unit voxels
-    float height = 0.0185f;    // full body height
-    float radius = 0.0022f;    // horizontal half-extent (~2.2 unit voxels)
-    float jumpSpeed = 0.055f;
-};
+#include "player_body.hpp"
 static PlayerBody g_player;
 static bool g_wantJump = false;
 
@@ -318,6 +471,7 @@ static movement::CameraOffset g_camOffset;
 // The sim eye as it stood before the most recent tick; renderEye() interpolates
 // from here to g_camPos. Written only by the host loop, read only by the view.
 static Vec3 g_camPosPrevTick;
+static Vec3 lerpEye(const Vec3& a, const Vec3& b, float t);
 // Smoke pause probe (see the main loop).
 static bool g_smokePauseDone = false;
 static bool g_smokePauseFrozenOk = false;
@@ -380,6 +534,10 @@ static mapvox::Environment g_mapEnvironment;
 static std::vector<mapvox::PickupPlacement> g_mapPickups;
 static std::string g_mapPath; // file the world was loaded from (empty = procedural)
 static int g_mapPrefabsStamped = 0;
+// The prefab instances currently in the world: the map's own list plus any the
+// editor stamps. `g_mapPrefabsStamped` is the same population; the list is what
+// the editor scene hierarchy reads back.
+static std::vector<mapvox::PrefabPlacement> g_mapPrefabInstances;
 // --map <path>: load this map instead of the default warehouse_v1. Empty means
 // the default search list.
 static std::string g_mapOverridePath;
@@ -475,11 +633,12 @@ static bool g_pickupPressed = false;   // G: take the world item under the cross
 
 // Inventory lattice mesh: unit cubes emitted camera-relative into their own
 // overlay pass. 36 lattice cells + 8 equipment slot markers + margin.
-static constexpr uint32_t kInventoryMaxVerts = 4096;
+static constexpr uint32_t kInventoryMaxVerts = 8192;
 static VkBuffer g_inventoryVB = VK_NULL_HANDLE;
 static VkDeviceMemory g_inventoryMem = VK_NULL_HANDLE;
 static void* g_inventoryMapped = nullptr;
 static uint32_t g_inventoryVertexCount = 0;
+static uint32_t g_inventorySlotVertexCount = 0;
 static uint32_t g_inventoryOverlayFrames = 0; // frames that actually submitted the pass
 static constexpr float kInventoryMatId = rc::attr(rc::RenderClass::InventoryLattice);
 static constexpr float kPickupMatId = rc::attr(rc::RenderClass::WorldPickup); // main pass, not the overlay
@@ -512,11 +671,12 @@ static VkDeviceMemory g_debrisMem = VK_NULL_HANDLE;
 static void* g_debrisMapped = nullptr;
 static uint32_t g_debrisVertexCount = 0;
 // True cubic chips: 36 verts/particle (6 faces × 2 tris). Cap keeps upload cheap.
-static constexpr uint32_t kDebrisMaxParticlesDraw = 160;
+static constexpr uint32_t kDebrisMaxParticlesDraw = 512;
 static constexpr uint32_t kDebrisVertsPerParticle = 36;
 static constexpr uint32_t kMuzzleFlashCubes = 4;
+static constexpr uint32_t kMaxProjectileTracersDraw = 64;
 static constexpr uint32_t kDebrisMaxVerts =
-    kDebrisMaxParticlesDraw * kDebrisVertsPerParticle + kMuzzleFlashCubes * 36u;
+    kDebrisMaxParticlesDraw * kDebrisVertsPerParticle + kMuzzleFlashCubes * 36u + kMaxProjectileTracersDraw * 72u;
 static double g_debrisUploadUsSum = 0.0;
 static double g_debrisUploadUsMax = 0.0;
 static int g_debrisUploadSamples = 0;
@@ -557,6 +717,7 @@ static VkDescriptorSetLayout g_dsl = VK_NULL_HANDLE;
 static VkPipelineLayout g_pipelineLayout = VK_NULL_HANDLE;
 static VkPipeline g_pipeline = VK_NULL_HANDLE;
 static VkPipeline g_overlayPipeline = VK_NULL_HANDLE;
+static VkPipeline g_charPipeline = VK_NULL_HANDLE;
 static VkCommandPool g_cmdPool = VK_NULL_HANDLE;
 static std::vector<VkCommandBuffer> g_cmdBuffers;
 static VkImage g_depthImage = VK_NULL_HANDLE;
@@ -599,6 +760,20 @@ static VkDeviceMemory g_uboMems[MAX_FRAMES]{};
 static void* g_uboMapped[MAX_FRAMES]{};
 static VkDescriptorPool g_descPool = VK_NULL_HANDLE;
 static VkDescriptorSet g_descSets[MAX_FRAMES]{};
+static VkBuffer g_boneBuf[MAX_FRAMES]{};
+static VkDeviceMemory g_boneMem[MAX_FRAMES]{};
+static void* g_boneMapped[MAX_FRAMES]{};
+
+// Skinned character model buffers (Models layer, view-side only)
+static VkBuffer g_charVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_charMem = VK_NULL_HANDLE;
+static void* g_charMapped = nullptr;
+static VkBuffer g_charIB = VK_NULL_HANDLE;
+static VkDeviceMemory g_charIBMem = VK_NULL_HANDLE;
+static void* g_charIBMapped = nullptr;
+static uint32_t g_charIndexCount = 0;
+static uint32_t g_charVertexCount = 0;
+static char_mesh::ExtractedMesh g_charExtracted;
 static VkSemaphore g_imageAvailable[MAX_FRAMES]{};
 static VkSemaphore g_renderFinished[MAX_FRAMES]{};
 static VkFence g_inFlight[MAX_FRAMES]{};
@@ -1031,6 +1206,7 @@ static void paceFrame120() {
 
 static Vec3 cameraForward();
 static Vec3 cameraRight();
+static Vec3 cameraUp();
 
 static void ensureSkyTileBuffer() {
     if (g_skyTileVB) return;
@@ -1212,8 +1388,10 @@ static bool projectToScreen(const Vec3& p, float& outX, float& outY) {
     const float cy = vp.m[1] * p.x + vp.m[5] * p.y + vp.m[9] * p.z + vp.m[13];
     const float cw = vp.m[3] * p.x + vp.m[7] * p.y + vp.m[11] * p.z + vp.m[15];
     if (cw <= 1e-6f) return false;
-    outX = (cx / cw * 0.5f + 0.5f) * static_cast<float>(g_extent.width);
-    outY = (1.0f - (cy / cw * 0.5f + 0.5f)) * static_cast<float>(g_extent.height);
+    const float w = g_width > 0 ? static_cast<float>(g_width) : static_cast<float>(g_extent.width);
+    const float h = g_height > 0 ? static_cast<float>(g_height) : static_cast<float>(g_extent.height);
+    outX = (cx / cw * 0.5f + 0.5f) * w;
+    outY = (cy / cw * 0.5f + 0.5f) * h;
     return true;
 }
 
@@ -1238,6 +1416,57 @@ static bool cellScreenRect(const InventoryDisplay& d, float x0, float y0, float 
     return true;
 }
 
+
+// Layout specification for character armor configuration zones and equipment rig.
+struct EquipSlotSpec {
+    EquipSlot slot;
+    const char* name;
+    int x0, y0, z0;
+    int sx, sy, sz;
+    bool hasSec;
+    int secX0, secY0, secZ0;
+    int secSX, secSY, secSZ;
+};
+
+static constexpr EquipSlotSpec kEquipSlotSpecs[kEquipSlotCount] = {
+    // Primary0 (0): main rifle holster upper left
+    { EquipSlot::Primary0, "Primary 0", -13, 6, 0, 3, 2, 2, false, 0, 0, 0, 0, 0, 0 },
+    // Primary1 (1): secondary weapon mid left
+    { EquipSlot::Primary1, "Primary 1", -13, 3, 0, 3, 2, 2, false, 0, 0, 0, 0, 0, 0 },
+    // Small (2): sidearm lower left
+    { EquipSlot::Small,    "Sidearm",   -13, 0, 0, 2, 2, 3, false, 0, 0, 0, 0, 0, 0 },
+    // ArmorLegs (3): legs lower center
+    { EquipSlot::ArmorLegs,"Legs",      -8, 1, 0, 3, 3, 3, false, 0, 0, 0, 0, 0, 0 },
+    // ArmorChest (4): chest mid center
+    { EquipSlot::ArmorChest,"Chest",    -8, 4, 0, 3, 3, 3, false, 0, 0, 0, 0, 0, 0 },
+    // ArmorArms (5): arms flanking chest: left arm -9, right arm -5
+    { EquipSlot::ArmorArms, "Arms",     -9, 4, 0, 1, 3, 3, true, -5, 4, 0, 1, 3, 3 },
+    // ArmorHead (6): head top center
+    { EquipSlot::ArmorHead, "Head",     -8, 7, 0, 3, 2, 3, false, 0, 0, 0, 0, 0, 0 },
+    // Backpack (7): pack frame between mannequin and pack volume
+    { EquipSlot::Backpack,  "Backpack", -3, 0, 0, 2, 3, 2, false, 0, 0, 0, 0, 0, 0 },
+};
+
+static void emitSlotBrackets(const Vec3& origin, const Vec3& dRight, const Vec3& dUp, const Vec3& dFwd,
+                             int bx0, int by0, int bz0, int bsx, int bsy,
+                             float cr, float cg, float cb, uint32_t& wi) {
+    const int xMin = bx0;
+    const int xMax = bx0 + bsx - 1;
+    const int yMin = by0;
+    const int yMax = by0 + bsy - 1;
+    emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMin), static_cast<float>(yMin),
+                      static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
+    if (xMax != xMin)
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMax), static_cast<float>(yMin),
+                          static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
+    if (yMax != yMin)
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMin), static_cast<float>(yMax),
+                          static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
+    if (xMax != xMin && yMax != yMin)
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(xMax), static_cast<float>(yMax),
+                          static_cast<float>(bz0), cr, cg, cb, static_cast<float>(kInventoryMatId), wi);
+}
+
 // Rebuild the lattice mesh. Rebuilt every frame while open (cheap at ~1.6k
 // verts) because the display basis follows the camera.
 static void updateInventoryMesh() {
@@ -1256,13 +1485,13 @@ static void updateInventoryMesh() {
         return;
     }
 
-    // Display basis: camera basis yawed so two faces of the volume are visible
-    // (a 3D projection rather than a flat orthographic panel). Built as two true
-    // rotations — yaw about the view up, then pitch about the yawed right — so
-    // the basis stays orthonormal. A tilt applied to only one axis (e.g.
-    // up*cp + fwd*sp) would shear it and turn the unit cells into rhomboids.
-    const float yaw = 0.52f; // ~30 degrees about the view up axis
-    const float pitch = 0.30f;
+    // Display basis: camera basis with subtle yaw and pitch so top and side
+    // faces of the unit cubes are visible (a 3D isometric projection rather
+    // than a flat orthographic panel). Built as two true rotations — yaw about
+    // the view up, then pitch about the yawed right — so the basis stays
+    // orthonormal (RULES.md rule 12).
+    const float yaw = 0.14f; // subtle ~8 degree relief, eliminating harsh perspective foreshortening
+    const float pitch = 0.08f;
     Vec3 fwd = cameraForward();
     Vec3 right = cameraRight();
     if (right.length() < 1e-5f) right = Vec3(1, 0, 0);
@@ -1277,11 +1506,11 @@ static void updateInventoryMesh() {
     const Vec3 dFwd = (dFwdY * cp + dUpY * sp).normalized();
     const Vec3 dUp = (dUpY * cp - dFwdY * sp).normalized();
 
-    // Anchor: down and to the right of the eye. A 3x3x4 cell block is
-    // 0.003 x 0.003 x 0.004 world units; the distance sets its screen size.
+    // Anchor: centered horizontally around the character rig and framed in the
+    // lower-middle field of view above the health HUD.
     const float k = kOverlayDepthScale;
     const float dist = 0.006f * k;
-    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0042f * k) + right * (0.0046f * k);
+    const Vec3 origin = g_camPos + fwd * dist + up * (-0.0032f * k) + right * (0.0020f * k);
 
     g_invDisplay.origin = origin;
     g_invDisplay.right = dRight;
@@ -1293,7 +1522,6 @@ static void updateInventoryMesh() {
     // ties break toward the cell closest to the lattice centre so the front face
     // of the volume wins over the back one.
     const Inventory& inv = g_inventory;
-    const int markerCol0 = -(inv.vol.sx + 2);
     g_invHover = InventoryHover{};
     {
         const float mx = static_cast<float>(g_mouseX);
@@ -1322,15 +1550,53 @@ static void updateInventoryMesh() {
             }
         }
         for (int s = 0; s < kEquipSlotCount; ++s) {
-            float ax, ay, bx, by;
-            if (!cellScreenRect(g_invDisplay, static_cast<float>(markerCol0 + (s & 1)),
-                                static_cast<float>(s >> 1), 0.0f, ax, ay, bx, by))
-                continue;
-            if (mx < ax || mx > bx || my < ay || my > by) continue;
-            g_invHover.slot = true;
-            g_invHover.slotIndex = s;
-            g_invHover.lattice = false;
-            break;
+            const auto& spec = kEquipSlotSpecs[s];
+            const int defIdx = inv.slotDef[s];
+            auto testSlotCell = [&](int cx, int cy, int cz) {
+                float ax, ay, bx, by;
+                if (!cellScreenRect(g_invDisplay, static_cast<float>(cx),
+                                    static_cast<float>(cy), static_cast<float>(cz), ax, ay, bx, by))
+                    return;
+                if (mx < ax || mx > bx || my < ay || my > by) return;
+                const int depth = cz * 4 + 2;
+                if (depth < bestDepth) {
+                    bestDepth = depth;
+                    g_invHover.slot = true;
+                    g_invHover.slotIndex = s;
+                    g_invHover.lattice = false;
+                }
+            };
+
+            if (defIdx >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                if (d && d->shape.valid()) {
+                    const ItemShape itemShape = rotatedShape(d->shape, inv.slotRot[s]);
+                    for (int iz = 0; iz < itemShape.sz; ++iz) {
+                        for (int iy = 0; iy < itemShape.sy; ++iy) {
+                            for (int ix = 0; ix < itemShape.sx; ++ix) {
+                                if (!itemShape.solid(ix, iy, iz)) continue;
+                                testSlotCell(spec.x0 + ix, spec.y0 + iy, spec.z0 + iz);
+                                if (spec.hasSec) {
+                                    testSlotCell(spec.secX0 + ix, spec.secY0 + iy, spec.secZ0 + iz);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int iy = 0; iy < spec.sy; ++iy) {
+                    for (int ix = 0; ix < spec.sx; ++ix) {
+                        testSlotCell(spec.x0 + ix, spec.y0 + iy, spec.z0);
+                    }
+                }
+                if (spec.hasSec) {
+                    for (int iy = 0; iy < spec.secSY; ++iy) {
+                        for (int ix = 0; ix < spec.secSX; ++ix) {
+                            testSlotCell(spec.secX0 + ix, spec.secY0 + iy, spec.secZ0);
+                        }
+                    }
+                }
+            }
         }
         g_invHover.overCell = g_invHover.lattice || g_invHover.slot;
     }
@@ -1354,23 +1620,23 @@ static void updateInventoryMesh() {
                 if (inst >= 0 && inst < static_cast<int>(inv.items.size())) {
                     const ItemDef* d = itemDefAt(g_itemDefs, inv.items[inst].defIndex);
                     if (d) {
-                        cr = d->cr;
-                        cg = d->cg;
-                        cb = d->cb;
+                        cr = d->cr * 0.18f;
+                        cg = d->cg * 0.18f;
+                        cb = d->cb * 0.18f;
                     } else {
-                        cr = cg = cb = 0.8f;
+                        cr = cg = cb = 0.15f;
                     }
                 } else {
-                    cr = 0.10f;
-                    cg = 0.11f;
-                    cb = 0.14f; // dim backing for an empty cell
+                    cr = 0.012f;
+                    cg = 0.016f;
+                    cb = 0.022f; // subtle dark open strut frame for empty cell
                 }
                 // Hover highlight on the cell under the cursor.
                 if (g_invHover.lattice && g_invHover.x == ix && g_invHover.y == iy &&
                     g_invHover.z == iz) {
-                    cr = std::min(1.0f, cr + 0.30f);
-                    cg = std::min(1.0f, cg + 0.34f);
-                    cb = std::min(1.0f, cb + 0.38f);
+                    cr = std::min(1.0f, cr + 0.22f);
+                    cg = std::min(1.0f, cg + 0.26f);
+                    cb = std::min(1.0f, cb + 0.32f);
                 }
                 emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(ix),
                                   static_cast<float>(iy), static_cast<float>(iz), cr, cg, cb,
@@ -1401,35 +1667,90 @@ static void updateInventoryMesh() {
         }
     }
 
-    // Equipment slot markers: 8 one-cell cubes in a 2x4 block left of the volume.
+    const uint32_t wiBeforeSlots = wi;
+
+    // Character Armor Configuration & Equipment Rig (Pure Lattice Visuals)
     for (int s = 0; s < kEquipSlotCount; ++s) {
+        const auto& spec = kEquipSlotSpecs[s];
         const int defIdx = inv.slotDef[s];
-        float cr, cg, cb;
-        if (defIdx >= 0) {
-            const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
-            if (d) {
-                cr = d->cr * 1.15f;
-                cg = d->cg * 1.15f;
-                cb = d->cb * 1.15f;
+        const bool isHovered = g_invHover.slot && g_invHover.slotIndex == s;
+
+        float tintR = 0.0f, tintG = 0.0f, tintB = 0.0f;
+        bool overrideColor = false;
+        if (isHovered && inv.held >= 0) {
+            const int heldDef = inv.items[static_cast<size_t>(inv.held)].defIndex;
+            if (canEquip(g_itemDefs, heldDef, spec.slot)) {
+                overrideColor = true;
+                tintR = 0.25f; tintG = 0.90f; tintB = 0.40f; // Green: fits
             } else {
-                cr = cg = cb = 0.8f;
+                overrideColor = true;
+                tintR = 0.90f; tintG = 0.25f; tintB = 0.25f; // Red: invalid
+            }
+        }
+
+        if (defIdx >= 0) {
+            // Equipped piece: emit 3D unit-cube shape of the item
+            const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+            if (d && d->shape.valid()) {
+                float cr = overrideColor ? tintR : d->cr * 0.22f;
+                float cg = overrideColor ? tintG : d->cg * 0.22f;
+                float cb = overrideColor ? tintB : d->cb * 0.22f;
+                if (isHovered && !overrideColor) {
+                    cr = std::min(1.0f, cr + 0.22f);
+                    cg = std::min(1.0f, cg + 0.26f);
+                    cb = std::min(1.0f, cb + 0.32f);
+                }
+                const ItemShape itemShape = rotatedShape(d->shape, inv.slotRot[s]);
+                for (int iz = 0; iz < itemShape.sz; ++iz) {
+                    for (int iy = 0; iy < itemShape.sy; ++iy) {
+                        for (int ix = 0; ix < itemShape.sx; ++ix) {
+                            if (!itemShape.solid(ix, iy, iz)) continue;
+                            emitInventoryCube(origin, dRight, dUp, dFwd,
+                                              static_cast<float>(spec.x0 + ix),
+                                              static_cast<float>(spec.y0 + iy),
+                                              static_cast<float>(spec.z0 + iz),
+                                              cr, cg, cb,
+                                              static_cast<float>(kInventoryMatId), wi);
+                            if (spec.hasSec) {
+                                emitInventoryCube(origin, dRight, dUp, dFwd,
+                                                  static_cast<float>(spec.secX0 + ix),
+                                                  static_cast<float>(spec.secY0 + iy),
+                                                  static_cast<float>(spec.secZ0 + iz),
+                                                  cr, cg, cb,
+                                                  static_cast<float>(kInventoryMatId), wi);
+                            }
+                        }
+                    }
+                }
             }
         } else {
-            cr = 0.16f;
-            cg = 0.17f;
-            cb = 0.20f; // empty slot
+            // Empty slot: emit zone bracket lattice in unit cubes
+            float cr, cg, cb;
+            if (overrideColor) {
+                cr = tintR; cg = tintG; cb = tintB;
+            } else if (isHovered) {
+                cr = 0.20f; cg = 0.35f; cb = 0.50f; // bright cyan hover
+            } else if (slotIsArmor(spec.slot)) {
+                cr = 0.035f; cg = 0.045f; cb = 0.065f; // armor frame blue/cyan
+            } else if (slotIsWeapon(spec.slot)) {
+                cr = 0.065f; cg = 0.050f; cb = 0.035f; // weapon frame amber
+            } else {
+                cr = 0.045f; cg = 0.055f; cb = 0.040f; // backpack frame olive
+            }
+            emitSlotBrackets(origin, dRight, dUp, dFwd, spec.x0, spec.y0, spec.z0, spec.sx, spec.sy, cr, cg, cb, wi);
+            if (spec.hasSec) {
+                emitSlotBrackets(origin, dRight, dUp, dFwd, spec.secX0, spec.secY0, spec.secZ0, spec.secSX, spec.secSY, cr, cg, cb, wi);
+            }
         }
-        if (g_invHover.slot && g_invHover.slotIndex == s) {
-            cr = std::min(1.0f, cr + 0.30f);
-            cg = std::min(1.0f, cg + 0.34f);
-            cb = std::min(1.0f, cb + 0.38f);
-        }
-        const float mx = static_cast<float>(markerCol0 + (s & 1));
-        const float my = static_cast<float>(s >> 1);
-        emitInventoryCube(origin, dRight, dUp, dFwd, mx, my, 0.0f, cr, cg, cb,
-                          static_cast<float>(kInventoryMatId), wi);
     }
 
+    // Pedestal base under mannequin legs
+    for (int x = -8; x <= -6; ++x) {
+        emitInventoryCube(origin, dRight, dUp, dFwd, static_cast<float>(x), 0.0f, 0.0f,
+                          0.03f, 0.035f, 0.045f, static_cast<float>(kInventoryMatId), wi);
+    }
+
+    g_inventorySlotVertexCount = wi - wiBeforeSlots;
     g_inventoryVertexCount = emitHealthHud(wi);
 }
 
@@ -1474,6 +1795,26 @@ static void ensurePickupBuffer() {
                  g_pickupVB, g_pickupMem);
     vkMapMemory(g_device, g_pickupMem, 0, size, 0, &g_pickupMapped);
     if (g_pickupMapped) std::memset(g_pickupMapped, 0, static_cast<size_t>(size));
+}
+
+// Weapon models & viewmodel rendering (Models layer)
+static std::vector<weapon_view::WeaponModel> g_weaponModels;
+static weapon_view::ViewModelAnim g_viewmodelAnim;
+static VkBuffer g_weaponVB = VK_NULL_HANDLE;
+static VkDeviceMemory g_weaponMem = VK_NULL_HANDLE;
+static void* g_weaponMapped = nullptr;
+static uint32_t g_weaponVertexCount = 0;
+static constexpr uint32_t kWeaponMaxVerts = 16384;
+static char_model::Mat4 g_lastRHandSocket = char_model::Mat4::identity();
+
+static void ensureWeaponBuffer() {
+    if (g_weaponVB) return;
+    VkDeviceSize size = sizeof(Vertex) * kWeaponMaxVerts;
+    createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_weaponVB, g_weaponMem);
+    vkMapMemory(g_device, g_weaponMem, 0, size, 0, &g_weaponMapped);
+    if (g_weaponMapped) std::memset(g_weaponMapped, 0, static_cast<size_t>(size));
 }
 
 // World AABB of a pickup's solid cells, in world units.
@@ -1623,6 +1964,36 @@ static void buildFixtureMesh() {
     g_fixtureVertexCount = wi;
 }
 
+// Skinned character mesh initialization and GPU buffer allocation (Models layer).
+// Canonical humanoid sub-lattice is extracted once into static vertex/index buffers.
+static void initCharacterMesh() {
+    if (g_charVB != VK_NULL_HANDLE) return;
+    const char_model::Model model = char_model::generateHumanoid(0);
+    g_charExtracted = char_mesh::extractMesh(model);
+    if (g_charExtracted.vertices.empty() || g_charExtracted.indices.empty()) return;
+
+    g_charVertexCount = static_cast<uint32_t>(g_charExtracted.vertices.size());
+    g_charIndexCount = static_cast<uint32_t>(g_charExtracted.indices.size());
+
+    const VkDeviceSize vbSize = sizeof(char_mesh::SkinnedVertex) * g_charVertexCount;
+    createBuffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_charVB, g_charMem);
+    vkMapMemory(g_device, g_charMem, 0, vbSize, 0, &g_charMapped);
+    if (g_charMapped) {
+        std::memcpy(g_charMapped, g_charExtracted.vertices.data(), static_cast<size_t>(vbSize));
+    }
+
+    const VkDeviceSize ibSize = sizeof(uint32_t) * g_charIndexCount;
+    createBuffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 g_charIB, g_charIBMem);
+    vkMapMemory(g_device, g_charIBMem, 0, ibSize, 0, &g_charIBMapped);
+    if (g_charIBMapped) {
+        std::memcpy(g_charIBMapped, g_charExtracted.indices.data(), static_cast<size_t>(ibSize));
+    }
+}
+
 static void updatePickupMesh() {
     if (!g_pickupMapped && g_pickupVB) ensurePickupBuffer();
     if (!g_pickupMapped) {
@@ -1700,13 +2071,26 @@ static void drainInventoryInput() {
     if (g_inventoryClick) {
         g_inventoryClick = false;
         if (g_inventory.held >= 0) {
-            if (g_invHover.lattice)
+            if (g_invHover.lattice) {
                 placeHeld(g_inventory, g_itemDefs, g_inventoryHandRot, g_invHover.x, g_invHover.y,
                           g_invHover.z);
+            } else if (g_invHover.slot) {
+                const int heldInst = g_inventory.held;
+                const int heldDef = g_inventory.items[static_cast<size_t>(heldInst)].defIndex;
+                const EquipSlot slot = static_cast<EquipSlot>(g_invHover.slotIndex);
+                if (canEquip(g_itemDefs, heldDef, slot)) {
+                    int displaced = -1;
+                    removePacked(g_inventory, heldInst);
+                    equipDef(g_inventory, g_itemDefs, heldDef, slot, displaced);
+                    if (displaced >= 0) {
+                        takeIntoHand(g_inventory, g_itemDefs, displaced);
+                    }
+                }
+            }
         } else if (g_invHover.lattice) {
             liftPacked(g_inventory, invIndexAt(g_inventory, g_invHover.x, g_invHover.y, g_invHover.z));
         } else if (g_invHover.slot) {
-            // Clicking a marker lifts what is in that equipment slot back out.
+            // Clicking an equipped slot lifts what is in that equipment slot back out.
             const int defIdx = g_inventory.slotDef[g_invHover.slotIndex];
             if (defIdx >= 0) {
                 const bool isPack = g_invHover.slotIndex == static_cast<int>(EquipSlot::Backpack);
@@ -1722,29 +2106,27 @@ static void drainInventoryInput() {
     }
 }
 
-// Cubic 8^3 debris chips + short-lived muzzle flash cubes (display only).
+// Cubic 8^3 debris chips + short-lived muzzle flash cubes + projectile tracers (display only).
 static void updateDebrisMesh() {
     const int alive = g_debris.activeCount();
     const bool flashOn = g_muzzleFlash > 0.02f;
-    if (alive <= 0 && !flashOn) {
+    const bool projsActive = !g_projectiles.empty();
+    if (alive <= 0 && !flashOn && !projsActive && !g_debris.meshDirty) {
         g_debrisVertexCount = 0;
         g_debrisWasActive = false;
         g_debris.meshDirty = false;
         return;
     }
-    // Skip rebuild only when nothing moved and no flash (still draw last mesh).
-    if (!g_debris.meshDirty && !flashOn && g_debrisWasActive && g_debrisVertexCount > 0) {
+    // Skip rebuild only when nothing moved, no active projectiles, and no flash (still draw last mesh).
+    if (!g_debris.meshDirty && !flashOn && !projsActive && g_debrisWasActive && g_debrisVertexCount > 0) {
         return;
     }
 
     ensureDebrisBuffer();
     if (!g_debrisMapped) { g_debrisVertexCount = 0; return; }
-
-    LARGE_INTEGER t0{}, t1{}, freq{};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-
-    Vertex* verts = reinterpret_cast<Vertex*>(g_debrisMapped);
+    alignas(64) static std::vector<Vertex> s_debrisScratch;
+    if (s_debrisScratch.size() < kDebrisMaxVerts) s_debrisScratch.resize(kDebrisMaxVerts);
+    Vertex* verts = s_debrisScratch.data();
     uint32_t wi = 0;
     auto put = [&](float px, float py, float pz,
                    float nx, float ny, float nz,
@@ -1761,19 +2143,25 @@ static void updateDebrisMesh() {
     };
 
     // Soft-cap drawn particles under load (36 verts each).
-    const int drawCap = g_stress ? 96 : static_cast<int>(kDebrisMaxParticlesDraw);
+    const int drawCap = g_stress ? 24 : static_cast<int>(kDebrisMaxParticlesDraw);
     int drawn = 0;
-    int stride = 1;
-    if (alive > drawCap) stride = (alive + drawCap - 1) / drawCap;
 
-    int seen = 0;
+    // 1. Stationary debris: sublattice crater dent marks & resting chips stay rendered
     for (const auto& p : g_debris.particles) {
-        if (!p.alive) continue;
-        if ((seen++ % stride) != 0) continue;
+        if (!p.alive || !p.stationary) continue;
         if (drawn >= drawCap) break;
-        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u) break;
+        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u - 72u) break;
         ++drawn;
         emitDebrisCube(p, kDebrisMatId, put);
+    }
+
+    // 2. Dynamic debris: flying chips and emissive sparks
+    for (const auto& p : g_debris.particles) {
+        if (!p.alive || p.stationary) continue;
+        if (drawn >= drawCap) break;
+        if (wi + kDebrisVertsPerParticle > kDebrisMaxVerts - kMuzzleFlashCubes * 36u - 72u) break;
+        ++drawn;
+        emitDebrisCube(p, p.emissive ? kMuzzleMatId : kDebrisMatId, put);
     }
 
     // Muzzle flash: stacked emissive cubes just ahead of the camera along aim.
@@ -1805,10 +2193,49 @@ static void updateDebrisMesh() {
         }
     }
 
+    // 3. In-flight projectile tracers (glowing bullet head + trailing streak)
+    int projDrawn = 0;
+    const int maxProjsDraw = g_stress ? 4 : static_cast<int>(kMaxProjectileTracersDraw);
+    for (const auto& p : g_projectiles) {
+        if (!p.alive) continue;
+        if (projDrawn >= maxProjsDraw) break;
+        if (wi + 72u > kDebrisMaxVerts) break;
+        ++projDrawn;
+
+        float cr = 1.0f, cg = 0.88f, cb = 0.45f; // ballistic gold default
+        if (p.def.caliber == "energy") {
+            cr = 0.25f; cg = 0.85f; cb = 1.0f; // cyan
+        } else if (p.def.effect == "explosive" || p.def.caliber == "explosive") {
+            cr = 1.0f; cg = 0.45f; cb = 0.15f; // orange
+        }
+
+        const float half = std::max(0.0006f, std::min(0.0022f, p.def.radius * 0.75f));
+        emitFlashCube(p.px, p.py, p.pz, half, cr, cg, cb, kMuzzleMatId, put);
+
+        // Trailing streak along velocity
+        const float speedSq = p.vx * p.vx + p.vy * p.vy + p.vz * p.vz;
+        if (speedSq > 1e-4f) {
+            const float speed = std::sqrt(speedSq);
+            const float tLen = std::min(0.008f, speed * 0.0012f);
+            const float tx = p.px - (p.vx / speed) * tLen;
+            const float ty = p.py - (p.vy / speed) * tLen;
+            const float tz = p.pz - (p.vz / speed) * tLen;
+            emitFlashCube(tx, ty, tz, half * 0.70f, cr * 0.65f, cg * 0.65f, cb * 0.65f, kMuzzleMatId, put);
+        }
+    }
+
     g_debrisVertexCount = wi;
     if (wi > g_debrisVertsPeak) g_debrisVertsPeak = wi;
     g_debrisWasActive = (wi > 0);
     g_debris.meshDirty = false;
+
+    LARGE_INTEGER t0{}, t1{}, freq{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    if (wi > 0 && g_debrisMapped) {
+        std::memcpy(g_debrisMapped, verts, wi * sizeof(Vertex));
+    }
 
     QueryPerformanceCounter(&t1);
     const double us = (double(t1.QuadPart - t0.QuadPart) * 1e6) / double(freq.QuadPart);
@@ -1929,17 +2356,20 @@ static void updateWindowTitle() {
     if (g_paused) t += "  —  PAUSED: Esc to resume, Shift+Esc quits";
     else if (g_cursorLocked) t += "  —  Esc pause";
     else t += "  —  click to look, Esc pause";
-    SetWindowTextA(g_hwnd, t.c_str());
+    HWND target = g_hMainWindow ? g_hMainWindow : g_hwnd;
+    if (target) SetWindowTextA(target, t.c_str());
 }
 
 // Confine the cursor to the client area. Re-run whenever the window moves or
 // resizes while locked, since the clip rect is in screen coordinates.
 static void clipCursorToClient() {
+    HWND target = g_hViewportWnd ? g_hViewportWnd : g_hwnd;
+    if (!target) return;
     RECT rc;
-    GetClientRect(g_hwnd, &rc);
+    GetClientRect(target, &rc);
     POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
-    ClientToScreen(g_hwnd, &tl);
-    ClientToScreen(g_hwnd, &br);
+    ClientToScreen(target, &tl);
+    ClientToScreen(target, &br);
     const RECT screen{tl.x, tl.y, br.x, br.y};
     ClipCursor(&screen);
 }
@@ -1972,17 +2402,20 @@ static void setPaused(bool paused) {
     updateWindowTitle();
 }
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+static LRESULT CALLBACK ViewportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // The menu sees every message first (it tracks the mouse even when closed).
     if (g_uiReady && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return true;
     switch (msg) {
-    case WM_CLOSE:
-        g_running = false;
-        PostQuitMessage(0);
-        return 0;
-    case WM_DESTROY:
-        g_running = false;
-        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) {
+            if (!g_cursorLocked || g_inventoryOpen || g_paused) {
+                SetCursor(LoadCursor(nullptr, IDC_ARROW));
+                return TRUE;
+            }
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
             g_width = std::max(1, static_cast<int>(LOWORD(lParam)));
@@ -2020,6 +2453,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
     case WM_KEYDOWN:
         if (wParam < 256) g_keys[wParam] = true;
+        if (g_rebindingAction >= 0) {
+            if (wParam == VK_ESCAPE) {
+                g_rebindingAction = -1;
+            } else if (wParam == VK_DELETE || wParam == VK_BACK) {
+                if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = 0;
+                else g_keybindings[g_rebindingAction].key2 = 0;
+                g_rebindingAction = -1;
+            } else {
+                if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = static_cast<int>(wParam);
+                else g_keybindings[g_rebindingAction].key2 = static_cast<int>(wParam);
+                g_rebindingAction = -1;
+            }
+            return 0;
+        }
         if (wParam == VK_ESCAPE) {
             // Esc pauses; Shift+Esc quits. Smoke/stress keep Esc = quit so a run
             // can be aborted (it then fails with smoke_complete=0, exit 7).
@@ -2037,13 +2484,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // what the player asked for and sim::tick() validates it against the
         // authoritative inventory. This is what stops a modified client from
         // selecting a weapon it was never given.
-        if (wParam == 'F') {
+        if (isActionKey(KeyAction::PrimaryFire, static_cast<int>(wParam))) {
             g_pendingInput.firePressed = true;
             g_pendingInput.fireHeld = true;
         }
-        if (wParam == VK_SPACE) g_pendingInput.jump = true;
+        if (isActionKey(KeyAction::Jump, static_cast<int>(wParam)) || wParam == VK_SPACE) g_pendingInput.jump = true;
         // TAB: toggle the 3D inventory lattice (RULES.md rule 12)
-        if (wParam == VK_TAB) {
+        if (isActionKey(KeyAction::ToggleInventory, static_cast<int>(wParam)) || wParam == VK_TAB) {
             g_inventoryOpen = !g_inventoryOpen;
             if (g_inventoryOpen) {
                 // Free the cursor so it can select cells; drop any held item back
@@ -2053,33 +2500,57 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 stowHeld(g_inventory, g_itemDefs);
                 g_inventoryHandRot = 0;
                 setCursorLock(false);
+                RECT cr{};
+                GetClientRect(hwnd, &cr);
+                POINT pt{ (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+                g_mouseX = static_cast<short>(pt.x);
+                g_mouseY = static_cast<short>(pt.y);
+                g_lastMouseX = g_mouseX;
+                g_lastMouseY = g_mouseY;
+                ClientToScreen(hwnd, &pt);
+                SetCursorPos(pt.x, pt.y);
+                SetCursor(LoadCursor(nullptr, IDC_ARROW));
             } else {
                 setCursorLock(true);
             }
+            return 0;
         }
-        // R: rotate the held item while the lattice is up; otherwise cycle ammo.
-        if (wParam == 'R') {
+        // R / ReloadOrRotate: rotate the held item while the lattice is up; otherwise reload / cycle ammo.
+        if (isActionKey(KeyAction::ReloadOrRotate, static_cast<int>(wParam)) || wParam == 'R') {
             if (g_inventoryOpen) {
                 g_inventoryHandRot = (g_inventoryHandRot + 1) & 3;
             } else {
+                g_viewmodelAnim.triggerReload();
+                g_animController.playClip("rifle_reload", false, 0.15f);
                 g_pendingInput.cycleAmmo = true;
             }
         }
-        // G: take the world item under the crosshair (auto-places into the pack)
-        if (wParam == 'G' && !g_inventoryOpen) g_pickupPressed = true;
+        // Interact / Pick Up: take the world item under the crosshair (auto-places into the pack)
+        if ((isActionKey(KeyAction::Interact, static_cast<int>(wParam)) || wParam == 'G') && !g_inventoryOpen) {
+            g_pickupPressed = true;
+        }
         // 1-4: caliber class (light medium heavy energy)
         if (wParam == '1') g_pendingInput.selectCaliber = 0;
         if (wParam == '2') g_pendingInput.selectCaliber = 1;
         if (wParam == '3') g_pendingInput.selectCaliber = 2;
         if (wParam == '4') g_pendingInput.selectCaliber = 3;
-        if (wParam == 'V') g_pendingInput.cycleWeapon = true;
-        if (wParam == 'B') g_pendingInput.cycleFireMode = true;
+        if (isActionKey(KeyAction::CycleWeapon, static_cast<int>(wParam)) || wParam == 'V') g_pendingInput.cycleWeapon = true;
+        if (isActionKey(KeyAction::CycleFireMode, static_cast<int>(wParam)) || wParam == 'B') g_pendingInput.cycleFireMode = true;
+        if (isActionKey(KeyAction::ThirdPerson, static_cast<int>(wParam)) || wParam == 'T' || wParam == VK_F5) g_thirdPerson = !g_thirdPerson;
         return 0;
     case WM_KEYUP:
         if (wParam < 256) g_keys[wParam] = false;
-        if (wParam == 'F') g_pendingInput.fireHeld = false;
+        if (isActionKey(KeyAction::PrimaryFire, static_cast<int>(wParam))) g_pendingInput.fireHeld = false;
         return 0;
     case WM_LBUTTONDOWN:
+        g_keys[VK_LBUTTON] = true;
+        SetFocus(hwnd);
+        if (g_rebindingAction >= 0 && g_frame > g_rebindingFrame) {
+            if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = VK_LBUTTON;
+            else g_keybindings[g_rebindingAction].key2 = VK_LBUTTON;
+            g_rebindingAction = -1;
+            return 0;
+        }
         // While paused, clicks belong to the menu. A click while unlocked only
         // locks the mouse; it is not also read as a look drag or a pick.
         if (g_paused) return 0;
@@ -2097,23 +2568,59 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_inventoryClick = true;
             return 0;
         }
+        if (isActionKey(KeyAction::PrimaryFire, VK_LBUTTON)) {
+            g_pendingInput.firePressed = true;
+            g_pendingInput.fireHeld = true;
+        }
         SetCapture(hwnd);
         return 0;
     case WM_LBUTTONUP:
+        g_keys[VK_LBUTTON] = false;
         g_mouseDown = false;
+        if (isActionKey(KeyAction::PrimaryFire, VK_LBUTTON)) {
+            g_pendingInput.fireHeld = false;
+        }
         ReleaseCapture();
         return 0;
     case WM_RBUTTONDOWN:
+        g_keys[VK_RBUTTON] = true;
+        if (g_rebindingAction >= 0 && g_frame > g_rebindingFrame) {
+            if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = VK_RBUTTON;
+            else g_keybindings[g_rebindingAction].key2 = VK_RBUTTON;
+            g_rebindingAction = -1;
+            return 0;
+        }
         if (g_paused) return 0;
         if (g_inventoryOpen) {
             g_inventoryStow = true;
             return 0;
         }
-        g_pendingInput.firePressed = true;
-        g_pendingInput.fireHeld = true;
+        if (isActionKey(KeyAction::AimDownSights, VK_RBUTTON)) {
+            g_pendingInput.ads = true;
+        } else if (isActionKey(KeyAction::PrimaryFire, VK_RBUTTON)) {
+            g_pendingInput.firePressed = true;
+            g_pendingInput.fireHeld = true;
+        }
         return 0;
     case WM_RBUTTONUP:
-        g_pendingInput.fireHeld = false;
+        g_keys[VK_RBUTTON] = false;
+        if (isActionKey(KeyAction::AimDownSights, VK_RBUTTON)) {
+            g_pendingInput.ads = false;
+        } else if (isActionKey(KeyAction::PrimaryFire, VK_RBUTTON)) {
+            g_pendingInput.fireHeld = false;
+        }
+        return 0;
+    case WM_MBUTTONDOWN:
+        g_keys[VK_MBUTTON] = true;
+        if (g_rebindingAction >= 0 && g_frame > g_rebindingFrame) {
+            if (g_rebindingSlot == 0) g_keybindings[g_rebindingAction].key1 = VK_MBUTTON;
+            else g_keybindings[g_rebindingAction].key2 = VK_MBUTTON;
+            g_rebindingAction = -1;
+            return 0;
+        }
+        return 0;
+    case WM_MBUTTONUP:
+        g_keys[VK_MBUTTON] = false;
         return 0;
     case WM_MOUSEMOVE:
         g_mouseX = static_cast<short>(LOWORD(lParam));
@@ -2143,35 +2650,146 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 }
 
+static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CLOSE:
+        g_running = false;
+        PostQuitMessage(0);
+        return 0;
+    case WM_DESTROY:
+        g_running = false;
+        return 0;
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int totalW = rc.right - rc.left;
+            int totalH = rc.bottom - rc.top;
+            if (g_editorMode && g_hWebPanelWnd && g_hViewportWnd) {
+                int panelW = std::min(450, totalW / 3);
+                if (panelW < 280) panelW = 280;
+                int viewW = std::max(1, totalW - panelW);
+                SetWindowPos(g_hWebPanelWnd, nullptr, 0, 0, panelW, totalH, SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(g_hViewportWnd, nullptr, panelW, 0, viewW, totalH, SWP_NOZORDER | SWP_NOACTIVATE);
+                g_webHost.resize(0, 0, panelW, totalH);
+            } else if (g_hViewportWnd) {
+                SetWindowPos(g_hViewportWnd, nullptr, 0, 0, totalW, totalH, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        return 0;
+    case WM_SETFOCUS:
+        if (g_hViewportWnd) SetFocus(g_hViewportWnd);
+        return 0;
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+        if (g_hViewportWnd) {
+            SendMessageA(g_hViewportWnd, msg, wParam, lParam);
+            return 0;
+        }
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
 static void createWindow() {
     g_hInstance = GetModuleHandleA(nullptr);
-    WNDCLASSEXA wc{};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = g_hInstance;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = "VoxelVulkanEngine";
-    if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-        fail("RegisterClassEx failed");
+
+    // Register top-level main window class
+    WNDCLASSEXA wcMain{};
+    wcMain.cbSize = sizeof(wcMain);
+    wcMain.style = CS_HREDRAW | CS_VREDRAW;
+    wcMain.lpfnWndProc = MainWndProc;
+    wcMain.hInstance = g_hInstance;
+    wcMain.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcMain.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcMain.lpszClassName = "VoxelAppMainWindow";
+    if (!RegisterClassExA(&wcMain) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        fail("RegisterClassEx for main window failed");
+
+    // Register child viewport window class
+    WNDCLASSEXA wcView{};
+    wcView.cbSize = sizeof(wcView);
+    wcView.style = CS_HREDRAW | CS_VREDRAW;
+    wcView.lpfnWndProc = ViewportWndProc;
+    wcView.hInstance = g_hInstance;
+    wcView.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcView.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wcView.lpszClassName = "VoxelAppViewport";
+    if (!RegisterClassExA(&wcView) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        fail("RegisterClassEx for viewport failed");
 
     RECT r{0, 0, WIDTH, HEIGHT};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hwnd = CreateWindowExA(
-        0, wc.lpszClassName,
-"Voxel FPS 0.0",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_hMainWindow = CreateWindowExA(
+        0, wcMain.lpszClassName,
+        "Voxel FPS 0.0",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, g_hInstance, nullptr);
-    if (!g_hwnd) fail("CreateWindowEx failed");
+    if (!g_hMainWindow) fail("CreateWindowEx for main window failed");
+
+    RECT clientRc{};
+    GetClientRect(g_hMainWindow, &clientRc);
+    int clientW = clientRc.right - clientRc.left;
+    int clientH = clientRc.bottom - clientRc.top;
+
+    int panelW = 0;
+    if (g_editorMode) {
+        panelW = std::min(450, clientW / 3);
+        if (panelW < 280) panelW = 280;
+
+        WNDCLASSEXA wcPanel{};
+        wcPanel.cbSize = sizeof(wcPanel);
+        wcPanel.style = CS_HREDRAW | CS_VREDRAW;
+        wcPanel.lpfnWndProc = DefWindowProcA;
+        wcPanel.hInstance = g_hInstance;
+        wcPanel.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wcPanel.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wcPanel.lpszClassName = "VoxelAppWebPanel";
+        if (!RegisterClassExA(&wcPanel) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            fail("RegisterClassEx for web panel failed");
+
+        g_hWebPanelWnd = CreateWindowExA(
+            0, wcPanel.lpszClassName,
+            nullptr,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            0, 0, panelW, clientH,
+            g_hMainWindow, nullptr, g_hInstance, nullptr);
+        if (!g_hWebPanelWnd) fail("CreateWindowEx for web panel failed");
+
+        std::string uiDist = g_exeDir + "\\data\\ui\\dist";
+        if (GetFileAttributesA(uiDist.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            uiDist = g_exeDir + "\\..\\data\\ui\\dist";
+        }
+        std::wstring userDataFolder = utf8ToWide(g_exeDir + "\\webview_profile");
+        std::wstring assetsFolder = utf8ToWide(uiDist);
+        g_webHost.initialize(g_hWebPanelWnd, userDataFolder, assetsFolder, [](const std::string& msg) {
+            std::fprintf(stderr, "[ui-bridge] action received: %s\n", msg.c_str());
+        });
+        g_webHost.resize(0, 0, panelW, clientH);
+        g_webHost.setVisible(true);
+    }
+
+    g_hViewportWnd = CreateWindowExA(
+        0, wcView.lpszClassName,
+        nullptr,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+        panelW, 0, clientW - panelW, clientH,
+        g_hMainWindow, nullptr, g_hInstance, nullptr);
+    if (!g_hViewportWnd) fail("CreateWindowEx for viewport child failed");
+
+    g_hwnd = g_hViewportWnd; // Maintain g_hwnd as viewport handle for backward compatibility
+    SetFocus(g_hViewportWnd);
     updateWindowTitle();
+
     // Raw mouse input for locked look (HID generic desktop page, mouse usage).
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01;
     rid.usUsage = 0x02;
     rid.dwFlags = 0;
-    rid.hwndTarget = g_hwnd;
+    rid.hwndTarget = g_hViewportWnd;
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
 }
 
@@ -2295,7 +2913,7 @@ static void createInstance() {
 
 static void createSurface() {
     VkWin32SurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-    ci.hwnd = g_hwnd;
+    ci.hwnd = g_hViewportWnd ? g_hViewportWnd : g_hwnd;
     ci.hinstance = g_hInstance;
     if (vkCreateWin32SurfaceKHR(g_instance, &ci, nullptr, &g_surface) != VK_SUCCESS)
         fail("vkCreateWin32SurfaceKHR failed");
@@ -2870,7 +3488,7 @@ static void recordOccupancyUpload(VkCommandBuffer cmd, uint32_t frameIndex) {
 static void createDescriptors() {
     uploadTextures();
     createOccupancyVolume();
-    VkDescriptorSetLayoutBinding bindings[4]{};
+    VkDescriptorSetLayoutBinding bindings[5]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -2885,9 +3503,13 @@ static void createDescriptors() {
     bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[4].binding = 4; // bone palette
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 4;
+    lci.bindingCount = 5;
     lci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(g_device, &lci, nullptr, &g_dsl) != VK_SUCCESS)
         fail("descriptor set layout failed");
@@ -2897,11 +3519,24 @@ static void createDescriptors() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      g_uboBuffers[i], g_uboMems[i]);
         vkMapMemory(g_device, g_uboMems[i], 0, sizeof(FrameUBO), 0, &g_uboMapped[i]);
+
+        const VkDeviceSize boneBufSize = sizeof(char_model::Mat4) * char_model::kMaxBones;
+        createBuffer(boneBufSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_boneBuf[i], g_boneMem[i]);
+        vkMapMemory(g_device, g_boneMem[i], 0, boneBufSize, 0, &g_boneMapped[i]);
+        if (g_boneMapped[i]) {
+            char_model::Mat4 idents[char_model::kMaxBones];
+            for (int b = 0; b < char_model::kMaxBones; ++b) {
+                idents[b] = char_model::Mat4::identity();
+            }
+            std::memcpy(g_boneMapped[i], idents, static_cast<size_t>(boneBufSize));
+        }
     }
 
     VkDescriptorPoolSize poolSizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES},
                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAMES}};
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * MAX_FRAMES}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.poolSizeCount = 3;
     pci.pPoolSizes = poolSizes;
@@ -2946,8 +3581,15 @@ static void createDescriptors() {
         lightWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         lightWrite.descriptorCount = 1;
         lightWrite.pBufferInfo = &li;
-        VkWriteDescriptorSet writes[4] = {write, texWrite, occWrite, lightWrite};
-        vkUpdateDescriptorSets(g_device, 4, writes, 0, nullptr);
+        VkDescriptorBufferInfo boneBi{g_boneBuf[i], 0, sizeof(char_model::Mat4) * char_model::kMaxBones};
+        VkWriteDescriptorSet boneWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        boneWrite.dstSet = g_descSets[i];
+        boneWrite.dstBinding = 4;
+        boneWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        boneWrite.descriptorCount = 1;
+        boneWrite.pBufferInfo = &boneBi;
+        VkWriteDescriptorSet writes[5] = {write, texWrite, occWrite, lightWrite, boneWrite};
+        vkUpdateDescriptorSets(g_device, 5, writes, 0, nullptr);
     }
 }
 
@@ -3060,9 +3702,16 @@ rs.cullMode = VK_CULL_MODE_NONE; // sky dome + moon billboard + world
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynStates;
 
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(char_model::Mat4);
+
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &g_dsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(g_device, &plci, nullptr, &g_pipelineLayout) != VK_SUCCESS)
         fail("pipeline layout failed");
 
@@ -3091,6 +3740,48 @@ rs.cullMode = VK_CULL_MODE_NONE; // sky dome + moon billboard + world
     if (vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &g_overlayPipeline) != VK_SUCCESS)
         fail("overlay graphics pipeline failed");
 
+    // Skinned character pipeline (char.vert + voxel.frag)
+    const std::string charVertPath = resolveShaderPath("char.vert");
+    if (charVertPath.empty()) return false;
+    VkShaderModule charVert = loadShader(charVertPath);
+
+    VkPipelineShaderStageCreateInfo charStages[2]{};
+    charStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    charStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    charStages[0].module = charVert;
+    charStages[0].pName = "main";
+    charStages[1] = stages[1]; // voxel.frag
+
+    VkVertexInputBindingDescription charBind{};
+    charBind.binding = 0;
+    charBind.stride = sizeof(char_mesh::SkinnedVertex);
+    charBind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription charAttrs[7]{};
+    charAttrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(char_mesh::SkinnedVertex, x)};
+    charAttrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(char_mesh::SkinnedVertex, nx)};
+    charAttrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(char_mesh::SkinnedVertex, r)};
+    charAttrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT, offsetof(char_mesh::SkinnedVertex, mat)};
+    charAttrs[4] = {4, 0, VK_FORMAT_R8G8B8A8_UINT, offsetof(char_mesh::SkinnedVertex, bone)};
+    charAttrs[5] = {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(char_mesh::SkinnedVertex, weight)};
+    charAttrs[6] = {6, 0, VK_FORMAT_R8_UINT, offsetof(char_mesh::SkinnedVertex, region)};
+
+    VkPipelineVertexInputStateCreateInfo charVi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    charVi.vertexBindingDescriptionCount = 1;
+    charVi.pVertexBindingDescriptions = &charBind;
+    charVi.vertexAttributeDescriptionCount = 7;
+    charVi.pVertexAttributeDescriptions = charAttrs;
+
+    VkGraphicsPipelineCreateInfo charPci = pci;
+    charPci.stageCount = 2;
+    charPci.pStages = charStages;
+    charPci.pVertexInputState = &charVi;
+    charPci.renderPass = g_renderPass;
+    charPci.subpass = 0;
+    if (vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &charPci, nullptr, &g_charPipeline) != VK_SUCCESS)
+        fail("character graphics pipeline failed");
+
+    vkDestroyShaderModule(g_device, charVert, nullptr);
     vkDestroyShaderModule(g_device, vert, nullptr);
     vkDestroyShaderModule(g_device, frag, nullptr);
     return true;
@@ -3175,17 +3866,17 @@ static bool ensureVertexCapacity(uint32_t verts) {
 struct SimBallisticsHooks final : ballistics::Hooks {
     void voxelDestroyed(int x, int y, int z, Block was, MaterialId mat,
                         const ballistics::Impact& imp) override {
-        // Visual degradation: spawn 8x8x8 sub-voxel debris chips (occupancy still unit cube).
-        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
-                                imp.aoeScale);
+        // Visual degradation: spawn 1-2 sublattice impact units (occupancy still unit cube).
+        g_debris.spawnSublatticeImpact(x, y, z, mat, imp.sub, imp.energy, VOXEL_SIZE,
+                                      imp.aoeScale);
         (void)was;
         g_meshDirty = true;
         ++g_voxelsDestroyed;
     }
     void ricochet(int x, int y, int z, MaterialId mat, const ballistics::Impact& imp) override {
         ++g_debris.ricochets;
-        g_debris.spawnFromVoxel(x, y, z, mat, imp.dx, imp.dy, imp.dz, imp.energy, VOXEL_SIZE,
-                                imp.aoeScale);
+        g_debris.spawnSublatticeImpact(x, y, z, mat, imp.sub, imp.energy, VOXEL_SIZE,
+                                      imp.aoeScale);
     }
     ArmorZone bodySweep(float ax, float ay, float az, float bx, float by, float bz,
                         float radiusCells) override {
@@ -3219,6 +3910,8 @@ static std::string activeCaliberId(const WeaponDef& w) {
 }
 
 static void applyRecoilKick(const WeaponDef& w) {
+    g_viewmodelAnim.triggerRecoil(w.recoil, w.handling);
+    g_animController.triggerAdditive("rifle_fire", 1.0f, 1.0f);
     // Kick accumulates on a temporary offset (not permanent aim). Handling/weight/ADS
     // damp the punch; handling also speeds the smooth return after the last shot.
     const float damp = 1.0f / (1.0f + std::max(0.0f, w.weight) * 0.08f +
@@ -3449,6 +4142,60 @@ static void tryLoadWeapons() {
     g_activeAmmoIndex = 0;
     for (int i = 0; i < 4; ++i) {
         if (normalizeCaliber(w0.caliber) == kCaliberIds[i]) { g_activeCaliberIndex = i; break; }
+    }
+
+    g_weaponModels.clear();
+    for (const auto& w : g_weapons) {
+        weapon_view::WeaponModel wm;
+        bool found = false;
+        const std::string voxPaths[] = {
+            g_exeDir + "\\..\\data\\voxfmt\\" + w.id + ".vox.json",
+            g_exeDir + "\\voxfmt\\" + w.id + ".vox.json",
+            g_exeDir + "\\..\\data\\voxfmt\\smoke_weapon.vox.json",
+            g_exeDir + "\\voxfmt\\smoke_weapon.vox.json",
+            g_exeDir + "\\weapons\\" + w.id + ".vox.json",
+            g_exeDir + "\\..\\data\\weapons\\" + w.id + ".vox.json"
+        };
+        for (const auto& p : voxPaths) {
+            if (weapon_view::loadWeaponModelFromFile(p, wm)) {
+                wm.id = w.id;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (w.id == "sidearm_light" || w.caliber == "light") {
+                wm = weapon_view::buildProceduralPistol(w.id);
+            } else {
+                wm = weapon_view::buildProceduralRifle(w.id);
+            }
+        }
+        g_weaponModels.push_back(wm);
+    }
+
+    tryLoadAnimClips();
+}
+
+// Load authored animation clips (data/anims/*.anim.json)
+static void tryLoadAnimClips() {
+    g_animController.clips.clear();
+    const std::string clipIds[] = { "rifle_idle", "rifle_fire", "rifle_reload", "walk" };
+    for (const auto& cid : clipIds) {
+        anim::AnimationClip clip;
+        const std::string paths[] = {
+            g_exeDir + "\\..\\data\\anims\\" + cid + ".anim.json",
+            g_exeDir + "\\anims\\" + cid + ".anim.json",
+            g_exeDir + "\\..\\..\\data\\anims\\" + cid + ".anim.json"
+        };
+        for (const auto& p : paths) {
+            if (anim::loadClipFromFile(p, clip)) {
+                g_animController.addClip(clip);
+                break;
+            }
+        }
+    }
+    if (!g_animController.clips.empty()) {
+        g_animController.playClip("rifle_idle", true, 0.0f);
     }
 }
 
@@ -5056,7 +5803,7 @@ static InventorySmokeReport runInventorySmoke() {
     rep.overlayVerts = static_cast<int>(g_inventoryVertexCount);
     const int cells = g_inventory.vol.cells();
     rep.overlayLatticeVerts = cells * 36;
-    rep.overlaySlotVerts = kEquipSlotCount * 36;
+    rep.overlaySlotVerts = static_cast<int>(g_inventorySlotVertexCount);
     // HUD is appended to the same buffer: 10 health + 5 breath unit cells.
     rep.overlayHudVerts = (kHudHealthCells + kHudBreathCells) * 36;
     rep.hudBuilt = rep.overlayVerts ==
@@ -5485,7 +6232,7 @@ static void initUi() {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; // window layout is not persisted; settings are
     ImGui::StyleColorsDark();
-    ImGui_ImplWin32_Init(g_hwnd);
+    ImGui_ImplWin32_Init(g_hViewportWnd ? g_hViewportWnd : g_hwnd);
     ImGui_ImplVulkan_InitInfo ii{};
     ii.ApiVersion = VK_API_VERSION_1_2;
     ii.Instance = g_instance;
@@ -5569,28 +6316,545 @@ static void drawVisualsPanel() {
     }
 }
 
+static void saveKeybindings() {
+    const std::string path = g_exeDir + "\\keybindings.json";
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        g_keybindStatus = "Could not write " + path;
+        return;
+    }
+    f << "{\n";
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        f << "  \"" << kKeyActionDefs[i].id << "\": ["
+          << g_keybindings[i].key1 << ", "
+          << g_keybindings[i].key2 << "]"
+          << (i + 1 < static_cast<int>(KeyAction::Count) ? ",\n" : "\n");
+    }
+    f << "}\n";
+    g_keybindStatus = "Saved " + path;
+}
+
+static void loadKeybindings() {
+    const std::string path = g_exeDir + "\\keybindings.json";
+    bool readable = false;
+    const std::string text = jsonReadText(path, &readable);
+    if (!readable) {
+        g_keybindStatus = "No saved keybindings yet";
+        return;
+    }
+    int loaded = 0;
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        std::vector<int> arr = jsonExtractIntArray(text, kKeyActionDefs[i].id);
+        if (!arr.empty()) {
+            g_keybindings[i].key1 = arr[0];
+            g_keybindings[i].key2 = arr.size() >= 2 ? arr[1] : 0;
+            ++loaded;
+        }
+    }
+    g_keybindStatus = "Loaded " + std::to_string(loaded) + " keybindings";
+}
+
+static void drawKeybindsPanel() {
+    if (ImGui::Button("Reset Defaults")) {
+        initDefaultKeybindings();
+        g_keybindStatus = "Reset to defaults";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save##keys")) {
+        saveKeybindings();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load##keys")) {
+        loadKeybindings();
+    }
+    if (!g_keybindStatus.empty()) {
+        ImGui::TextDisabled("%s", g_keybindStatus.c_str());
+    }
+
+    if (g_rebindingAction >= 0 && g_rebindingAction < static_cast<int>(KeyAction::Count)) {
+        const auto& def = kKeyActionDefs[g_rebindingAction];
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                           "Press key or mouse button for [%s] (%s)...",
+                           def.label, g_rebindingSlot == 0 ? "Primary" : "Secondary");
+        ImGui::TextDisabled("Esc: Cancel  |  Del / Backspace: Clear");
+        if (ImGui::Button("Cancel Rebind")) {
+            g_rebindingAction = -1;
+        }
+        ImGui::Separator();
+    }
+
+    const char* currentCategory = nullptr;
+    for (int i = 0; i < static_cast<int>(KeyAction::Count); ++i) {
+        const auto& def = kKeyActionDefs[i];
+        if (!currentCategory || std::strcmp(currentCategory, def.category) != 0) {
+            currentCategory = def.category;
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", currentCategory);
+            ImGui::Separator();
+        }
+
+        ImGui::PushID(i);
+        ImGui::Text("%-20s", def.label);
+        ImGui::SameLine(180.0f);
+
+        // Slot 1 (Primary)
+        const bool isRebinding1 = (g_rebindingAction == i && g_rebindingSlot == 0);
+        std::string btn1Text = isRebinding1 ? "[ Press Key ]" : "[" + keyName(g_keybindings[i].key1) + "]";
+        if (isRebinding1) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.5f, 0.1f, 1.0f));
+        if (ImGui::Button(btn1Text.c_str(), ImVec2(105.0f, 0.0f))) {
+            g_rebindingAction = i;
+            g_rebindingSlot = 0;
+            g_rebindingFrame = g_frame;
+        }
+        if (isRebinding1) ImGui::PopStyleColor();
+
+        ImGui::SameLine();
+
+        // Slot 2 (Secondary)
+        const bool isRebinding2 = (g_rebindingAction == i && g_rebindingSlot == 1);
+        std::string btn2Text = isRebinding2 ? "[ Press Key ]" : "[" + keyName(g_keybindings[i].key2) + "]";
+        if (isRebinding2) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.5f, 0.1f, 1.0f));
+        if (ImGui::Button(btn2Text.c_str(), ImVec2(105.0f, 0.0f))) {
+            g_rebindingAction = i;
+            g_rebindingSlot = 1;
+            g_rebindingFrame = g_frame;
+        }
+        if (isRebinding2) ImGui::PopStyleColor();
+
+        ImGui::PopID();
+    }
+}
+
+static bool projectLatticePoint(float lx, float ly, float lz, float& sx, float& sy) {
+    if (!g_invDisplay.valid) return false;
+    const Vec3 p = g_invDisplay.origin + g_invDisplay.right * (lx * VOXEL_SIZE) +
+                   g_invDisplay.up * (ly * VOXEL_SIZE) +
+                   g_invDisplay.fwd * (lz * VOXEL_SIZE);
+    return projectToScreen(p, sx, sy);
+}
+
+static void drawBadge(ImDrawList* draw, float cx, float cy, const char* text, ImU32 colText,
+                      ImU32 colBg, ImU32 colBorder, float padX = 7.0f, float padY = 3.5f) {
+    const ImVec2 textSize = ImGui::CalcTextSize(text);
+    const float x = cx - textSize.x * 0.5f;
+    const float y = cy - textSize.y * 0.5f;
+    const ImVec2 bMin(x - padX, y - padY);
+    const ImVec2 bMax(x + textSize.x + padX, y + textSize.y + padY);
+    draw->AddRectFilled(bMin, bMax, colBg, 4.0f);
+    draw->AddRect(bMin, bMax, colBorder, 4.0f);
+    draw->AddText(ImVec2(x, y), colText, text);
+}
+
+static bool itemScreenBounds(float ox, float oy, float oz, float sx, float sy, float sz,
+                             float& minX, float& minY, float& maxX, float& maxY) {
+    minX = minY = 1e30f;
+    maxX = maxY = -1e30f;
+    int count = 0;
+    const float stepX = std::max(0.1f, sx);
+    const float stepY = std::max(0.1f, sy);
+    const float stepZ = std::max(0.1f, sz);
+    for (float cz = 0.0f; cz <= sz + 1e-4f; cz += stepZ) {
+        for (float cy = 0.0f; cy <= sy + 1e-4f; cy += stepY) {
+            for (float cx = 0.0f; cx <= sx + 1e-4f; cx += stepX) {
+                float sxPos = 0.0f, syPos = 0.0f;
+                if (projectLatticePoint(ox + cx, oy + cy, oz + cz, sxPos, syPos)) {
+                    minX = std::min(minX, sxPos);
+                    maxX = std::max(maxX, sxPos);
+                    minY = std::min(minY, syPos);
+                    maxY = std::max(maxY, syPos);
+                    ++count;
+                }
+            }
+        }
+    }
+    return count > 0 && maxX > minX && maxY > minY;
+}
+
+static void drawWeaponSilhouetteIcon(ImDrawList* draw, float cx, float cy, float maxW, float maxH,
+                                     const std::string& weaponId, ImU32 col) {
+    const weapon_view::WeaponModel* wm = nullptr;
+    for (const auto& m : g_weaponModels) {
+        if (m.id == weaponId) { wm = &m; break; }
+    }
+    if (!wm || wm->voxels.empty()) return;
+
+    int minVx = 1000, maxVx = -1000, minVy = 1000, maxVy = -1000;
+    for (const auto& v : wm->voxels) {
+        minVx = std::min(minVx, v.x);
+        maxVx = std::max(maxVx, v.x);
+        minVy = std::min(minVy, v.y);
+        maxVy = std::max(maxVy, v.y);
+    }
+    const int spanX = maxVx - minVx + 1;
+    const int spanY = maxVy - minVy + 1;
+    if (spanX <= 0 || spanY <= 0) return;
+
+    const float scale = std::min(maxW / static_cast<float>(spanX), maxH / static_cast<float>(spanY));
+    const float totalW = static_cast<float>(spanX) * scale;
+    const float totalH = static_cast<float>(spanY) * scale;
+    const float startX = cx - totalW * 0.5f;
+    const float startY = cy + totalH * 0.5f;
+
+    std::vector<bool> filled(static_cast<size_t>(spanX * spanY), false);
+    for (const auto& v : wm->voxels) {
+        int ix = v.x - minVx;
+        int iy = v.y - minVy;
+        if (ix >= 0 && ix < spanX && iy >= 0 && iy < spanY) {
+            filled[static_cast<size_t>(iy * spanX + ix)] = true;
+        }
+    }
+
+    const float pad = std::max(0.5f, scale * 0.08f);
+    for (int iy = 0; iy < spanY; ++iy) {
+        for (int ix = 0; ix < spanX; ++ix) {
+            if (!filled[static_cast<size_t>(iy * spanX + ix)]) continue;
+            float px0 = startX + static_cast<float>(ix) * scale;
+            float py0 = startY - static_cast<float>(iy + 1) * scale;
+            draw->AddRectFilled(ImVec2(px0, py0), ImVec2(px0 + scale - pad, py0 + scale - pad), col);
+        }
+    }
+}
+
+static void drawItemCard(ImDrawList* draw, float minX, float minY, float maxX, float maxY,
+                         const ItemDef* def, int rounds, bool isHovered, const char* extraBadge = nullptr) {
+    if (!def) return;
+    const float w = maxX - minX;
+    const float h = maxY - minY;
+    if (w < 8.0f || h < 8.0f) return;
+
+    ImU32 catCol = IM_COL32(180, 200, 220, 220);
+    const char* catTag = "ITEM";
+    const bool isWeapon = (def->cls == ItemClass::WeaponPrimary || def->cls == ItemClass::WeaponSmall);
+    if (isWeapon) {
+        catCol = IM_COL32(245, 180, 60, 240);
+        catTag = (def->cls == ItemClass::WeaponSmall) ? "SIDEARM" : "WEAPON";
+    } else if (def->cls == ItemClass::Armor) {
+        catCol = IM_COL32(70, 180, 255, 240);
+        catTag = "ARMOR";
+    } else if (def->cls == ItemClass::AmmoPouch) {
+        catCol = IM_COL32(225, 210, 80, 240);
+        catTag = "AMMO";
+    } else if (def->cls == ItemClass::Backpack) {
+        catCol = IM_COL32(120, 210, 130, 240);
+        catTag = "PACK";
+    }
+
+    const ImU32 bgCol = isHovered ? IM_COL32(24, 34, 48, 240) : IM_COL32(15, 21, 29, 215);
+    const ImU32 borderCol = isHovered ? IM_COL32(255, 255, 255, 255) : catCol;
+    const float borderThick = isHovered ? 2.0f : 1.0f;
+
+    // Card background & border
+    draw->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY), bgCol, 4.0f);
+    draw->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY), borderCol, 4.0f, 0, borderThick);
+
+    // Tech corner accent indicators
+    const float cornerLen = std::min(8.0f, std::min(w, h) * 0.25f);
+    draw->AddLine(ImVec2(minX, minY), ImVec2(minX + cornerLen, minY), borderCol, borderThick + 0.5f);
+    draw->AddLine(ImVec2(minX, minY), ImVec2(minX, minY + cornerLen), borderCol, borderThick + 0.5f);
+    draw->AddLine(ImVec2(maxX, maxY), ImVec2(maxX - cornerLen, maxY), borderCol, borderThick + 0.5f);
+    draw->AddLine(ImVec2(maxX, maxY), ImVec2(maxX, maxY - cornerLen), borderCol, borderThick + 0.5f);
+
+    // Icon & Content layout
+    const float midX = (minX + maxX) * 0.5f;
+    const float midY = (minY + maxY) * 0.5f;
+
+    if (h >= 32.0f && w >= 36.0f) {
+        // Tag badge at top
+        const ImVec2 tagSz = ImGui::CalcTextSize(catTag);
+        draw->AddRectFilled(ImVec2(midX - tagSz.x * 0.5f - 4.0f, minY + 3.0f),
+                            ImVec2(midX + tagSz.x * 0.5f + 4.0f, minY + 5.0f + tagSz.y),
+                            IM_COL32(10, 14, 20, 200), 2.0f);
+        draw->AddText(ImVec2(midX - tagSz.x * 0.5f, minY + 4.0f), catCol, catTag);
+
+        // If weapon, draw distinctive voxel silhouette icon
+        float textCenterY = midY;
+        if (isWeapon && h >= 46.0f) {
+            const float iconH = std::min(22.0f, h * 0.30f);
+            const float iconW = std::min(w - 12.0f, 62.0f);
+            const float iconY = minY + tagSz.y + 7.0f + iconH * 0.5f;
+            const ImU32 silCol = isHovered ? IM_COL32(255, 255, 255, 245) : IM_COL32(245, 195, 75, 220);
+            drawWeaponSilhouetteIcon(draw, midX, iconY, iconW, iconH,
+                                     def->weaponId.empty() ? def->id : def->weaponId, silCol);
+            textCenterY = iconY + iconH * 0.5f + 7.0f;
+        }
+
+        // Item Name
+        std::string displayName = def->name;
+        ImVec2 nameSz = ImGui::CalcTextSize(displayName.c_str());
+        if (nameSz.x > w - 8.0f && displayName.length() > 8) {
+            displayName = displayName.substr(0, 7) + "..";
+            nameSz = ImGui::CalcTextSize(displayName.c_str());
+        }
+        draw->AddText(ImVec2(midX - nameSz.x * 0.5f, textCenterY - nameSz.y * 0.5f),
+                      IM_COL32(245, 248, 252, 255), displayName.c_str());
+
+        // Stat Badge at bottom (ammo count or armor rating or extra)
+        char statStr[32] = {0};
+        if (extraBadge) {
+            snprintf(statStr, sizeof(statStr), "%s", extraBadge);
+        } else if (isWeapon) {
+            snprintf(statStr, sizeof(statStr), "%d rnds", rounds > 0 ? rounds : def->magazineSize);
+        } else if (def->cls == ItemClass::Armor) {
+            snprintf(statStr, sizeof(statStr), "+%.0f AP", def->armorPoints);
+        } else if (def->cls == ItemClass::AmmoPouch) {
+            snprintf(statStr, sizeof(statStr), "%d rsv", rounds);
+        }
+        if (statStr[0]) {
+            const ImVec2 statSz = ImGui::CalcTextSize(statStr);
+            draw->AddText(ImVec2(midX - statSz.x * 0.5f, maxY - statSz.y - 4.0f),
+                          IM_COL32(180, 205, 225, 220), statStr);
+        }
+    } else {
+        // Compact slot display: draw silhouette if weapon
+        if (isWeapon && w >= 16.0f && h >= 14.0f) {
+            const ImU32 silCol = isHovered ? IM_COL32(255, 255, 255, 240) : IM_COL32(245, 195, 75, 210);
+            drawWeaponSilhouetteIcon(draw, midX, midY, w - 4.0f, h - 4.0f,
+                                     def->weaponId.empty() ? def->id : def->weaponId, silCol);
+        } else {
+            std::string compactName = def->name;
+            ImVec2 sz = ImGui::CalcTextSize(compactName.c_str());
+            if (sz.x > w - 4.0f && compactName.length() > 6) {
+                compactName = compactName.substr(0, 5) + ".";
+                sz = ImGui::CalcTextSize(compactName.c_str());
+            }
+            draw->AddText(ImVec2(midX - sz.x * 0.5f, midY - sz.y * 0.5f),
+                          IM_COL32(245, 248, 252, 255), compactName.c_str());
+        }
+    }
+}
+
+static void drawInventoryLabels() {
+    if (!g_invDisplay.valid) return;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    if (!draw) return;
+
+    const Inventory& inv = g_inventory;
+
+    // 1. Prominent Section Headers anchored above each region in 3D lattice space
+    // Left Section: WEAPONS (anchored above rifle rack)
+    float wx = 0.0f, wy = 0.0f;
+    if (projectLatticePoint(-11.5f, 8.4f, 0.0f, wx, wy)) {
+        drawBadge(draw, wx, wy - 12.0f, "WEAPONS", IM_COL32(255, 220, 130, 255),
+                  IM_COL32(18, 22, 28, 225), IM_COL32(190, 140, 50, 225), 10.0f, 4.5f);
+    }
+
+    // Center Section: ARMOR (anchored above helmet)
+    float ax = 0.0f, ay = 0.0f;
+    if (projectLatticePoint(-7.0f, 9.4f, 0.0f, ax, ay)) {
+        drawBadge(draw, ax, ay - 12.0f, "ARMOR", IM_COL32(140, 215, 255, 255),
+                  IM_COL32(18, 22, 28, 225), IM_COL32(50, 140, 210, 225), 10.0f, 4.5f);
+    }
+
+    // Right Section: BACKPACK (anchored above storage volume)
+    float bx = 0.0f, by = 0.0f;
+    if (projectLatticePoint(1.0f, static_cast<float>(inv.vol.sy) + 0.6f, 0.0f, bx, by)) {
+        drawBadge(draw, bx, by - 12.0f, "BACKPACK", IM_COL32(160, 240, 160, 255),
+                  IM_COL32(18, 22, 28, 225), IM_COL32(70, 170, 80, 225), 10.0f, 4.5f);
+    }
+
+    // 2. Storage Volume Open Lattice Grid (front face)
+    for (int iy = 0; iy < inv.vol.sy; ++iy) {
+        for (int ix = 0; ix < inv.vol.sx; ++ix) {
+            float cMinX = 0, cMinY = 0, cMaxX = 0, cMaxY = 0;
+            if (itemScreenBounds(static_cast<float>(ix), static_cast<float>(iy), 0.0f, 1.0f, 1.0f, 0.0f, cMinX, cMinY, cMaxX, cMaxY)) {
+                const bool cellHov = (g_invHover.lattice && g_invHover.x == ix && g_invHover.y == iy);
+                const ImU32 gridCol = cellHov ? IM_COL32(90, 200, 255, 220) : IM_COL32(40, 60, 85, 110);
+                draw->AddRect(ImVec2(cMinX, cMinY), ImVec2(cMaxX, cMaxY), gridCol, 1.0f, 0, cellHov ? 2.0f : 1.0f);
+            }
+        }
+    }
+
+    // 3. Stored Items -> Interactive Item Icon Cards
+    for (size_t i = 0; i < inv.items.size(); ++i) {
+        const auto& inst = inv.items[i];
+        if (inst.defIndex < 0) continue;
+        const ItemDef* d = itemDefAt(g_itemDefs, inst.defIndex);
+        if (!d) continue;
+        const ItemShape s = rotatedShape(d->shape, inst.rot);
+        float iMinX = 0, iMinY = 0, iMaxX = 0, iMaxY = 0;
+        if (itemScreenBounds(static_cast<float>(inst.ox), static_cast<float>(inst.oy), static_cast<float>(inst.oz),
+                             static_cast<float>(s.sx), static_cast<float>(s.sy), static_cast<float>(s.sz),
+                             iMinX, iMinY, iMaxX, iMaxY)) {
+            const bool isHovered = (g_invHover.lattice && invIndexAt(inv, g_invHover.x, g_invHover.y, g_invHover.z) == static_cast<int>(i));
+            drawItemCard(draw, iMinX + 1.5f, iMinY + 1.5f, iMaxX - 1.5f, iMaxY - 1.5f, d, inst.rounds, isHovered);
+        }
+    }
+
+    // 4. Equipment Slots & Character Armor Configuration
+    for (int s = 0; s < kEquipSlotCount; ++s) {
+        const auto& spec = kEquipSlotSpecs[s];
+        const int defIdx = inv.slotDef[s];
+        const bool isHovered = (g_invHover.slot && g_invHover.slotIndex == s);
+        float sMinX = 0, sMinY = 0, sMaxX = 0, sMaxY = 0;
+        if (itemScreenBounds(static_cast<float>(spec.x0), static_cast<float>(spec.y0), static_cast<float>(spec.z0),
+                             static_cast<float>(spec.sx), static_cast<float>(spec.sy), static_cast<float>(spec.sz),
+                             sMinX, sMinY, sMaxX, sMaxY)) {
+            if (defIdx >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                drawItemCard(draw, sMinX + 1.0f, sMinY + 1.0f, sMaxX - 1.0f, sMaxY - 1.0f, d, d ? d->magazineSize : 0, isHovered);
+            } else {
+                const ImU32 frameCol = isHovered ? IM_COL32(100, 180, 255, 240) : IM_COL32(48, 68, 92, 140);
+                draw->AddRect(ImVec2(sMinX, sMinY), ImVec2(sMaxX, sMaxY), frameCol, 3.0f, 0, isHovered ? 2.0f : 1.0f);
+                const ImVec2 nameSz = ImGui::CalcTextSize(spec.name);
+                draw->AddText(ImVec2((sMinX + sMaxX) * 0.5f - nameSz.x * 0.5f, (sMinY + sMaxY) * 0.5f - nameSz.y * 0.5f),
+                              isHovered ? IM_COL32(255, 255, 255, 240) : IM_COL32(130, 155, 180, 180), spec.name);
+            }
+        }
+        if (spec.hasSec) {
+            if (itemScreenBounds(static_cast<float>(spec.secX0), static_cast<float>(spec.secY0), static_cast<float>(spec.secZ0),
+                                 static_cast<float>(spec.secSX), static_cast<float>(spec.secSY), static_cast<float>(spec.secSZ),
+                                 sMinX, sMinY, sMaxX, sMaxY)) {
+                if (defIdx >= 0) {
+                    const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                    drawItemCard(draw, sMinX + 1.0f, sMinY + 1.0f, sMaxX - 1.0f, sMaxY - 1.0f, d, 0, isHovered, "R-ARM");
+                } else {
+                    const ImU32 frameCol = isHovered ? IM_COL32(100, 180, 255, 240) : IM_COL32(48, 68, 92, 140);
+                    draw->AddRect(ImVec2(sMinX, sMinY), ImVec2(sMaxX, sMaxY), frameCol, 3.0f, 0, isHovered ? 2.0f : 1.0f);
+                    const ImVec2 nameSz = ImGui::CalcTextSize(spec.name);
+                    draw->AddText(ImVec2((sMinX + sMaxX) * 0.5f - nameSz.x * 0.5f, (sMinY + sMaxY) * 0.5f - nameSz.y * 0.5f),
+                                  isHovered ? IM_COL32(255, 255, 255, 240) : IM_COL32(130, 155, 180, 180), spec.name);
+                }
+            }
+        }
+    }
+
+    // Storage capacity badge below the storage lattice
+    float stX = 0.0f, stY = 0.0f;
+    if (projectLatticePoint(static_cast<float>(inv.vol.sx) * 0.5f, 0.0f, static_cast<float>(inv.vol.sz) * 0.5f, stX, stY)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "STORAGE (%d/%d)", inv.usedCells(), inv.vol.cells());
+        drawBadge(draw, stX, stY + 16.0f, buf, IM_COL32(180, 215, 190, 225),
+                  IM_COL32(14, 20, 18, 195), IM_COL32(50, 100, 65, 185), 6.0f, 2.5f);
+    }
+
+    // 3. Live Cursor Hover Inspection Badge
+    if (g_invHover.overCell) {
+        const float hx = static_cast<float>(g_mouseX);
+        const float hy = static_cast<float>(g_mouseY) - 30.0f;
+
+        if (g_invHover.slot) {
+            const int s = g_invHover.slotIndex;
+            const auto& spec = kEquipSlotSpecs[s];
+            const int defIdx = inv.slotDef[s];
+            char info[128];
+            if (defIdx >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, defIdx);
+                if (d) {
+                    if (slotIsArmor(spec.slot)) {
+                        snprintf(info, sizeof(info), "%s: %s (+%.0f Armor)", spec.name, d->name.c_str(), d->armorPoints);
+                    } else if (slotIsWeapon(spec.slot)) {
+                        snprintf(info, sizeof(info), "%s: %s (%d rnds)", spec.name, d->name.c_str(), d->magazineSize);
+                    } else {
+                        snprintf(info, sizeof(info), "%s: %s", spec.name, d->name.c_str());
+                    }
+                } else {
+                    snprintf(info, sizeof(info), "%s: Equipped", spec.name);
+                }
+            } else if (inv.held >= 0) {
+                const int heldDef = inv.items[static_cast<size_t>(inv.held)].defIndex;
+                if (canEquip(g_itemDefs, heldDef, spec.slot)) {
+                    snprintf(info, sizeof(info), "%s [LMB: Equip]", spec.name);
+                } else {
+                    snprintf(info, sizeof(info), "%s [Cannot Equip Here]", spec.name);
+                }
+            } else {
+                snprintf(info, sizeof(info), "%s (Empty)", spec.name);
+            }
+            drawBadge(draw, hx, hy, info, IM_COL32(255, 255, 255, 255),
+                      IM_COL32(22, 28, 38, 240), IM_COL32(80, 140, 220, 230), 8.0f, 4.0f);
+        } else if (g_invHover.lattice) {
+            const int inst = invIndexAt(inv, g_invHover.x, g_invHover.y, g_invHover.z);
+            char info[128];
+            if (inst >= 0 && inst < static_cast<int>(inv.items.size())) {
+                const ItemDef* d = itemDefAt(g_itemDefs, inv.items[inst].defIndex);
+                if (d) {
+                    snprintf(info, sizeof(info), "%s [LMB: Lift, RMB: Stow]", d->name.c_str());
+                } else {
+                    snprintf(info, sizeof(info), "Item [LMB: Lift]");
+                }
+            } else if (inv.held >= 0) {
+                const ItemDef* d = itemDefAt(g_itemDefs, inv.items[static_cast<size_t>(inv.held)].defIndex);
+                const char* dname = d ? d->name.c_str() : "Item";
+                snprintf(info, sizeof(info), "Place %s [LMB, R: rotate]", dname);
+            } else {
+                snprintf(info, sizeof(info), "Cell (%d, %d, %d)", g_invHover.x, g_invHover.y, g_invHover.z);
+            }
+            drawBadge(draw, hx, hy, info, IM_COL32(220, 235, 245, 255),
+                      IM_COL32(20, 24, 30, 240), IM_COL32(70, 95, 125, 220), 8.0f, 4.0f);
+        }
+    }
+
+    // 4. Bottom Controls Legend Banner
+    const float scrW = static_cast<float>(g_extent.width);
+    const float scrH = static_cast<float>(g_extent.height);
+    const char* hint = "TAB: Close  |  LMB: Pick / Place  |  RMB: Stow  |  R: Rotate Held";
+    drawBadge(draw, scrW * 0.5f, scrH - 24.0f, hint, IM_COL32(180, 195, 215, 230),
+              IM_COL32(14, 18, 24, 210), IM_COL32(45, 60, 80, 180), 12.0f, 4.0f);
+}
+
+static void drawPickupPrompt() {
+    if (g_pickupHover < 0 || static_cast<size_t>(g_pickupHover) >= g_pickups.size()) return;
+    const WorldPickup& pk = g_pickups[static_cast<size_t>(g_pickupHover)];
+    if (!pk.alive) return;
+    const ItemDef* def = itemDefAt(g_itemDefs, pk.defIndex);
+    const char* itemName = def ? def->name.c_str() : "Item";
+
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    if (!draw) return;
+
+    std::string key = keyName(g_keybindings[static_cast<int>(KeyAction::Interact)].key1);
+    if (key == "-") key = "F";
+    char text[128];
+    snprintf(text, sizeof(text), "[%s] Pick up %s", key.c_str(), itemName);
+
+    const float cx = static_cast<float>(g_extent.width) * 0.5f;
+    const float cy = static_cast<float>(g_extent.height) * 0.5f + 36.0f;
+    drawBadge(draw, cx, cy, text,
+              IM_COL32(255, 255, 255, 255),
+              IM_COL32(20, 26, 36, 235),
+              IM_COL32(100, 180, 255, 245),
+              9.0f, 4.0f);
+}
+
 // Build this frame's menu, if it is showing. Recorded later in the UI pass.
 static void buildUiFrame() {
     g_uiDrawPending = false;
-    if (!g_uiReady || !(g_paused || g_menuForced)) return;
+    if (!g_uiReady || !(g_paused || g_menuForced || g_inventoryOpen || g_pickupHover >= 0)) return;
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
-    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Always);
-    ImGui::Begin("Paused", nullptr,
-                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoSavedSettings);
-    if (ImGui::Button("Resume")) setPaused(false);
-    ImGui::SameLine();
-    if (ImGui::Button("Quit")) {
-        g_running = false;
-        PostQuitMessage(0);
+
+    // In editor mode the WebView2 panel replaces the Dear ImGui tooling (RFC
+    // "Execution Modes": editor => Dear ImGui disabled), so the pause menu and
+    // its Visuals/Keybinds panels are suppressed there. The viewport overlays
+    // (inventory, pickup prompt) are unaffected.
+    if ((g_paused || g_menuForced) && !g_editorMode) {
+        const ImVec2 center(0.5f * static_cast<float>(g_extent.width), 0.5f * static_cast<float>(g_extent.height));
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(460.0f, 520.0f), ImGuiCond_Always);
+        ImGui::Begin("Paused", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoSavedSettings);
+        if (ImGui::Button("Resume")) setPaused(false);
+        ImGui::SameLine();
+        if (ImGui::Button("Quit")) {
+            g_running = false;
+            PostQuitMessage(0);
+        }
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Keybinds", ImGuiTreeNodeFlags_DefaultOpen)) drawKeybindsPanel();
+        if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_None)) drawVisualsPanel();
+        ImGui::End();
     }
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Visuals", ImGuiTreeNodeFlags_DefaultOpen)) drawVisualsPanel();
-    ImGui::End();
+
+    if (g_inventoryOpen && g_invDisplay.valid) {
+        drawInventoryLabels();
+    }
+
+    if (!g_paused && !g_inventoryOpen && g_pickupHover >= 0) {
+        drawPickupPrompt();
+    }
+
     ImGui::Render();
     g_uiDrawPending = true;
 }
@@ -5604,7 +6868,7 @@ static void recordUiPass(VkCommandBuffer cmd, uint32_t imageIndex) {
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
     vkCmdEndRenderPass(cmd);
-    ++g_uiFrames;
+    if (g_paused || g_menuForced) ++g_uiFrames;
 }
 
 static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
@@ -5693,6 +6957,84 @@ static void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex) {
         VkDeviceSize pOff = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &g_pickupVB, &pOff);
         vkCmdDraw(cmd, g_pickupVertexCount, 1, 0, 0);
+    }
+
+    // Skinned character models (Models layer, view-side only)
+    if (g_charVB == VK_NULL_HANDLE) initCharacterMesh();
+    if (g_charPipeline != VK_NULL_HANDLE && g_charVB != VK_NULL_HANDLE && g_charIndexCount > 0) {
+        if (g_boneMapped[frameIndex]) {
+            char_model::Mat4 bones[char_model::kMaxBones];
+            const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+            const float timeSec = (static_cast<float>(g_tick) + (g_paused ? 0.0f : alpha)) * static_cast<float>(TICK_DT);
+            const float deltaYaw = g_captureActive ? 0.0f : angleDiff(g_yaw, g_legYaw);
+            const float aimPitch = g_captureActive ? 0.0f : g_pitch;
+            float renderPhase = g_charLocomotionPhase;
+            const float horizSpeed = std::sqrt(g_player.vx * g_player.vx + g_player.vz * g_player.vz);
+            if (!g_paused && horizSpeed > 0.001f) {
+                float cadence = 1.2f;
+                if (g_move.gait == movement::Gait::Sprint) cadence = 2.0f;
+                else if (g_move.gait == movement::Gait::Run) cadence = 1.6f;
+                else if (g_move.stance == movement::Stance::Crouch) cadence = 0.9f;
+                else if (g_move.stance == movement::Stance::Prone) cadence = 0.7f;
+                renderPhase += cadence * alpha * static_cast<float>(TICK_DT) * (2.0f * static_cast<float>(M_PI));
+                if (renderPhase > 2.0f * static_cast<float>(M_PI)) renderPhase -= 2.0f * static_cast<float>(M_PI);
+            }
+            const bool holdingWep = !g_weapons.empty() && !g_inventoryOpen && g_forceWeaponHold;
+            const float reloadPh = (g_viewmodelAnim.isReloading && g_viewmodelAnim.reloadDuration > 0.0f)
+                                       ? (g_viewmodelAnim.reloadTimer / g_viewmodelAnim.reloadDuration) : 0.0f;
+            char_model::AuthoredPoseOverride ov;
+            for (int b = 0; b < char_model::BoneId::Count; ++b) {
+                ov.trans[b] = g_currentAnimPose.pos[b];
+                ov.rot[b] = g_currentAnimPose.rot[b].toMat4();
+            }
+            ov.weight = g_animAuthoredWeight;
+
+            char_model::evaluateProceduralPose(
+                char_model::getCanonicalModel(), g_move, g_player, timeSec,
+                deltaYaw, aimPitch, bones, nullptr, renderPhase, &g_lastRHandSocket,
+                holdingWep, g_viewmodelAnim.recoilPitch, g_viewmodelAnim.isReloading, reloadPh, &ov);
+
+            // In first person, collapse head and neck so local player camera has
+            // an unobstructed view while chest, arms, legs, and feet remain visible looking down.
+            if (!g_thirdPerson && !g_captureActive) {
+                bones[char_model::BoneId::Head] = char_model::Mat4::scaling(0.0f);
+                bones[char_model::BoneId::Neck] = char_model::Mat4::scaling(0.0f);
+            }
+            std::memcpy(g_boneMapped[frameIndex], bones, sizeof(bones));
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_charPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelineLayout, 0, 1,
+                                &g_descSets[frameIndex], 0, nullptr);
+        VkDeviceSize cOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_charVB, &cOff);
+        vkCmdBindIndexBuffer(cmd, g_charIB, 0, VK_INDEX_TYPE_UINT32);
+
+        const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
+        const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
+        const float modelYaw = g_captureActive ? 0.0f : g_legYaw;
+        const char_model::Mat4 rotMat = char_model::Mat4::rotationY(static_cast<float>(M_PI) - modelYaw);
+        const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+        const Vec3 interpPos = lerpEye(g_playerPosPrevTick, Vec3(g_player.px, g_player.py, g_player.pz), alpha);
+        const float modelX = g_captureActive ? (static_cast<float>(g_spawnCellX + 2) * VOXEL_SIZE) : interpPos.x;
+        const float modelY = g_captureActive ? (static_cast<float>(g_spawnCellY) * VOXEL_SIZE) : interpPos.y;
+        const float modelZ = g_captureActive ? (static_cast<float>(g_spawnCellZ + 2) * VOXEL_SIZE) : interpPos.z;
+        const char_model::Mat4 transMat = char_model::Mat4::translation(modelX, modelY, modelZ);
+        const char_model::Mat4 modelMat = char_model::Mat4::multiply(transMat, char_model::Mat4::multiply(rotMat, scaleMat));
+        vkCmdPushConstants(cmd, g_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(char_model::Mat4), &modelMat);
+        vkCmdDrawIndexed(cmd, g_charIndexCount, 1, 0, 0, 0);
+
+        // Restore world pipeline & descriptors for following passes (debris & sky)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelineLayout, 0, 1,
+                                &g_descSets[frameIndex], 0, nullptr);
+    }
+ 
+    // Weapon model rendering (Models layer: first-person viewmodel or 3rd-person attached to RHand)
+    if (g_weaponVB != VK_NULL_HANDLE && g_weaponVertexCount > 0) {
+        VkDeviceSize wOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &g_weaponVB, &wOff);
+        vkCmdDraw(cmd, g_weaponVertexCount, 1, 0, 0);
     }
 
     // Visual debris cubes (8x8x8 chips) after world mesh, before sky
@@ -5965,7 +7307,10 @@ static void spawnPlayerOnMap(const sim::World& world) {
         g_player.leanTarget = 0.0f;
         g_yaw = g_mapSpawn.yaw;
         g_pitch = g_mapSpawn.pitch;
+        g_legYaw = g_yaw;
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+        g_playerPosPrevTick = Vec3(g_player.px, g_player.py, g_player.pz);
+        g_charLocomotionPhase = 0.0f;
         return;
     }
     // No authored spawn, but a terrain section: stand on the generated ground.
@@ -6010,7 +7355,10 @@ static void spawnPlayerOnMap(const sim::World& world) {
         g_player.leanTarget = 0.0f;
         g_yaw = g_mapSpawn.yaw;
         g_pitch = g_mapSpawn.pitch;
+        g_legYaw = g_yaw;
         g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+        g_playerPosPrevTick = Vec3(g_player.px, g_player.py, g_player.pz);
+        g_charLocomotionPhase = 0.0f;
     }
 }
 
@@ -6062,6 +7410,13 @@ static Vec3 cameraRight() {
     return cameraForward().cross(Vec3(0, 1, 0)).normalized();
 }
 
+static Vec3 cameraUp() {
+    Vec3 f = cameraForward();
+    Vec3 r = cameraRight();
+    if (r.length() < 1e-5f) r = Vec3(1, 0, 0);
+    return r.normalized().cross(f).normalized();
+}
+
 // Flat look vectors (movement stays grounded; pitch does not fly).
 static Vec3 flatForward() {
     return Vec3(std::sin(g_yaw), 0.0f, -std::cos(g_yaw)).normalized();
@@ -6070,20 +7425,710 @@ static Vec3 flatRight() {
     return Vec3(std::cos(g_yaw), 0.0f, std::sin(g_yaw)).normalized();
 }
 
-// Sync locked eye camera to physics body + lean offset.
+// Sync locked eye camera to animated character model head + lean offset.
 static void syncCameraToPlayer() {
+    // 1. Update leg heading based on movement velocity and waist twist limit:
+    const float horizSpeedSq = g_player.vx * g_player.vx + g_player.vz * g_player.vz;
+    if (horizSpeedSq > 1e-6f) {
+        const float moveYaw = std::atan2(g_player.vx, -g_player.vz);
+        g_legYaw += angleDiff(moveYaw, g_legYaw) * 0.35f;
+    } else {
+        const float diff = angleDiff(g_yaw, g_legYaw);
+        if (diff > 1.15f) {
+            g_legYaw = g_yaw - 1.15f;
+        } else if (diff < -1.15f) {
+            g_legYaw = g_yaw + 1.15f;
+        }
+    }
+    while (g_legYaw > static_cast<float>(M_PI)) g_legYaw -= static_cast<float>(2.0 * M_PI);
+    while (g_legYaw < -static_cast<float>(M_PI)) g_legYaw += static_cast<float>(2.0 * M_PI);
+
+    // Continuous locomotion phase accumulation during simulation tick
+    const float horizSpeed = std::sqrt(horizSpeedSq);
+    float cadence = 1.2f;
+    if (g_move.gait == movement::Gait::Sprint) cadence = 2.0f;
+    else if (g_move.gait == movement::Gait::Run) cadence = 1.6f;
+    else if (g_move.stance == movement::Stance::Crouch) cadence = 0.9f;
+    else if (g_move.stance == movement::Stance::Prone) cadence = 0.7f;
+    if (horizSpeed > 0.001f) {
+        g_charLocomotionPhase += cadence * static_cast<float>(TICK_DT) * (2.0f * static_cast<float>(M_PI));
+        if (g_charLocomotionPhase > 2.0f * static_cast<float>(M_PI)) {
+            g_charLocomotionPhase -= 2.0f * static_cast<float>(M_PI);
+        }
+    }
+
+    // 2. Evaluate procedural model pose to obtain the animated head joint position
+    const float deltaYaw = angleDiff(g_yaw, g_legYaw);
+    const float aimPitch = g_pitch;
+    const float timeSec = static_cast<float>(g_tick) * TICK_DT;
+    char_model::Vec3 headModelPos{};
+    char_model::Mat4 dummyBones[char_model::kMaxBones];
+
+    // No authored pose override here. This runs inside the sim tick and sets
+    // g_camPos, which is the shot origin. g_currentAnimPose is view state: it
+    // advances with the frame dt in drawFrame, so feeding it in made shots,
+    // impacts and the stress sim_fingerprint depend on frame timing (RULES.md:
+    // the simulation never reads rendering state). Authored clips still drive
+    // the rendered body and weapon in recordCommandBuffer.
+    char_model::evaluateProceduralPose(
+        char_model::getCanonicalModel(), g_move, g_player, timeSec,
+        deltaYaw, aimPitch, dummyBones, &headModelPos, g_charLocomotionPhase, nullptr,
+        false, 0.0f, false, 0.0f, nullptr);
+
+    const float scale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
+    const char_model::Mat4 scaleMat = char_model::Mat4::scaling(scale);
+    const char_model::Mat4 rotMat = char_model::Mat4::rotationY(static_cast<float>(M_PI) - g_legYaw);
+    const char_model::Mat4 transMat = char_model::Mat4::translation(g_player.px, g_player.py, g_player.pz);
+    const char_model::Mat4 modelMat = char_model::Mat4::multiply(transMat, char_model::Mat4::multiply(rotMat, scaleMat));
+
+    const char_model::Vec3 headWorld = modelMat.transformPoint(headModelPos);
+    g_charHeadWorldPos = Vec3(headWorld.x, headWorld.y, headWorld.z);
+
+    // The body and model are the authority. The camera is locked to the head joint,
+    // plus any presentation offsets from the movement intent system.
     Vec3 right = flatRight();
     Vec3 fwd = flatForward();
-    const float leanLat = g_player.lean * 0.0032f;   // lateral peek
-    const float leanDrop = std::fabs(g_player.lean) * 0.0009f;
-    // The body is the authority. Everything past this line is presentation:
-    // lean, the movement system's stance eye height, and the offset it produced
-    // this tick. None of it is read back by the simulation.
-    const float eye = movement::STANCE_EYE_HEIGHT[static_cast<int>(g_move.stance)];
-    const float lat = leanLat + g_camOffset.lateralLean;
-    g_camPos.x = g_player.px + right.x * lat + fwd.x * g_camOffset.forwardLean;
-    g_camPos.y = g_player.py + eye + g_camOffset.eyeLift - leanDrop;
-    g_camPos.z = g_player.pz + right.z * lat + fwd.z * g_camOffset.forwardLean;
+    g_camPos.x = g_charHeadWorldPos.x + right.x * g_camOffset.lateralLean + fwd.x * g_camOffset.forwardLean;
+    g_camPos.y = g_charHeadWorldPos.y + g_camOffset.eyeLift;
+    g_camPos.z = g_charHeadWorldPos.z + right.z * g_camOffset.lateralLean + fwd.z * g_camOffset.forwardLean;
+}
+
+// -----------------------------------------------------------------------------
+// Editor & UI Bridge Helpers: Voxel Raycast, Map Reload, File Watcher, Actions
+// -----------------------------------------------------------------------------
+
+struct PickResult {
+    bool hit = false;
+    int x = 0, y = 0, z = 0;
+    int nx = 0, ny = 0, nz = 0;
+    int adjX = 0, adjY = 0, adjZ = 0;
+    sim::Block block = sim::Block::Air;
+    int paletteIndex = 0;
+    float dist = 0.0f;
+    const char* blockName = "Air";
+};
+
+static const char* blockNameFor(sim::Block b) {
+    switch (b) {
+    case sim::Block::Air: return "Air";
+    case sim::Block::Dirt: return "Dirt";
+    case sim::Block::Concrete: return "Concrete";
+    case sim::Block::SheetMetal: return "SheetMetal";
+    case sim::Block::Girder: return "Girder";
+    case sim::Block::Wood: return "Wood";
+    case sim::Block::WoodDark: return "WoodDark";
+    case sim::Block::Water: return "Water";
+    case sim::Block::WaterCurrent: return "WaterCurrent";
+    case sim::Block::Moon: return "Moon";
+    case sim::Block::LightBulb: return "LightBulb";
+    case sim::Block::Sand: return "Sand";
+    case sim::Block::Grass: return "Grass";
+    case sim::Block::Snow: return "Snow";
+    case sim::Block::Asphalt: return "Asphalt";
+    default: return "Unknown";
+    }
+}
+
+static PickResult raycastVoxel(const Vec3& eye, const Vec3& dir, float maxDist = 40.0f) {
+    PickResult res;
+    if (!g_world) return res;
+
+    const float vs = VOXEL_SIZE;
+    float dx = dir.x, dy = dir.y, dz = dir.z;
+    const float eps = 1e-8f;
+    if (std::fabs(dx) < eps) dx = (dx < 0.0f ? -eps : eps);
+    if (std::fabs(dy) < eps) dy = (dy < 0.0f ? -eps : eps);
+    if (std::fabs(dz) < eps) dz = (dz < 0.0f ? -eps : eps);
+
+    float ox = eye.x / vs;
+    float oy = eye.y / vs;
+    float oz = eye.z / vs;
+
+    int ix = static_cast<int>(std::floor(ox));
+    int iy = static_cast<int>(std::floor(oy));
+    int iz = static_cast<int>(std::floor(oz));
+
+    const int stepX = dx > 0.0f ? 1 : -1;
+    const int stepY = dy > 0.0f ? 1 : -1;
+    const int stepZ = dz > 0.0f ? 1 : -1;
+
+    const float tDeltaX = vs / std::fabs(dx);
+    const float tDeltaY = vs / std::fabs(dy);
+    const float tDeltaZ = vs / std::fabs(dz);
+
+    float tMaxX = (stepX > 0)
+        ? ((static_cast<float>(ix) + 1.0f - ox) / dx) * vs
+        : ((ox - static_cast<float>(ix)) / -dx) * vs;
+    float tMaxY = (stepY > 0)
+        ? ((static_cast<float>(iy) + 1.0f - oy) / dy) * vs
+        : ((oy - static_cast<float>(iy)) / -dy) * vs;
+    float tMaxZ = (stepZ > 0)
+        ? ((static_cast<float>(iz) + 1.0f - oz) / dz) * vs
+        : ((oz - static_cast<float>(iz)) / -dz) * vs;
+
+    int lastFace = -1; // 0 = X, 1 = Y, 2 = Z
+    float traveled = 0.0f;
+    const int maxSteps = static_cast<int>(maxDist / vs);
+
+    for (int step = 0; step < maxSteps; ++step) {
+        if (sim::World::inBounds(ix, iy, iz)) {
+            sim::Block b = g_world->get(ix, iy, iz);
+            if (b != sim::Block::Air && b != sim::Block::Water && b != sim::Block::WaterCurrent) {
+                res.hit = true;
+                res.x = ix; res.y = iy; res.z = iz;
+                res.block = b;
+                res.paletteIndex = g_world->getAppearance(ix, iy, iz);
+                res.dist = traveled;
+                res.blockName = blockNameFor(b);
+                if (lastFace == 0) {
+                    res.nx = -stepX; res.ny = 0; res.nz = 0;
+                } else if (lastFace == 1) {
+                    res.nx = 0; res.ny = -stepY; res.nz = 0;
+                } else if (lastFace == 2) {
+                    res.nx = 0; res.ny = 0; res.nz = -stepZ;
+                } else {
+                    res.nx = 0; res.ny = 1; res.nz = 0;
+                }
+                res.adjX = ix + res.nx;
+                res.adjY = iy + res.ny;
+                res.adjZ = iz + res.nz;
+                return res;
+            }
+        } else if (traveled > 0.05f) {
+            break;
+        }
+
+        if (tMaxX < tMaxY) {
+            if (tMaxX < tMaxZ) {
+                traveled = tMaxX;
+                tMaxX += tDeltaX;
+                ix += stepX;
+                lastFace = 0;
+            } else {
+                traveled = tMaxZ;
+                tMaxZ += tDeltaZ;
+                iz += stepZ;
+                lastFace = 2;
+            }
+        } else {
+            if (tMaxY < tMaxZ) {
+                traveled = tMaxY;
+                tMaxY += tDeltaY;
+                iy += stepY;
+                lastFace = 1;
+            } else {
+                traveled = tMaxZ;
+                tMaxZ += tDeltaZ;
+                iz += stepZ;
+                lastFace = 2;
+            }
+        }
+    }
+    return res;
+}
+
+static bool reloadMapFile(const std::string& path) {
+    if (!g_world || path.empty()) return false;
+    mapvox::Doc mapDoc;
+    if (!mapvox::loadMapVox(path, mapDoc)) {
+        std::fprintf(stderr, "[map-reload] Failed to load %s: %s\n", path.c_str(), mapDoc.error.c_str());
+        return false;
+    }
+    if (mapDoc.sx != WORLD_W || mapDoc.sy != WORLD_H || mapDoc.sz != WORLD_D) {
+        std::fprintf(stderr, "[map-reload] Map size mismatch (%dx%dx%d != %dx%dx%d): %s\n",
+                     mapDoc.sx, mapDoc.sy, mapDoc.sz, WORLD_W, WORLD_H, WORLD_D, path.c_str());
+        return false;
+    }
+    *g_world = makeEmptyWorld();
+    mapvox::stampMapVox(mapDoc, *g_world, 0, 0, 0);
+    g_mapPrefabsStamped = 0;
+    g_mapPrefabInstances.clear();
+    for (const auto& pf : mapDoc.prefabs) {
+        if (stampPrefabById(pf.id, *g_world, pf.x, pf.y, pf.z, pf.rot)) {
+            ++g_mapPrefabsStamped;
+            g_mapPrefabInstances.push_back(pf);
+        }
+    }
+    g_mapTerrain = mapDoc.terrain;
+    generateMapTerrain(*g_world, g_mapTerrain);
+    g_mapSpawn = mapDoc.spawn;
+    g_mapPickups = mapDoc.pickups;
+    g_mapLights = mapDoc.lights;
+    g_bulbs.clear();
+    for (const auto& ml : mapDoc.lights) {
+        BulbLight l;
+        l.pos = Vec3(ml.x * VOXEL_SIZE, ml.y * VOXEL_SIZE, ml.z * VOXEL_SIZE);
+        l.color = Vec3(ml.r, ml.g, ml.b);
+        l.intensity = ml.intensity;
+        l.radius = ml.radius;
+        g_bulbs.push_back(l);
+    }
+    if (mapDoc.environment.present) {
+        g_mapEnvironment = mapDoc.environment;
+        g_moonDirWorld = Vec3(mapDoc.environment.moonDir[0],
+                              mapDoc.environment.moonDir[1],
+                              mapDoc.environment.moonDir[2])
+                             .normalized();
+    }
+    sendPalette(*g_world, g_viewPalette);
+    g_mapPath = path;
+    g_structuralMatrix.initDefaultZones(*g_world);
+    if (g_views) {
+        for (auto& v : *g_views) {
+            v.hasSnapshot = false;
+            v.meshedVersion = 0;
+        }
+    }
+    g_meshDirty = true;
+    std::fprintf(stderr, "[map-reload] Successfully reloaded map: %s (prefabs=%d)\n",
+                 path.c_str(), g_mapPrefabsStamped);
+    return true;
+}
+
+static FILETIME g_lastMapWriteTime{};
+static bool checkMapFileModified() {
+    if (g_mapPath.empty()) return false;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(g_mapPath.c_str(), GetFileExInfoStandard, &fad)) return false;
+    if (g_lastMapWriteTime.dwLowDateTime == 0 && g_lastMapWriteTime.dwHighDateTime == 0) {
+        g_lastMapWriteTime = fad.ftLastWriteTime;
+        return false;
+    }
+    if (CompareFileTime(&g_lastMapWriteTime, &fad.ftLastWriteTime) < 0) {
+        g_lastMapWriteTime = fad.ftLastWriteTime;
+        return true;
+    }
+    return false;
+}
+
+static void launchJavaPainterAsync() {
+    STARTUPINFOA si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    std::string cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\launch_dev.ps1 -Action Painter";
+    std::vector<char> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back('\0');
+    if (CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        std::fprintf(stderr, "[ui-bridge] Launched Java Painter externally\n");
+    } else {
+        std::fprintf(stderr, "[ui-bridge] Failed to launch Java Painter: 0x%08lX\n", GetLastError());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Editor transactions (RFC "Sim/View Boundary" 5.1 / roadmap E.5).
+//
+// Every editor mutation of occupancy -- a paint, a carve, a prefab stamp -- is
+// recorded as one reversible transaction. The transaction holds the before and
+// after of each cell it touched; undo/redo replay those cells. The write itself
+// goes through sim::World::set/setAppearance, so the chunk-version mechanism the
+// view already uses still dirties exactly the meshes that changed -- the editor
+// authors occupancy, it does not bypass the authoritative grid (RULES.md,
+// "Authority and the view/sim split"). The editor runs only under --mode editor,
+// so none of this is reachable from the deterministic smoke/stress paths.
+// -----------------------------------------------------------------------------
+
+struct EditorCellEdit {
+    int x = 0, y = 0, z = 0;
+    sim::Block beforeBlock = sim::Block::Air;
+    uint8_t beforeAppearance = 0;
+    sim::Block afterBlock = sim::Block::Air;
+    uint8_t afterAppearance = 0;
+};
+
+struct EditorTransaction {
+    std::string label;
+    std::vector<EditorCellEdit> edits;
+};
+
+static constexpr size_t kEditorHistoryMax = 256;
+static std::vector<EditorTransaction> g_editorUndo;
+static std::vector<EditorTransaction> g_editorRedo;
+static bool g_editorRecording = false;             // capture writes while true
+static std::vector<EditorCellEdit> g_editorRecorded;
+
+static void applyEditorCell(const EditorCellEdit& e, bool forward) {
+    if (!g_world || !sim::World::inBounds(e.x, e.y, e.z)) return;
+    g_world->set(e.x, e.y, e.z, forward ? e.afterBlock : e.beforeBlock);
+    g_world->setAppearance(e.x, e.y, e.z, forward ? e.afterAppearance : e.beforeAppearance);
+}
+
+static void editorBeginRecord() {
+    g_editorRecorded.clear();
+    g_editorRecording = true;
+}
+
+static void editorNoteCell(const EditorCellEdit& e) {
+    if (g_editorRecording) g_editorRecorded.push_back(e);
+}
+
+// Apply one cell inside the open transaction. An edit that changes nothing is a
+// no-op and is not recorded, so a click with no effect leaves no undo step.
+static bool editorSetCell(int x, int y, int z, sim::Block block, uint8_t appearance) {
+    if (!g_world || !sim::World::inBounds(x, y, z)) return false;
+    EditorCellEdit e;
+    e.x = x; e.y = y; e.z = z;
+    e.beforeBlock = g_world->get(x, y, z);
+    e.beforeAppearance = g_world->getAppearance(x, y, z);
+    e.afterBlock = block;
+    e.afterAppearance = appearance;
+    if (e.beforeBlock == e.afterBlock && e.beforeAppearance == e.afterAppearance) return false;
+    applyEditorCell(e, true);
+    editorNoteCell(e);
+    return true;
+}
+
+// Close the open recording buffer as a single undoable step.
+static void editorCommit(const char* label) {
+    g_editorRecording = false;
+    if (g_editorRecorded.empty()) return;
+    EditorTransaction tx;
+    tx.label = label ? label : "Edit";
+    tx.edits = std::move(g_editorRecorded);
+    g_editorRecorded.clear();
+    g_editorUndo.push_back(std::move(tx));
+    if (g_editorUndo.size() > kEditorHistoryMax) g_editorUndo.erase(g_editorUndo.begin());
+    g_editorRedo.clear();
+    g_meshDirty = true;
+}
+
+static void editorDiscardRecording() {
+    g_editorRecording = false;
+    g_editorRecorded.clear();
+}
+
+static void editorUndo() {
+    if (g_editorUndo.empty()) return;
+    EditorTransaction tx = std::move(g_editorUndo.back());
+    g_editorUndo.pop_back();
+    for (auto it = tx.edits.rbegin(); it != tx.edits.rend(); ++it) applyEditorCell(*it, false);
+    g_editorRedo.push_back(std::move(tx));
+    g_meshDirty = true;
+}
+
+static void editorRedo() {
+    if (g_editorRedo.empty()) return;
+    EditorTransaction tx = std::move(g_editorRedo.back());
+    g_editorRedo.pop_back();
+    for (const EditorCellEdit& e : tx.edits) applyEditorCell(e, true);
+    g_editorUndo.push_back(std::move(tx));
+    g_meshDirty = true;
+}
+
+// Stamp a prefab as one undoable transaction. The document is loaded once, both
+// to stamp it and to bound the before/after capture to its own footprint (the
+// turn keeps the footprint inside max(sx, sz) on both axes), so the diff touches
+// no cell the stamp could not have written.
+static bool editorStampPrefab(const std::string& id, int x, int y, int z, int rot) {
+    if (!g_world || id.empty()) return false;
+    mapvox::Doc pd;
+    bool found = false;
+    for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                  g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+        if (mapvox::loadAssetVox(dir + id + ".vox.json", pd)) { found = true; break; }
+    }
+    if (!found) return false;
+
+    const int spanXZ = std::max(pd.sx, pd.sz);
+    const int x0 = std::clamp(x, 0, WORLD_W - 1), x1 = std::clamp(x + spanXZ, 0, WORLD_W - 1);
+    const int y0 = std::clamp(y, 0, WORLD_H - 1), y1 = std::clamp(y + pd.sy, 0, WORLD_H - 1);
+    const int z0 = std::clamp(z, 0, WORLD_D - 1), z1 = std::clamp(z + spanXZ, 0, WORLD_D - 1);
+
+    struct CellState { sim::Block b; uint8_t a; };
+    std::vector<CellState> before;
+    before.reserve(static_cast<size_t>(x1 - x0 + 1) * static_cast<size_t>(y1 - y0 + 1) *
+                   static_cast<size_t>(z1 - z0 + 1));
+    for (int yy = y0; yy <= y1; ++yy)
+        for (int zz = z0; zz <= z1; ++zz)
+            for (int xx = x0; xx <= x1; ++xx)
+                before.push_back({g_world->get(xx, yy, zz), g_world->getAppearance(xx, yy, zz)});
+
+    editorBeginRecord();
+    const mapvox::StampResult r = mapvox::stampMapVox(pd, *g_world, x, y, z, rot, false);
+
+    size_t i = 0;
+    for (int yy = y0; yy <= y1; ++yy) {
+        for (int zz = z0; zz <= z1; ++zz) {
+            for (int xx = x0; xx <= x1; ++xx, ++i) {
+                const sim::Block nb = g_world->get(xx, yy, zz);
+                const uint8_t na = g_world->getAppearance(xx, yy, zz);
+                if (nb == before[i].b && na == before[i].a) continue;
+                EditorCellEdit e;
+                e.x = xx; e.y = yy; e.z = zz;
+                e.beforeBlock = before[i].b; e.beforeAppearance = before[i].a;
+                e.afterBlock = nb; e.afterAppearance = na;
+                editorNoteCell(e);
+            }
+        }
+    }
+    if (r.written == 0 && g_editorRecorded.empty()) {
+        editorDiscardRecording();
+        return false;
+    }
+    g_mapPrefabInstances.push_back({id, x, y, z, rot});
+    ++g_mapPrefabsStamped;
+    return true;
+}
+
+// Prefab ids available to the editor, scanned from the same directories the
+// stamp path searches. Names are unique and sorted so the UI list is stable.
+static std::vector<std::string> scanPrefabIds() {
+    std::vector<std::string> ids;
+    const std::string suffix = ".vox.json";
+    for (const std::string dir : {g_exeDir + "\\prefabs\\", g_exeDir + "\\..\\data\\prefabs\\",
+                                  g_exeDir + "\\..\\..\\data\\prefabs\\"}) {
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = FindFirstFileA((dir + "*.vox.json").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            const std::string name = fd.cFileName;
+            if (name.size() <= suffix.size() ||
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+            const std::string id = name.substr(0, name.size() - suffix.size());
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+static void handleEditorAction(const std::string& actionJson) {
+    std::string type = jsonExtractString(actionJson, "type");
+    if (type.empty()) return;
+
+    if (type == "TOGGLE_PAUSE") {
+        setPaused(!g_paused);
+    } else if (type == "SET_PAUSED") {
+        bool p = jsonExtractBool(actionJson, "paused", false);
+        setPaused(p);
+    } else if (type == "RESET_CAMERA") {
+        g_yaw = g_mapSpawn.yaw;
+        g_pitch = g_mapSpawn.pitch;
+        g_legYaw = g_yaw;
+        g_camPos = Vec3(g_player.px, g_player.py + g_player.eyeHeight, g_player.pz);
+    } else if (type == "TOGGLE_THIRD_PERSON") {
+        g_thirdPerson = !g_thirdPerson;
+    } else if (type == "SET_THIRD_PERSON") {
+        g_thirdPerson = jsonExtractBool(actionJson, "thirdPerson", false);
+    } else if (type == "SPAWN_PLAYER") {
+        if (g_world) spawnPlayerOnMap(*g_world);
+    } else if (type == "SET_VISUAL_PARAM") {
+        std::string key = jsonExtractString(actionJson, "key");
+        float val = jsonExtractFloat(actionJson, "value", 0.0f);
+        if (auto* p = g_visReg.find(key)) {
+            p->set(val);
+            g_visReg.touch();
+        }
+    } else if (type == "APPLY_PRESET") {
+        std::string name = jsonExtractString(actionJson, "name");
+        g_visReg.applyPreset(name);
+    } else if (type == "RESET_VISUAL_PARAMS") {
+        g_visReg.resetDefaults();
+    } else if (type == "PAINT_VOXEL") {
+        int x = static_cast<int>(jsonExtractFloat(actionJson, "x", -1.0f));
+        int y = static_cast<int>(jsonExtractFloat(actionJson, "y", -1.0f));
+        int z = static_cast<int>(jsonExtractFloat(actionJson, "z", -1.0f));
+        int b = static_cast<int>(jsonExtractFloat(actionJson, "block", 2.0f));
+        int p = static_cast<int>(jsonExtractFloat(actionJson, "paletteIndex", 0.0f));
+        editorBeginRecord();
+        if (editorSetCell(x, y, z, static_cast<sim::Block>(b), static_cast<uint8_t>(p)))
+            editorCommit("Paint voxel");
+        else
+            editorDiscardRecording();
+    } else if (type == "DELETE_VOXEL") {
+        int x = static_cast<int>(jsonExtractFloat(actionJson, "x", -1.0f));
+        int y = static_cast<int>(jsonExtractFloat(actionJson, "y", -1.0f));
+        int z = static_cast<int>(jsonExtractFloat(actionJson, "z", -1.0f));
+        editorBeginRecord();
+        if (editorSetCell(x, y, z, sim::Block::Air, 0))
+            editorCommit("Carve voxel");
+        else
+            editorDiscardRecording();
+    } else if (type == "PREFAB_STAMP") {
+        const std::string id = jsonExtractString(actionJson, "id");
+        const int rot = static_cast<int>(jsonExtractFloat(actionJson, "rot", 0.0f));
+        int x = 0, y = 0, z = 0;
+        if (jsonxHasKey(actionJson, "x") && jsonxHasKey(actionJson, "y") && jsonxHasKey(actionJson, "z")) {
+            x = static_cast<int>(jsonExtractFloat(actionJson, "x", 0.0f));
+            y = static_cast<int>(jsonExtractFloat(actionJson, "y", 0.0f));
+            z = static_cast<int>(jsonExtractFloat(actionJson, "z", 0.0f));
+        } else {
+            // No cell named: place at the crosshair's adjacent cell, the same
+            // cell the paint tool's "place adjacent" targets.
+            const PickResult pick = raycastVoxel(g_camPos, cameraForward(), 40.0f);
+            if (!pick.hit) return;
+            x = pick.adjX; y = pick.adjY; z = pick.adjZ;
+        }
+        if (editorStampPrefab(id, x, y, z, rot))
+            editorCommit("Stamp prefab");
+        else
+            editorDiscardRecording();
+    } else if (type == "UNDO") {
+        editorUndo();
+    } else if (type == "REDO") {
+        editorRedo();
+    } else if (type == "RELOAD_MAP") {
+        reloadMapFile(g_mapPath);
+    } else if (type == "LAUNCH_JAVA_PAINTER") {
+        launchJavaPainterAsync();
+    } else if (type == "SET_STANCE") {
+        int st = static_cast<int>(jsonExtractFloat(actionJson, "stance", 0.0f));
+        if (st >= 0 && st <= 2) g_move.stance = static_cast<movement::Stance>(st);
+    } else if (type == "SET_GAIT") {
+        int g = static_cast<int>(jsonExtractFloat(actionJson, "gait", 0.0f));
+        if (g >= 0 && g <= 2) g_move.gait = static_cast<movement::Gait>(g);
+    } else if (type == "TRIGGER_DASH") {
+        g_pendingInput.dash = true;
+    } else if (type == "TRIGGER_SLIDE") {
+        g_move.sliding = !g_move.sliding;
+    } else if (type == "CYCLE_WEAPON") {
+        g_pendingInput.cycleWeapon = true;
+    } else if (type == "SET_CALIBER") {
+        int c = static_cast<int>(jsonExtractFloat(actionJson, "caliber", 0.0f));
+        g_pendingInput.selectCaliber = c;
+    } else if (type == "SET_TIME_OF_DAY") {
+        float tod = jsonExtractFloat(actionJson, "timeOfDay", g_timeOfDay);
+        g_timeOfDay = std::clamp(tod, 0.0f, 1.0f);
+    } else if (type == "EQUIP_WEAPON") {
+        std::string weaponId = jsonExtractString(actionJson, "weaponId");
+        for (size_t i = 0; i < g_weapons.size(); ++i) {
+            if (g_weapons[i].id == weaponId) {
+                g_activeWeaponIndex = static_cast<int>(i);
+                g_viewmodelAnim.triggerEquip();
+                break;
+            }
+        }
+    } else if (type == "TRIGGER_RELOAD") {
+        g_viewmodelAnim.triggerReload();
+        g_animController.playClip("rifle_reload", false, 0.15f);
+    } else if (type == "TRIGGER_RECOIL") {
+        g_viewmodelAnim.triggerRecoil(12.0f, 10.0f);
+        g_animController.triggerAdditive("rifle_fire", 1.0f, 1.0f);
+    } else if (type == "TOGGLE_ADS") {
+        g_viewmodelAnim.adsAlpha = (g_viewmodelAnim.adsAlpha > 0.5f) ? 0.0f : 1.0f;
+    } else if (type == "SET_ANIM_CLIP") {
+        const std::string clipId = jsonExtractString(actionJson, "clipId", "");
+        if (!clipId.empty()) {
+            const bool loop = jsonExtractBool(actionJson, "loop", true);
+            const float blend = jsonExtractFloat(actionJson, "blend", 0.15f);
+            g_animController.playClip(clipId, false, blend);
+        }
+        if (jsonxHasKey(actionJson, "scrubTime")) {
+            g_animController.clipTime = jsonExtractFloat(actionJson, "scrubTime", 0.0f);
+        }
+        if (jsonxHasKey(actionJson, "isPlaying")) {
+            g_animController.isPlaying = jsonExtractBool(actionJson, "isPlaying", true);
+        }
+        if (jsonxHasKey(actionJson, "speed")) {
+            g_animController.playbackSpeed = jsonExtractFloat(actionJson, "speed", 1.0f);
+        }
+        if (jsonxHasKey(actionJson, "weight")) {
+            g_animAuthoredWeight = jsonExtractFloat(actionJson, "weight", 0.85f);
+        }
+    } else if (type == "SET_WEAPON_HOLD") {
+        g_forceWeaponHold = jsonExtractBool(actionJson, "holding", true);
+    } else if (type == "TRIGGER_PLANETARY_IMPACT") {
+        const uint32_t targetId = static_cast<uint32_t>(jsonExtractFloat(actionJson, "targetId", 1.0f));
+        const double radiusM = static_cast<double>(jsonExtractFloat(actionJson, "radiusM", 4500000.0f));
+        const double speedMps = static_cast<double>(jsonExtractFloat(actionJson, "speedMps", 50000.0f));
+        g_multiPlanetSystem.launchImpactor(targetId, radiusM, speedMps);
+    } else if (type == "RESET_PLANETARY_SIM") {
+        g_multiPlanetSystem.initStandardEarthMoonImpactorSystem();
+    } else if (type == "STEP_PLANETARY_SIM") {
+        const double dt = static_cast<double>(jsonExtractFloat(actionJson, "dt", 1.0f));
+        g_multiPlanetSystem.step(dt);
+    } else if (type == "ROLL_CONTAINER_LOOT") {
+        const std::string contStr = jsonExtractString(actionJson, "container", "WeaponLocker");
+        loot::ContainerType contType = loot::ContainerType::WeaponLocker;
+        if (contStr == "WallSafe") contType = loot::ContainerType::WallSafe;
+        else if (contStr == "MilitaryFootlocker") contType = loot::ContainerType::MilitaryFootlocker;
+        else if (contStr == "ScrapBin") contType = loot::ContainerType::ScrapBin;
+        else if (contStr == "CovertDeadDrop") contType = loot::ContainerType::CovertDeadDrop;
+        else if (contStr == "MedicalCabinet") contType = loot::ContainerType::MedicalCabinet;
+        
+        static uint64_t s_lootSeed = 1337;
+        const auto drops = loot::openContainer(contType, s_lootSeed++);
+        for (const auto& item : drops) {
+            std::cout << "[IPC] Rolled container loot drop: " << item.name << " (" << loot::tierToString(item.tier) << ")" << std::endl;
+        }
+    }
+ else if (type == "RECALC_STRUCTURAL_INTEGRITY") {
+
+        if (g_world) {
+            g_structuralMatrix.evaluateAll(*g_world);
+        }
+    } else if (type == "DEMOLISH_TEST_MEMBER") {
+        if (g_world) {
+            for (int y = 2; y <= 45; ++y) {
+                for (int z = 10; z <= 150; ++z) {
+                    for (int x = 10; x <= 180; ++x) {
+                        sim::Block b = g_world->get(x, y, z);
+                        if (b == sim::Block::Girder || b == sim::Block::Concrete) {
+                            g_world->set(x, y, z, sim::Block::Air);
+                            g_meshDirty = true;
+                            g_structuralMatrix.evaluateAll(*g_world);
+                            goto memberDemolished;
+                        }
+                    }
+                }
+            }
+        memberDemolished:;
+        }
+    } else if (type == "BAKE_WEAPON_MODEL") {
+        std::string weaponId = jsonExtractString(actionJson, "weaponId");
+        if (weaponId.empty() && !g_weapons.empty() && g_activeWeaponIndex >= 0) {
+            weaponId = g_weapons[g_activeWeaponIndex].id;
+        }
+        const weapon_view::WeaponModel* targetModel = nullptr;
+        for (const auto& wm : g_weaponModels) {
+            if (wm.id == weaponId) { targetModel = &wm; break; }
+        }
+        if (!targetModel && !g_weaponModels.empty()) {
+            targetModel = &g_weaponModels[0];
+        }
+        if (targetModel && g_world) {
+            Vec3 fwd = flatForward();
+            int startX = static_cast<int>(g_player.px * 1000.0f + fwd.x * 2.0f);
+            int startY = static_cast<int>(g_player.py * 1000.0f + 1.0f);
+            int startZ = static_cast<int>(g_player.pz * 1000.0f + fwd.z * 2.0f);
+            for (const auto& v : targetModel->voxels) {
+                int wx = startX + v.x - targetModel->sx / 2;
+                int wy = startY + v.y;
+                int wz = startZ + v.z - targetModel->sz / 2;
+                if (sim::World::inBounds(wx, wy, wz)) {
+                    sim::Block blk = sim::Block::SheetMetal;
+                    if (v.material == "girder") blk = sim::Block::Girder;
+                    else if (v.material == "concrete") blk = sim::Block::Concrete;
+                    else if (v.material == "wood" || v.material == "treated_wood") blk = sim::Block::Wood;
+                    g_world->set(wx, wy, wz, blk);
+                }
+            }
+            g_meshDirty = true;
+            g_structuralMatrix.evaluateAll(*g_world);
+        }
+    } else if (type == "BAKE_CHARACTER_MODEL") {
+        if (g_world) {
+            Vec3 fwd = flatForward();
+            int feetX = static_cast<int>(g_player.px * 1000.0f + fwd.x * 2.5f);
+            int feetY = static_cast<int>(g_player.py * 1000.0f);
+            int feetZ = static_cast<int>(g_player.pz * 1000.0f + fwd.z * 2.5f);
+            for (int dy = 0; dy < 16; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        int wx = feetX + dx, wy = feetY + dy, wz = feetZ + dz;
+                        if (sim::World::inBounds(wx, wy, wz)) {
+                            sim::Block blk = (dy >= 14) ? sim::Block::Wood : (dy >= 6 ? sim::Block::Concrete : sim::Block::SheetMetal);
+                            g_world->set(wx, wy, wz, blk);
+                        }
+                    }
+                }
+            }
+            g_meshDirty = true;
+            g_structuralMatrix.evaluateAll(*g_world);
+        }
+    }
 }
 
 // Death drops whatever is in hand as a normal mat-8 world pickup, reusing the
@@ -6306,7 +8351,32 @@ static Vec3 lerpEye(const Vec3& a, const Vec3& b, float t) {
 static Vec3 renderEye() {
     if (g_paused || g_captureActive) return g_camPos;
     const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
-    return lerpEye(g_camPosPrevTick, g_camPos, alpha);
+    Vec3 eye = lerpEye(g_camPosPrevTick, g_camPos, alpha);
+    if (g_thirdPerson) {
+        Vec3 fwd = cameraForward();
+        Vec3 right = cameraRight();
+        float dist = 0.032f;
+        if (g_world) {
+            Vec3 target = eye - fwd * dist + right * 0.007f + Vec3(0.0f, 0.004f, 0.0f);
+            Vec3 dir = target - eye;
+            float totalLen = dir.length();
+            if (totalLen > 1e-4f) {
+                Vec3 stepDir = dir * (1.0f / totalLen);
+                for (float s = 0.002f; s <= totalLen; s += 0.002f) {
+                    Vec3 p = eye + stepDir * s;
+                    int cx = static_cast<int>(std::floor(p.x / VOXEL_SIZE));
+                    int cy = static_cast<int>(std::floor(p.y / VOXEL_SIZE));
+                    int cz = static_cast<int>(std::floor(p.z / VOXEL_SIZE));
+                    if (sim::World::inBounds(cx, cy, cz) && isSolidBlock(g_world->get(cx, cy, cz))) {
+                        dist = std::max(0.005f, s - 0.002f);
+                        break;
+                    }
+                }
+            }
+        }
+        eye = eye - fwd * dist + right * (0.007f * (dist / 0.032f)) + Vec3(0.0f, 0.004f * (dist / 0.032f), 0.0f);
+    }
+    return eye;
 }
 
 static void updateUBO(uint32_t frameIndex, float timeSec) {
@@ -6315,12 +8385,12 @@ static void updateUBO(uint32_t frameIndex, float timeSec) {
     float aspect = g_extent.height > 0
                        ? static_cast<float>(g_extent.width) / static_cast<float>(g_extent.height)
                        : 1.0f;
-    // Optic ADS (hold X): tighter FOV from weapon optic stat.
+    // Optic ADS: smooth FOV zoom interpolated by adsAlpha from weapon optic stat.
     float fovDeg = DEFAULT_FOV_DEG;
-    if (g_ads) {
+    if (g_viewmodelAnim.adsAlpha > 0.0001f) {
         WeaponDef w = activeWeaponOrDefault();
         float zoom = std::min(45.0f, 8.0f + w.optic * 3.5f);
-        fovDeg = std::max(40.0f, DEFAULT_FOV_DEG - zoom);
+        fovDeg = DEFAULT_FOV_DEG - zoom * g_viewmodelAnim.adsAlpha;
     }
     Mat4 proj = Mat4::perspective(fovDeg * static_cast<float>(M_PI) / 180.0f, aspect, 0.0005f, 5.0f);
     Mat4 view = Mat4::lookAt(eye, center, {0, 1, 0});
@@ -6380,6 +8450,187 @@ ubo.moonIntensity = g_isNight ? 0.95f : 0.08f;
     ubo.texGlobal[1] = g_vis.textureStrength;
     ubo.texGlobal[2] = g_vis.textureScale;
     std::memcpy(g_uboMapped[frameIndex], &ubo, sizeof(ubo));
+}
+
+static void updateWeaponMesh() {
+    ensureWeaponBuffer();
+    if (!g_weaponMapped) return;
+    g_weaponVertexCount = 0;
+
+    const WeaponDef activeWeapon = activeWeaponOrDefault();
+    if (g_weaponModels.empty()) return;
+
+    const weapon_view::WeaponModel* model = nullptr;
+    for (const auto& wm : g_weaponModels) {
+        if (wm.id == activeWeapon.id) {
+            model = &wm;
+            break;
+        }
+    }
+    if (!model && !g_weaponModels.empty()) {
+        model = &g_weaponModels[0];
+    }
+    if (!model || !model->valid()) return;
+
+    Vertex* verts = reinterpret_cast<Vertex*>(g_weaponMapped);
+    uint32_t wi = 0;
+
+    g_currentAnimPose = g_animController.evaluatePose();
+    const float boltOffset = g_currentAnimPose.pos[anim::kBoneWeaponBolt].x;
+    const float magOffsetY = g_currentAnimPose.pos[anim::kBoneWeaponMag].y;
+
+    if (g_thirdPerson && !g_captureActive) {
+        // Third-person mode: attached to character right hand socket
+        const float charScale = (g_player.height > 0.0f) ? (g_player.height / 1.76f) : 0.01f;
+        const char_model::Mat4 scaleMat = char_model::Mat4::scaling(charScale);
+        const float modelYaw = g_legYaw;
+        const char_model::Mat4 rotMat = char_model::Mat4::rotationY(static_cast<float>(M_PI) - modelYaw);
+        const float alpha = static_cast<float>(std::clamp(g_tickAccum / TICK_DT, 0.0, 1.0));
+        const Vec3 interpPos = lerpEye(g_playerPosPrevTick, Vec3(g_player.px, g_player.py, g_player.pz), alpha);
+        const char_model::Mat4 transMat = char_model::Mat4::translation(interpPos.x, interpPos.y, interpPos.z);
+        const char_model::Mat4 charWorldMat = char_model::Mat4::multiply(transMat, char_model::Mat4::multiply(rotMat, scaleMat));
+
+        const float cellScale = 0.020f;
+        const char_model::Mat4 gripRot = char_model::Mat4::rotationY(-static_cast<float>(M_PI) * 0.5f);
+        const char_model::Mat4 gripTrans = char_model::Mat4::translation(
+            -static_cast<float>(model->pivotX) * cellScale,
+            -static_cast<float>(model->pivotY) * cellScale,
+            -static_cast<float>(model->pivotZ) * cellScale
+        );
+        const char_model::Mat4 gripMat = char_model::Mat4::multiply(gripRot, gripTrans);
+        const char_model::Mat4 weaponModelMat = char_model::Mat4::multiply(charWorldMat, char_model::Mat4::multiply(g_lastRHandSocket, gripMat));
+
+        const Vec3 base(weaponModelMat.m[12], weaponModelMat.m[13], weaponModelMat.m[14]);
+        const Vec3 wX = Vec3(weaponModelMat.m[0], weaponModelMat.m[1], weaponModelMat.m[2]).normalized();
+        const Vec3 wY = Vec3(weaponModelMat.m[4], weaponModelMat.m[5], weaponModelMat.m[6]).normalized();
+        const Vec3 wZ = Vec3(weaponModelMat.m[8], weaponModelMat.m[9], weaponModelMat.m[10]).normalized();
+        const float worldEdge = cellScale * charScale;
+
+        for (const auto& v : model->voxels) {
+            float vx = static_cast<float>(v.x);
+            float vy = static_cast<float>(v.y);
+            float vz = static_cast<float>(v.z);
+            if (v.part == "bolt_chamber" || v.part == "action") {
+                vx += boltOffset / cellScale;
+            } else if (v.part == "magazine") {
+                vy += magOffsetY / cellScale;
+            }
+            emitUnitCube(verts, wi, kWeaponMaxVerts, base, wX, wY, wZ,
+                         vx, vy, vz,
+                         worldEdge, v.cr, v.cg, v.cb, static_cast<float>(kPickupMatId));
+        }
+    } else if (!g_captureActive) {
+        // First-person viewmodel: anchored to camera display basis
+        const Vec3 camPos = renderEye();
+        const Vec3 fwd = cameraForward();
+        const Vec3 right = cameraRight();
+        const Vec3 up = cameraUp();
+
+        const float cellScale = 0.00018f;
+
+        const float sightRelY = static_cast<float>(model->sightY - model->pivotY) * cellScale;
+        const float sightRelZ = static_cast<float>(model->sightZ - model->pivotZ) * cellScale;
+
+        const float hipRight = 0.0022f;
+        const float hipUp = -0.0018f;
+        const float hipFwd = 0.0048f;
+
+        // In ADS: center sight post exactly onto camera crosshair
+        const float adsRight = sightRelZ;  // Exactly cancels -axR * (sightZ - pivotZ) * cellScale
+        const float adsUp = -sightRelY;     // Exactly cancels +axU * (sightY - pivotY) * cellScale
+        const float adsFwd = 0.0028f;       // Clean eye relief down the sight line
+
+        const float ads = g_viewmodelAnim.adsAlpha;
+        const float restRight = hipRight + (adsRight - hipRight) * ads;
+        const float restUp = hipUp + (adsUp - hipUp) * ads;
+        const float restFwd = hipFwd + (adsFwd - hipFwd) * ads;
+
+        const float t = g_viewmodelAnim.idleTimer;
+        const float swayDamp = (1.0f - ads * 0.92f);
+        const float swayX = std::sin(t * 1.6f) * 0.00010f * swayDamp;
+        const float swayY = std::cos(t * 3.2f) * 0.00007f * swayDamp;
+        const float swayRoll = std::sin(t * 1.6f) * 0.015f * swayDamp;
+
+        const float bt = g_viewmodelAnim.bobTimer;
+        const float bobDamp = (1.0f - ads * 0.95f);
+        const float bobX = std::sin(bt * 0.5f) * 0.00007f * bobDamp;
+        const float bobY = std::abs(std::sin(bt)) * 0.00008f * bobDamp;
+        const float bobRoll = std::cos(bt * 0.5f) * 0.008f * bobDamp;
+
+        const float eq = g_viewmodelAnim.equipAlpha;
+        const float equipDrop = (1.0f - eq) * 0.0040f;
+        const float equipPitch = (1.0f - eq) * 0.35f;
+
+        const float relDrop = g_viewmodelAnim.reloadDrop;
+        const float relPitch = g_viewmodelAnim.reloadPitch;
+        const float relRoll = g_viewmodelAnim.reloadRoll;
+
+        const float recZ = g_viewmodelAnim.recoilZ;
+        const float recY = g_viewmodelAnim.recoilY;
+        const float recPitch = g_viewmodelAnim.recoilPitch;
+        const float recYaw = g_viewmodelAnim.recoilYaw;
+        const float recRoll = g_viewmodelAnim.recoilRoll;
+
+        const float totalRight = restRight + swayX + bobX + recYaw * 0.002f;
+        const float totalUp = restUp + swayY - bobY - equipDrop - relDrop - recY;
+        const float totalFwd = restFwd - recZ;
+
+        const Vec3 weaponOrigin = camPos + right * totalRight + up * totalUp + fwd * totalFwd;
+
+        const float pitch = (recPitch + equipPitch + relPitch) * (1.0f - ads * 0.40f);
+        const float yaw = recYaw * (1.0f - ads * 0.85f);
+        const float roll = (swayRoll + bobRoll + recRoll + relRoll) * (1.0f - ads * 0.90f);
+
+        Vec3 axF = fwd;
+        Vec3 axU = up;
+        Vec3 axR = right;
+
+        if (std::abs(pitch) > 1e-5f) {
+            const float cp = std::cos(pitch);
+            const float sp = std::sin(pitch);
+            const Vec3 newF = axF * cp + axU * sp;
+            const Vec3 newU = axU * cp - axF * sp;
+            axF = newF.normalized();
+            axU = newU.normalized();
+        }
+        if (std::abs(yaw) > 1e-5f) {
+            const float cy = std::cos(yaw);
+            const float sy = std::sin(yaw);
+            const Vec3 newF = axF * cy + axR * sy;
+            const Vec3 newR = axR * cy - axF * sy;
+            axF = newF.normalized();
+            axR = newR.normalized();
+        }
+        if (std::abs(roll) > 1e-5f) {
+            const float cr = std::cos(roll);
+            const float sr = std::sin(roll);
+            const Vec3 newR = axR * cr + axU * sr;
+            const Vec3 newU = axU * cr - axR * sr;
+            axR = newR.normalized();
+            axU = newU.normalized();
+        }
+
+        const Vec3 base = weaponOrigin - axF * (static_cast<float>(model->pivotX) * cellScale)
+                                       - axU * (static_cast<float>(model->pivotY) * cellScale)
+                                       + axR * (static_cast<float>(model->pivotZ) * cellScale);
+
+        const Vec3 negR = axR * -1.0f;
+        for (const auto& v : model->voxels) {
+            float vx = static_cast<float>(v.x);
+            float vy = static_cast<float>(v.y);
+            float vz = static_cast<float>(v.z);
+            if (v.part == "bolt_chamber" || v.part == "action") {
+                vx += boltOffset / cellScale;
+            } else if (v.part == "magazine") {
+                vy += magOffsetY / cellScale;
+            }
+            emitUnitCube(verts, wi, kWeaponMaxVerts, base, axF, axU, negR,
+                         vx, vy, vz,
+                         cellScale, v.cr, v.cg, v.cb, static_cast<float>(kPickupMatId));
+        }
+    }
+
+    g_weaponVertexCount = wi;
 }
 
 
@@ -6507,6 +8758,10 @@ static void drawFrame(float timeSec) {
     {
         ScopedSection s(SEC_PICKUP);
         updatePickupMesh();
+        const float dt = static_cast<float>(TICK_DT);
+        g_viewmodelAnim.update(dt, g_move, g_player, g_ads);
+        g_animController.update(dt);
+        updateWeaponMesh();
     }
     // Resolve g_invHover first (it needs this frame's camera basis), then act on
     // it, so a click always lands on the cell that was under the cursor.
@@ -6574,6 +8829,7 @@ static const CaptureShot kCaptureShots[] = {
     {"pause_menu",      96.0f, 19.5f, 132.0f, 0.00f, -0.08f, kShotMenu},
     {"preset_retro",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Retro"},
     {"preset_clean",    20.0f, 30.0f, 20.0f, 2.35f, -0.35f, kShotPlain, "Clean"},
+    {"char_pose",       99.5f, 4.2f, 137.5f, -0.405f, -0.10f, kShotPlain},
 };
 
 // Shots for a generated-terrain world. The list above is fixed to the
@@ -6602,6 +8858,8 @@ static std::vector<CaptureShot> terrainCaptureShots() {
     // One terrain preset pass, so the post chain is exercised on generated
     // materials as well as on the warehouse's.
     shots.push_back({"terrain_preset", sx, eye, sz, 0.0f, -0.10f, kShotPlain, "Retro"});
+    // Posed character model shot on generated terrain
+    shots.push_back({"terrain_char", sx + 3.5f, eye, sz + 5.5f, -0.405f, -0.10f, kShotPlain});
     return shots;
 }
 
@@ -6659,7 +8917,7 @@ static int runCaptureShots(float timeSec) {
 
 // --export-map <path>: write the loaded world, with its spawn and pickups, as a
 // run-length map document. This is how the procedural warehouse became
-// data/maps/warehouse_v1.map.vox.json; the fingerprints proved the round trip.
+// data/maps/warehouse_v2.map.vox.json; the fingerprints proved the round trip.
 static bool exportMapDocument(const sim::World& world, const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
@@ -6731,6 +8989,7 @@ static void cleanup() {
     destroySwapchainObjects();
     if (g_pipeline) vkDestroyPipeline(g_device, g_pipeline, nullptr);
     if (g_overlayPipeline) vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
+    if (g_charPipeline) vkDestroyPipeline(g_device, g_charPipeline, nullptr);
     if (g_pipelineLayout) vkDestroyPipelineLayout(g_device, g_pipelineLayout, nullptr);
     g_post.destroy(); // owns the world render pass (g_renderPass)
     g_renderPass = VK_NULL_HANDLE;
@@ -6746,6 +9005,14 @@ static void cleanup() {
         if (g_occStageMem[i]) vkFreeMemory(g_device, g_occStageMem[i], nullptr);
         if (g_lightBuf[i]) vkDestroyBuffer(g_device, g_lightBuf[i], nullptr);
         if (g_lightMem[i]) vkFreeMemory(g_device, g_lightMem[i], nullptr);
+        if (g_boneBuf[i]) {
+            if (g_boneMapped[i]) vkUnmapMemory(g_device, g_boneMem[i]);
+            vkDestroyBuffer(g_device, g_boneBuf[i], nullptr);
+            vkFreeMemory(g_device, g_boneMem[i], nullptr);
+            g_boneBuf[i] = VK_NULL_HANDLE;
+            g_boneMem[i] = VK_NULL_HANDLE;
+            g_boneMapped[i] = nullptr;
+        }
     }
     if (g_texView) vkDestroyImageView(g_device, g_texView, nullptr);
     if (g_texImage) vkDestroyImage(g_device, g_texImage, nullptr);
@@ -6795,6 +9062,14 @@ if (g_skyTileVB) {
         g_pickupMem = VK_NULL_HANDLE;
         g_pickupMapped = nullptr;
     }
+    if (g_weaponVB) {
+        vkDestroyBuffer(g_device, g_weaponVB, nullptr);
+        vkUnmapMemory(g_device, g_weaponMem);
+        vkFreeMemory(g_device, g_weaponMem, nullptr);
+        g_weaponVB = VK_NULL_HANDLE;
+        g_weaponMem = VK_NULL_HANDLE;
+        g_weaponMapped = nullptr;
+    }
     if (g_inventoryVB) {
         if (g_inventoryMapped) { vkUnmapMemory(g_device, g_inventoryMem); g_inventoryMapped = nullptr; }
         vkDestroyBuffer(g_device, g_inventoryVB, nullptr);
@@ -6805,17 +9080,41 @@ if (g_skyTileVB) {
         g_inventoryMem = VK_NULL_HANDLE;
     }
     g_inventoryVertexCount = 0;
+    if (g_charVB) {
+        if (g_charMapped) { vkUnmapMemory(g_device, g_charMem); g_charMapped = nullptr; }
+        vkDestroyBuffer(g_device, g_charVB, nullptr);
+        vkFreeMemory(g_device, g_charMem, nullptr);
+        g_charVB = VK_NULL_HANDLE;
+        g_charMem = VK_NULL_HANDLE;
+    }
+    g_charVertexCount = 0;
+    if (g_charIB) {
+        if (g_charIBMapped) { vkUnmapMemory(g_device, g_charIBMem); g_charIBMapped = nullptr; }
+        vkDestroyBuffer(g_device, g_charIB, nullptr);
+        vkFreeMemory(g_device, g_charIBMem, nullptr);
+        g_charIB = VK_NULL_HANDLE;
+        g_charIBMem = VK_NULL_HANDLE;
+    }
+    g_charIndexCount = 0;
     destroyWorldMeshBuffer();
     if (g_cmdPool) vkDestroyCommandPool(g_device, g_cmdPool, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
     if (g_debugMessenger != VK_NULL_HANDLE && g_destroyDUM)
         g_destroyDUM(g_instance, g_debugMessenger, nullptr);
     g_debugMessenger = VK_NULL_HANDLE;
+    g_webHost.shutdown();
     if (g_surface) vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
     if (g_instance) vkDestroyInstance(g_instance, nullptr);
-    if (g_hwnd) DestroyWindow(g_hwnd);
+    if (g_hWebPanelWnd) DestroyWindow(g_hWebPanelWnd);
+    if (g_hViewportWnd) DestroyWindow(g_hViewportWnd);
+    if (g_hMainWindow) DestroyWindow(g_hMainWindow);
+    g_hWebPanelWnd = nullptr;
+    g_hViewportWnd = nullptr;
+    g_hMainWindow = nullptr;
+    g_hwnd = nullptr;
     g_pipeline = VK_NULL_HANDLE;
     g_overlayPipeline = VK_NULL_HANDLE;
+    g_charPipeline = VK_NULL_HANDLE;
     g_pipelineLayout = VK_NULL_HANDLE;
     g_renderPass = VK_NULL_HANDLE;
     g_overlayRenderPass = VK_NULL_HANDLE;
@@ -6827,7 +9126,6 @@ if (g_skyTileVB) {
     g_device = VK_NULL_HANDLE;
     g_surface = VK_NULL_HANDLE;
     g_instance = VK_NULL_HANDLE;
-    g_hwnd = nullptr;
     g_cmdBuffers.clear();
 }
 
@@ -6906,29 +9204,31 @@ static SimInput buildSimInput() {
 
     // Held movement keys -> analog wish axes.
     float fwd = 0.0f, right = 0.0f;
-    if (g_keys['W'] || g_keys[VK_UP]) fwd += 1.0f;
-    if (g_keys['S'] || g_keys[VK_DOWN]) fwd -= 1.0f;
-    if (g_keys['D'] || g_keys[VK_RIGHT]) right += 1.0f;
-    if (g_keys['A'] || g_keys[VK_LEFT]) right -= 1.0f;
+    if (isActionHeld(KeyAction::MoveForward) || g_keys['W'] || g_keys[VK_UP]) fwd += 1.0f;
+    if (isActionHeld(KeyAction::MoveBackward) || g_keys['S'] || g_keys[VK_DOWN]) fwd -= 1.0f;
+    if (isActionHeld(KeyAction::MoveRight) || g_keys['D'] || g_keys[VK_RIGHT]) right += 1.0f;
+    if (isActionHeld(KeyAction::MoveLeft) || g_keys['A'] || g_keys[VK_LEFT]) right -= 1.0f;
     in.moveForward = std::max(-1.0f, std::min(1.0f, fwd));
     in.moveRight = std::max(-1.0f, std::min(1.0f, right));
-    in.sprint = g_keys[VK_SHIFT] != 0;
-    in.crouch = g_keys[VK_CONTROL] != 0;
-    in.ads = in.ads || (g_keys['X'] != 0);
+    in.sprint = isActionHeld(KeyAction::Sprint) || (g_keys[VK_SHIFT] != 0);
+    in.crouch = isActionHeld(KeyAction::Crouch) || (g_keys[VK_CONTROL] != 0);
+    in.ads = in.ads || isActionHeld(KeyAction::AimDownSights) || (g_keys['X'] != 0);
 
     // Dash and stance-cycle are edges: they are detected here, in the view, where
     // the press actually happened, and consumed by the sim on the next tick. The
-    // sim never learns a key is held, only that a press arrived. Q/E stay reserved
-    // for lean and E for interact, so dash is C and the stance cycle is F.
-    if (g_keys['C'] && !g_dashHeldPrev) g_pendingInput.dash = true;
-    g_dashHeldPrev = g_keys['C'] != 0;
-    if (g_keys['F'] && !g_stanceHeldPrev) g_pendingInput.stanceCycle = true;
-    g_stanceHeldPrev = g_keys['F'] != 0;
+    // sim never learns a key is held, only that a press arrived.
+    const bool dashHeld = isActionHeld(KeyAction::Dash) || (g_keys['C'] != 0);
+    if (dashHeld && !g_dashHeldPrev) g_pendingInput.dash = true;
+    g_dashHeldPrev = dashHeld;
+
+    const bool stanceHeld = isActionHeld(KeyAction::StanceCycle) || (g_keys['V'] != 0);
+    if (stanceHeld && !g_stanceHeldPrev) g_pendingInput.stanceCycle = true;
+    g_stanceHeldPrev = stanceHeld;
 
     // Held lean keys -> one axis, so a view cannot send contradictory Q and E.
     float lean = 0.0f;
-    if (g_keys['E']) lean += 1.0f;
-    if (g_keys['Q']) lean -= 1.0f;
+    if (isActionHeld(KeyAction::LeanLeft) || g_keys['Q']) lean += 1.0f;
+    if (isActionHeld(KeyAction::LeanRight) || g_keys['E']) lean -= 1.0f;
     in.leanAxis = lean;
     return in;
 }
@@ -7030,6 +9330,7 @@ static void simulateOnce(float dt, const SimInput& in) {
     }
     if (in.cycleWeapon && !g_weapons.empty()) {
         g_activeWeaponIndex = (g_activeWeaponIndex + 1) % static_cast<int>(g_weapons.size());
+        g_viewmodelAnim.triggerEquip();
     }
     if (in.cycleFireMode && !g_weapons.empty()) {
         WeaponDef& w = g_weapons[std::min(g_activeWeaponIndex,
@@ -7074,6 +9375,8 @@ static void simulateOnce(float dt, const SimInput& in) {
         updateProjectiles(dt);
         if (static_cast<int>(g_projectiles.size()) > g_projLivePeak)
             g_projLivePeak = static_cast<int>(g_projectiles.size());
+        if (!g_projectiles.empty())
+            g_debris.meshDirty = true;
     }
     {
         ScopedSection s(SEC_DEBRIS_SIM);
@@ -7101,6 +9404,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         g_stress = true;
         g_smoke = true; // reuse headless quit path
         g_smokeTicks = 600; // longer soak
+    }
+    if (cmd.find("--editor") != std::string::npos || cmd.find("--mode editor") != std::string::npos) {
+        g_editorMode = true;
     }
     // --mesh-helpers N overrides the mesh pool size (0 = serial), so the pooled
     // and serial mesher can be timed back to back on the same machine state.
@@ -7166,10 +9472,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         // Smoke/stress always run on defaults so their captures and timings
         // do not depend on whatever a player last chose.
         vis::registerEngineParams(g_visReg, g_vis);
+        initDefaultKeybindings();
         if (!g_smoke) {
             bool readable = false;
             const std::string saved = jsonReadText(g_exeDir + "\\visual_settings.json", &readable);
             if (readable) g_visReg.fromJson(saved);
+            loadKeybindings();
         }
         createWindow();
         createInstance();
@@ -7195,7 +9503,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         createSync();
         initUi();
 
-        // The world comes from data/maps/warehouse_v1.map.vox.json (exported
+        // The world comes from data/maps/warehouse_v2.map.vox.json (exported
         // from the old procedural builder, with fingerprint parity, then the
         // builder was deleted). --export-map re-saves whatever world loaded.
         sim::World world;
@@ -7209,9 +9517,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             std::vector<std::string> candidates;
             if (g_mapOverridePath.empty()) {
                 candidates = {
-                    g_exeDir + "\\maps\\warehouse_v1.map.vox.json",
-                    g_exeDir + "\\..\\data\\maps\\warehouse_v1.map.vox.json",
-                    g_exeDir + "\\..\\..\\data\\maps\\warehouse_v1.map.vox.json",
+                    g_exeDir + "\\maps\\warehouse_v2.map.vox.json",
+                    g_exeDir + "\\..\\data\\maps\\warehouse_v2.map.vox.json",
+                    g_exeDir + "\\..\\..\\data\\maps\\warehouse_v2.map.vox.json",
                 };
             } else {
                 candidates = {g_mapOverridePath};
@@ -7229,10 +9537,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                     mapvox::stampMapVox(mapDoc, world, 0, 0, 0);
                     // Prefab instances: data/prefabs/<id>.vox.json, stamped in
                     // list order (a later prefab overwrites an earlier one).
+                    g_mapPrefabInstances.clear();
                     for (const auto& pf : mapDoc.prefabs) {
                         if (!stampPrefabById(pf.id, world, pf.x, pf.y, pf.z, pf.rot))
                             fail("map " + path + ": prefab \"" + pf.id + "\" not found or invalid");
                         ++g_mapPrefabsStamped;
+                        g_mapPrefabInstances.push_back(pf);
                     }
                     // Terrain, after the authored map and its prefabs: the
                     // generator fills only Air, so it lands around structure
@@ -7268,12 +9578,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             }
             if (!loaded) {
                 if (g_mapOverridePath.empty())
-                    fail("map not found: data\\maps\\warehouse_v1.map.vox.json");
+                    fail("map not found: data\\maps\\warehouse_v2.map.vox.json");
                 fail("map not loaded: " + g_mapOverridePath);
             }
         }
         g_world = &world;
         spawnPlayerOnMap(world);
+        g_structuralMatrix.initDefaultZones(world);
+        g_multiPlanetSystem.initStandardEarthMoonImpactorSystem();
 
         // The view's chunk list. It starts empty of world knowledge: every
         // cell in it arrives via sendChunkSnapshot() below.
@@ -7316,6 +9628,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         seedPickups();
         ensurePickupBuffer();
         buildFixtureMesh();
+        initCharacterMesh();
 
         if (!exportMapPath.empty()) {
             const bool ok = exportMapDocument(world, exportMapPath);
@@ -7410,6 +9723,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
                 g_tickAccum -= TICK_DT;
                 ++g_tick;
                 g_camPosPrevTick = g_camPos;
+                g_playerPosPrevTick = Vec3(g_player.px, g_player.py, g_player.pz);
                 ++g_ticksSinceRemesh;
                 // One tick of intent, produced by whichever client is driving:
                 // the local window, the scripted smoke harness, or (later) a
@@ -7440,6 +9754,125 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             drawFrame(static_cast<float>(g_tick) * static_cast<float>(TICK_DT));
             ++frames;
 
+            if (g_editorMode && g_webHost.isInitialized()) {
+                g_webHost.drainActions([](const std::string& actionJson) {
+                    handleEditorAction(actionJson);
+                });
+
+                static double lastSnapTime = 0.0;
+                double nowTime = static_cast<double>(g_tick) * TICK_DT;
+                if (nowTime - lastSnapTime >= 0.1) {
+                    lastSnapTime = nowTime;
+
+                    if (checkMapFileModified()) {
+                        std::fprintf(stderr, "[map-watcher] Map file changed on disk: %s -> reloading world\n", g_mapPath.c_str());
+                        reloadMapFile(g_mapPath);
+                    }
+
+                    PickResult pick = raycastVoxel(g_camPos, cameraForward(), 40.0f);
+
+                    std::string normMapPath = g_mapPath;
+                    for (char& c : normMapPath) { if (c == '\\') c = '/'; }
+
+                    std::string snap = "{\"type\":\"VIEW_SNAPSHOT\",\"data\":{";
+                    snap += "\"tick\":" + std::to_string(g_tick) + ",";
+                    snap += "\"paused\":" + std::string(g_paused ? "true" : "false") + ",";
+                    snap += "\"health\":" + std::to_string(g_health.health) + ",";
+                    snap += "\"cam\":{\"x\":" + std::to_string(g_camPos.x) + ",\"y\":" + std::to_string(g_camPos.y) + ",\"z\":" + std::to_string(g_camPos.z) + ",";
+                    snap += "\"yaw\":" + std::to_string(g_yaw) + ",\"pitch\":" + std::to_string(g_pitch) + "},";
+                    snap += "\"player\":{\"x\":" + std::to_string(g_player.px) + ",\"y\":" + std::to_string(g_player.py) + ",\"z\":" + std::to_string(g_player.pz) + "},";
+                    snap += "\"thirdPerson\":" + std::string(g_thirdPerson ? "true" : "false") + ",";
+                    snap += "\"legYaw\":" + std::to_string(g_legYaw) + ",";
+                    snap += "\"deltaYaw\":" + std::to_string(angleDiff(g_yaw, g_legYaw)) + ",";
+                    snap += "\"stance\":" + std::to_string(static_cast<int>(g_move.stance)) + ",";
+                    snap += "\"gait\":" + std::to_string(static_cast<int>(g_move.gait)) + ",";
+                    snap += "\"sliding\":" + std::string(g_move.sliding ? "true" : "false") + ",";
+                    snap += "\"dashing\":" + std::string(g_move.dashing ? "true" : "false") + ",";
+                    snap += "\"wallRunning\":" + std::string(g_move.wallRunning ? "true" : "false") + ",";
+                    snap += "\"stamina\":" + std::to_string(g_move.stamina) + ",";
+                    snap += "\"timeOfDay\":" + std::to_string(g_timeOfDay) + ",";
+                    snap += "\"vertices\":" + std::to_string(g_liveVertexCount) + ",";
+                    snap += "\"caliber\":" + std::to_string(g_activeCaliberIndex) + ",";
+                    snap += "\"map\":{\"path\":\"" + normMapPath + "\",\"prefabs\":" + std::to_string(g_mapPrefabsStamped) + "},";
+                    if (pick.hit) {
+                        snap += "\"pick\":{\"hit\":true,\"x\":" + std::to_string(pick.x) + ",\"y\":" + std::to_string(pick.y) + ",\"z\":" + std::to_string(pick.z) + ",";
+                        snap += "\"nx\":" + std::to_string(pick.nx) + ",\"ny\":" + std::to_string(pick.ny) + ",\"nz\":" + std::to_string(pick.nz) + ",";
+                        snap += "\"adj\":[" + std::to_string(pick.adjX) + "," + std::to_string(pick.adjY) + "," + std::to_string(pick.adjZ) + "],";
+                        snap += "\"block\":" + std::to_string(static_cast<int>(pick.block)) + ",";
+                        snap += "\"blockName\":\"" + std::string(pick.blockName) + "\",";
+                        snap += "\"paletteIndex\":" + std::to_string(pick.paletteIndex) + ",";
+                        snap += "\"dist\":" + std::to_string(pick.dist) + "},";
+                    } else {
+                        snap += "\"pick\":{\"hit\":false},";
+                    }
+                    snap += "\"structural\":" + g_structuralMatrix.toJson() + ",";
+                    if (!g_weapons.empty() && g_activeWeaponIndex >= 0 && g_activeWeaponIndex < static_cast<int>(g_weapons.size())) {
+                        const auto& w = g_weapons[g_activeWeaponIndex];
+                        snap += "\"activeWeapon\":{\"id\":\"" + w.id + "\",\"caliber\":\"" + w.caliber + "\",\"ammoId\":\"" + w.ammoId + "\",";
+                        snap += "\"damage\":" + std::to_string(w.damage) + ",\"impact\":" + std::to_string(w.impact) + ",";
+                        snap += "\"recoil\":" + std::to_string(w.recoil) + ",\"handling\":" + std::to_string(w.handling) + ",";
+                        snap += "\"weight\":" + std::to_string(w.weight) + ",\"optic\":" + std::to_string(w.optic) + ",";
+                        snap += "\"fireMode\":\"" + w.fireMode + "\",\"hitscan\":" + (w.hitscan ? "true" : "false") + "},";
+                    }
+                    snap += "\"character\":{\"holdingWeapon\":" + std::string(g_forceWeaponHold ? "true" : "false") + ",";
+                    snap += "\"isReloading\":" + std::string(g_viewmodelAnim.isReloading ? "true" : "false") + ",";
+                    snap += "\"adsAlpha\":" + std::to_string(g_viewmodelAnim.adsAlpha) + "},";
+                    {
+                        std::string activeClipId = (g_animController.activeClipIndex >= 0 && g_animController.activeClipIndex < static_cast<int>(g_animController.clips.size()))
+                            ? g_animController.clips[g_animController.activeClipIndex].id : "none";
+                        float clipDur = (g_animController.activeClipIndex >= 0 && g_animController.activeClipIndex < static_cast<int>(g_animController.clips.size()))
+                            ? g_animController.clips[g_animController.activeClipIndex].durationSec : 1.0f;
+                        snap += "\"anim\":{\"activeClip\":\"" + activeClipId + "\",\"clipTime\":" + std::to_string(g_animController.clipTime) + ",";
+                        snap += "\"duration\":" + std::to_string(clipDur) + ",\"isPlaying\":" + (g_animController.isPlaying ? "true" : "false") + ",";
+                        snap += "\"weight\":" + std::to_string(g_animAuthoredWeight) + "},";
+                    }
+                    snap += "\"planetary\":" + g_multiPlanetSystem.toJson() + ",";
+                    std::string vpJson = g_visReg.toJson();
+                    while (!vpJson.empty() && (vpJson.back() == '\n' || vpJson.back() == '\r' || vpJson.back() == ' ')) {
+                        vpJson.pop_back();
+                    }
+                    snap += "\"visualParams\":" + vpJson + ",";
+                    snap += "\"undoDepth\":" + std::to_string(g_editorUndo.size()) + ",";
+                    snap += "\"redoDepth\":" + std::to_string(g_editorRedo.size()) + ",";
+                    {
+                        // Editor scene hierarchy + prefab catalogue. Read-only
+                        // view data: the sim owns the world, this is a summary
+                        // the UI draws (RFC E.4 "Scene Hierarchy block").
+                        const std::vector<std::string> prefabIds = scanPrefabIds();
+                        snap += "\"prefabs\":[";
+                        for (size_t i = 0; i < prefabIds.size(); ++i) {
+                            if (i) snap += ",";
+                            snap += "\"" + prefabIds[i] + "\"";
+                        }
+                        snap += "],";
+                        snap += "\"scene\":{";
+                        snap += "\"player\":{\"x\":" + std::to_string(g_player.px) +
+                                ",\"y\":" + std::to_string(g_player.py) +
+                                ",\"z\":" + std::to_string(g_player.pz) + "},";
+                        snap += "\"lights\":[";
+                        for (size_t i = 0; i < g_mapLights.size(); ++i) {
+                            const mapvox::LightPlacement& l = g_mapLights[i];
+                            if (i) snap += ",";
+                            snap += "{\"id\":\"light" + std::to_string(i) + "\",\"x\":" + std::to_string(l.x) +
+                                    ",\"y\":" + std::to_string(l.y) + ",\"z\":" + std::to_string(l.z) +
+                                    ",\"intensity\":" + std::to_string(l.intensity) + "}";
+                        }
+                        snap += "],";
+                        snap += "\"prefabs\":[";
+                        for (size_t i = 0; i < g_mapPrefabInstances.size(); ++i) {
+                            const mapvox::PrefabPlacement& pf = g_mapPrefabInstances[i];
+                            if (i) snap += ",";
+                            snap += "{\"id\":\"" + pf.id + "\",\"x\":" + std::to_string(pf.x) +
+                                    ",\"y\":" + std::to_string(pf.y) + ",\"z\":" + std::to_string(pf.z) +
+                                    ",\"rot\":" + std::to_string(pf.rot) + "}";
+                        }
+                        snap += "]}";
+                    }
+                    snap += "}}";
+                    g_webHost.postMessageJson(snap);
+                }
+            }
+
             if (g_smoke && g_tick >= g_smokeTicks) {
                 g_running = false;
             }
@@ -7463,6 +9896,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const bool jsonxOk = jsonxSelfTest();
             const ballistics::SelfTestReport ballisticsRep = ballistics::selfTest();
             const bool visualParamsOk = vis::selfTest();
+            const char_mesh::SelfTestReport charMeshRep = char_mesh::selfTest();
+            const bool sublatticeOk = sublatticeImpactSelfTest();
+            const bool structuralOk = g_structuralMatrix.selfTest(world);
+            const bool animClipsOk = anim::selfTest();
+            const bool planetaryOk = planetary::selfTest();
+            const bool lootTablesOk = loot::selfTest();
+            const bool engineLayersOk = layers::selfTest();
             // Render-eye interpolation: ends exact, midpoint halfway, teleport snaps.
             bool eyeInterpOk = false;
             {
@@ -7515,6 +9955,10 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\ndebris_alive=" << g_debris.activeCount()
                 << "\ndebris_ricochets=" << g_debris.ricochets
                 << "\ndebris_subdiv=" << kDebrisSubDiv
+                << "\nsublattice_impact_ok=" << (sublatticeOk ? 1 : 0)
+                << "\nsublattice_direct_impacts=" << g_debris.sublatticeImpactsDirect
+                << "\nsublattice_oblique_impacts=" << g_debris.sublatticeImpactsOblique
+                << "\nsublattice_units_impacted=" << g_debris.sublatticeUnitsImpacted
                 << "\ndebris_verts_peak=" << g_debrisVertsPeak
                 << "\ndebris_upload_us_avg=" << (g_debrisUploadSamples > 0 ? (g_debrisUploadUsSum / g_debrisUploadSamples) : 0.0)
                 << "\ndebris_upload_us_max=" << g_debrisUploadUsMax
@@ -7807,6 +10251,17 @@ out << "ticks=" << g_tick << "\nframes=" << frames
                 << "\nterrain_prefab_spares_authored_ok="
                 << (g_terrainSmoke.prefabSparesAuthoredOk ? 1 : 0)
                 << "\nterrain_ok=" << (g_terrainSmoke.ok() ? 1 : 0)
+                << "\nchar_mesh_cells=" << charMeshRep.solidCells
+                << "\nchar_mesh_verts=" << charMeshRep.vertexCount
+                << "\nchar_mesh_indices=" << charMeshRep.indexCount
+                << "\nchar_mesh_culled_faces=" << charMeshRep.culledFaces
+                << "\nchar_mesh_golden=" << std::hex << charMeshRep.goldenHash << std::dec
+                << "\nchar_mesh_ok=" << (charMeshRep.ok() ? 1 : 0)
+                << "\nstructural_integrity_ok=" << (structuralOk ? 1 : 0)
+                << "\nanim_clips_ok=" << (animClipsOk ? 1 : 0)
+                << "\nplanetary_ok=" << (planetaryOk ? 1 : 0)
+                << "\nloot_tables_ok=" << (lootTablesOk ? 1 : 0)
+                << "\nengine_layers_ok=" << (engineLayersOk ? 1 : 0)
                 << "\nmap_ok="
                 << ((g_mapSmoke.fileFound && g_mapSmoke.docOk &&
                      g_mapSmoke.formatOk && g_mapSmoke.modeOk && g_mapSmoke.unitOk &&
@@ -7900,6 +10355,32 @@ out << "ticks=" << g_tick << "\nframes=" << frames
             // keeps this triageable on its own, and it is checked on scratch
             // worlds, so it cannot make the map fingerprints move.
             if (!g_terrainSmoke.ok()) { cleanup(); return 10; }
+            // Character model and skinned mesh extraction contract:
+            // 16 mm sub-lattice, face culling, weight normalization, region partitioning,
+            // and golden hash match. Exit 11 keeps CI triage separate.
+            if (!charMeshRep.ok()) { cleanup(); return 11; }
+            // Sublattice impacts contract: 1-2 impacted units based on impact angle (<=45 deg direct vs >45 deg oblique).
+            // Exit 12 keeps CI triage separate.
+            if (!sublatticeOk) { cleanup(); return 12; }
+            // Structural integrity matrix contract: Warehouse baseline sound, sensitivity to demolition, restoration.
+            // Exit 13 keeps CI triage separate.
+            if (!structuralOk) { cleanup(); return 13; }
+            // Authored animation clips contract: Quat normalization, slerp, JSON loader, controller tracks, blending.
+            // Exit 14 keeps CI triage separate.
+            if (!animClipsOk) { cleanup(); return 14; }
+            // Planetary destruction & multi-scale Z-tile engine contract:
+            // Cubed-sphere round-trip, Hilbert curve, octave voxel scaling, data stripping, Q_D* physics.
+            // Exit 15 keeps CI triage separate.
+            if (!planetaryOk) { cleanup(); return 15; }
+            // Cascading loot drop and container filtering system contract:
+            // Top-down tier cascade, container profile filtering, catalog completeness, and deterministic seeding.
+            // Exit 16 keeps CI triage separate.
+            if (!lootTablesOk) { cleanup(); return 16; }
+            // In-engine layering coordinator contract: view-mode cycling, warehouse
+            // container placement + crosshair raycast + cascading loot, cross-layer
+            // planetary->structural seismic coupling, and celestial sky projections.
+            // Exit 17 keeps CI triage separate.
+            if (!engineLayersOk) { cleanup(); return 17; }
         }
     } catch (const std::exception& e) {
         // Every automated run here is headless -- smoke, stress, capture, export --

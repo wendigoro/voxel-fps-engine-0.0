@@ -5,8 +5,16 @@
   "voxel_size": 0.001,
   "class": "weapon_small",
   "material": "sheet_metal",
-  "color": [0.40, 0.42, 0.46],
-  "size": [2, 2, 3],
+  "color": [
+    0.4,
+    0.42,
+    0.46
+  ],
+  "size": [
+    2,
+    2,
+    3
+  ],
   "weapon_id": "sidearm_light",
   "caliber": "light",
   "ammo_id": "light_fmj",

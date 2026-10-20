@@ -1,0 +1,25 @@
+{
+  "id": "sniper_heavy",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "heavy",
+  "hitscan": 0,
+  "fire_mode": "bolt",
+  "ammo_id": "heavy_fmj",
+  "stats": {
+    "damage": 65.0,
+    "impact": 80.0,
+    "recoil": 45.0,
+    "handling": 5.0,
+    "weight": 28.0,
+    "optic": 16.0
+  },
+  "parts": {
+    "barrel": 102,
+    "action": 114,
+    "bolt_chamber": 3,
+    "trigger": 1,
+    "grip_stock": 115,
+    "sight": 40
+  }
+}

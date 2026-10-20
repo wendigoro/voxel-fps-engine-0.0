@@ -1,0 +1,569 @@
+{
+  "schema": "imagoro.image/v1",
+  "imageId": "imagoro.command-center",
+  "imageVersion": "0.1.0",
+  "builtAt": "2026-10-13T19:55:59.308Z",
+  "renderer": "react",
+  "shell": {
+    "entry": "src/sections.ts",
+    "sections": [
+      {
+        "id": "map",
+        "label": "Map Editor",
+        "blurb": "Live voxel raycasting, painting, carve/demolition tools, palette management, and Java Painter sync.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "engine.map.inspector",
+            "span": "pair"
+          },
+          {
+            "block": "engine.map.tools",
+            "span": "pair"
+          },
+          {
+            "block": "engine.map.structural",
+            "span": "full"
+          },
+          {
+            "block": "engine.map.sync",
+            "span": "pair"
+          },
+          {
+            "block": "engine.map.terrain",
+            "span": "pair"
+          }
+        ]
+      },
+      {
+        "id": "scene",
+        "label": "Scene & Prefabs",
+        "blurb": "Editor scene hierarchy, undo/redo history, and prefab stamping with rotation.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "engine.map.scene",
+            "span": "pair"
+          },
+          {
+            "block": "engine.map.prefabs",
+            "span": "pair"
+          }
+        ]
+      },
+      {
+        "id": "model",
+        "label": "Model & Character",
+        "blurb": "Humanoid skeletal rig, limb kinematics, procedural locomotion, and camera perspective.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "engine.model.camera",
+            "span": "pair"
+          },
+          {
+            "block": "engine.model.locomotion",
+            "span": "pair"
+          },
+          {
+            "block": "engine.model.character",
+            "span": "pair"
+          },
+          {
+            "block": "engine.model.weapons",
+            "span": "pair"
+          }
+        ]
+      },
+      {
+        "id": "visuals",
+        "label": "Visuals & Shaders",
+        "blurb": "Vulkan post-processing chain, retro CRT emulation, render scale, lighting, and occupancy shadows.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "engine.visuals.params",
+            "span": "pair"
+          },
+          {
+            "block": "engine.visuals.presets",
+            "span": "pair"
+          },
+          {
+            "block": "engine.visuals.lighting",
+            "span": "full"
+          }
+        ]
+      },
+      {
+        "id": "telemetry",
+        "label": "Telemetry & Logs",
+        "blurb": "Simulation timing, vertex counts, GPU memory allocations, and IPC bridge activity log.",
+        "span": "full",
+        "align": "start",
+        "slots": [
+          {
+            "block": "engine.status.telemetry",
+            "span": "full"
+          },
+          {
+            "block": "engine.console.log",
+            "span": "full"
+          }
+        ]
+      }
+    ]
+  },
+  "blocks": [
+    {
+      "id": "imagoro.map",
+      "name": "Integrated Map",
+      "version": "0.1.0",
+      "family": "map",
+      "substrate": "react",
+      "module": "@imagoro/block-map",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          240
+        ],
+        "ideal": [
+          520,
+          320
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.route",
+      "name": "Route Planner",
+      "version": "0.1.0",
+      "family": "route",
+      "substrate": "react",
+      "module": "@imagoro/block-route",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          240
+        ],
+        "ideal": [
+          520,
+          360
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "gps",
+            "type": "coordinate"
+          }
+        ],
+        "out": [
+          {
+            "name": "route",
+            "type": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.metrics",
+      "name": "Run Metrics",
+      "version": "0.1.0",
+      "family": "metrics",
+      "substrate": "react",
+      "module": "@imagoro/block-metrics",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          120
+        ],
+        "ideal": [
+          480,
+          160
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.audit",
+      "name": "Notification Workflow Audit",
+      "version": "0.1.0",
+      "family": "audit",
+      "substrate": "react",
+      "module": "@imagoro/block-audit",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          180
+        ],
+        "ideal": [
+          520,
+          240
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.weather",
+      "name": "Weather (Current Route)",
+      "version": "0.1.0",
+      "family": "weather",
+      "substrate": "react",
+      "module": "@imagoro/block-weather",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          120
+        ],
+        "ideal": [
+          360,
+          180
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.visualizer",
+      "name": "Audio Visualizer",
+      "version": "0.1.0",
+      "family": "audio/visualizer",
+      "substrate": "react",
+      "module": "@imagoro/block-visualizer",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          120
+        ],
+        "ideal": [
+          560,
+          160
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "rms",
+            "type": "number[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.chat",
+      "name": "Chat",
+      "version": "0.1.0",
+      "family": "chat",
+      "substrate": "react",
+      "module": "@imagoro/block-chat",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          240
+        ],
+        "ideal": [
+          520,
+          360
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "messages",
+            "type": "chat/message[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.console",
+      "name": "Console",
+      "version": "0.1.0",
+      "family": "console",
+      "substrate": "react",
+      "module": "@imagoro/block-console",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          140
+        ],
+        "ideal": [
+          560,
+          260
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.terminal",
+      "name": "Terminal",
+      "version": "0.1.0",
+      "family": "terminal",
+      "substrate": "react",
+      "module": "@imagoro/block-terminal",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          160
+        ],
+        "ideal": [
+          560,
+          260
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "events",
+            "type": "event[]"
+          }
+        ],
+        "out": []
+      }
+    },
+    {
+      "id": "imagoro.blackboard",
+      "name": "Blackboard",
+      "version": "0.1.0",
+      "family": "blackboard",
+      "substrate": "react",
+      "module": "@imagoro/block-blackboard",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          160
+        ],
+        "ideal": [
+          480,
+          240
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "snapshot",
+            "type": "blackboard/snapshot"
+          }
+        ],
+        "out": [
+          {
+            "name": "values",
+            "type": "kv"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.pipeline",
+      "name": "Pipeline Monitor",
+      "version": "0.1.0",
+      "family": "pipeline",
+      "substrate": "react",
+      "module": "@imagoro/block-pipeline",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          320,
+          140
+        ],
+        "ideal": [
+          520,
+          200
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "run",
+            "type": "pipeline/run"
+          }
+        ],
+        "out": [
+          {
+            "name": "state",
+            "type": "pipeline/state"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.graph",
+      "name": "Node Canvas",
+      "version": "0.1.0",
+      "family": "graph",
+      "substrate": "react",
+      "module": "@imagoro/block-graph",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          480,
+          320
+        ],
+        "ideal": [
+          720,
+          480
+        ]
+      },
+      "ports": {
+        "in": [],
+        "out": [
+          {
+            "name": "graph",
+            "type": "object"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.intent",
+      "name": "Intent",
+      "version": "0.1.0",
+      "family": "chat",
+      "substrate": "react",
+      "module": "@imagoro/block-intent",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          360,
+          240
+        ],
+        "ideal": [
+          720,
+          300
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "proposal",
+            "type": "intent/proposal"
+          }
+        ],
+        "out": [
+          {
+            "name": "proposal",
+            "type": "intent/proposal"
+          },
+          {
+            "name": "execute",
+            "type": "intent/execute"
+          }
+        ]
+      }
+    },
+    {
+      "id": "imagoro.sidebar",
+      "name": "Sidebar",
+      "version": "0.1.0",
+      "family": "sidebar",
+      "substrate": "react",
+      "module": "@imagoro/block-sidebar",
+      "entry": "index.tsx",
+      "size": {
+        "min": [
+          260,
+          320
+        ],
+        "ideal": [
+          320,
+          640
+        ]
+      },
+      "ports": {
+        "in": [
+          {
+            "name": "activate",
+            "type": "sidebar/activate"
+          }
+        ],
+        "out": [
+          {
+            "name": "activate",
+            "type": "sidebar/activate"
+          }
+        ]
+      }
+    }
+  ],
+  "dist": [
+    {
+      "path": "assets/index-BbSTyCXs.css",
+      "sha256": "67e904ac1a9bf706bb850ae828d7c6c48c378bb59cb3e3829c6e5b05588866c4",
+      "bytes": 8621,
+      "ms": 1
+    },
+    {
+      "path": "assets/index-ZYHuAWmz.js",
+      "sha256": "6173af1bd731ad2a322eb528e3e85bd8b90fd7df1eaabf14f544823fc867ebff",
+      "bytes": 196030,
+      "ms": 43
+    },
+    {
+      "path": "index.html",
+      "sha256": "b5c55ed6e80c82b386355b94c3fab7f5da9ee426cc39842087cd88f1cd62ce78",
+      "bytes": 417,
+      "ms": 0
+    }
+  ],
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "caf092d2cd2459014511776c309cb8b4575d667839c310cc8d3edb6a951b00f3",
+    "files": 3
+  }
+}

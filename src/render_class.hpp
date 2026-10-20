@@ -34,6 +34,7 @@ enum class RenderClass : uint8_t {
     Muzzle = 6,           // muzzle flash cubes; small depth bias
     InventoryLattice = 7, // inventory overlay pass only; skips the fisheye
     WorldPickup = 8,      // world items; shaded exactly like World
+    Character = 9,        // skinned voxel-derived character mesh (view-only)
     Count
 };
 

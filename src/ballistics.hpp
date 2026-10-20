@@ -40,6 +40,9 @@ struct Impact {
     float dx = 0.0f, dy = 0.0f, dz = -1.0f; // travel direction at the hit
     float energy = 10.0f;                   // energy at the struck cell
     float aoeScale = 1.0f;                  // chip spread scale
+    SublatticeImpact sub{};
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
 };
 
 struct State {
@@ -127,7 +130,20 @@ inline void applySplash(State& st, sim::World& world, Hooks& hooks, int cx, int 
                 const float thr = breakEnergyThreshold(mat);
                 st.last.aoeScale = aoe * densMul;
                 st.last.energy = e;
-                if (e >= thr * 0.8f) destroyVoxel(st, world, hooks, x, y, z);
+                if (e >= thr * 0.8f) {
+                    float sdirX = static_cast<float>(dx), sdirY = static_cast<float>(dy), sdirZ = static_cast<float>(dz);
+                    float sdirLen = std::sqrt(sdirX * sdirX + sdirY * sdirY + sdirZ * sdirZ);
+                    if (sdirLen > 1e-6f) { sdirX /= sdirLen; sdirY /= sdirLen; sdirZ /= sdirLen; }
+                    float snx = 0, sny = 0, snz = 0;
+                    faceNormalFromVelocity(sdirX, sdirY, sdirZ, snx, sny, snz);
+                    float shitX = (static_cast<float>(x) + 0.5f + snx * 0.5f) * vs;
+                    float shitY = (static_cast<float>(y) + 0.5f + sny * 0.5f) * vs;
+                    float shitZ = (static_cast<float>(z) + 0.5f + snz * 0.5f) * vs;
+                    st.last.hitX = shitX; st.last.hitY = shitY; st.last.hitZ = shitZ;
+                    st.last.nx = snx; st.last.ny = sny; st.last.nz = snz;
+                    st.last.sub = computeSublatticeImpact(x, y, z, shitX, shitY, shitZ, sdirX, sdirY, sdirZ, snx, sny, snz, vs);
+                    destroyVoxel(st, world, hooks, x, y, z);
+                }
             }
 
     // Splash reaches bodies too. Self damage is ON, so the player's own grenade
@@ -213,6 +229,7 @@ inline int fireHitscan(State& st, sim::World& world, Hooks& hooks, const Project
     float prevWx = eyeX + fx * 0.02f;
     float prevWy = eyeY + fy * 0.02f;
     float prevWz = eyeZ + fz * 0.02f;
+    int lastStepAxis = -1;
 
     for (int step = 0; step < maxSteps; ++step) {
         // Body sweep for this cell, tested in cell space against the same box
@@ -242,6 +259,27 @@ inline int fireHitscan(State& st, sim::World& world, Hooks& hooks, const Project
                 float e = energy * effectMultiplier(def.effect, mat);
                 st.last.dx = dx; st.last.dy = dy; st.last.dz = dz;
                 st.last.energy = e;
+
+                float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+                if (step == 0 || lastStepAxis < 0) {
+                    faceNormalFromVelocity(dx, dy, dz, nx, ny, nz);
+                } else if (lastStepAxis == 0) {
+                    nx = -static_cast<float>(stepX);
+                } else if (lastStepAxis == 1) {
+                    ny = -static_cast<float>(stepY);
+                } else {
+                    nz = -static_cast<float>(stepZ);
+                }
+                const float rayOrgX = ox * vs;
+                const float rayOrgY = oy * vs;
+                const float rayOrgZ = oz * vs;
+                float hitX = rayOrgX + dx * traveled;
+                float hitY = rayOrgY + dy * traveled;
+                float hitZ = rayOrgZ + dz * traveled;
+                st.last.hitX = hitX; st.last.hitY = hitY; st.last.hitZ = hitZ;
+                st.last.nx = nx; st.last.ny = ny; st.last.nz = nz;
+                st.last.sub = computeSublatticeImpact(ix, iy, iz, hitX, hitY, hitZ, dx, dy, dz, nx, ny, nz, vs);
+
                 if (resolveVoxelHit(mat, e, def.penetration)) {
                     destroyVoxel(st, world, hooks, ix, iy, iz);
                     applySplash(st, world, hooks, ix, iy, iz, def.splashRadius, energy, def);
@@ -251,7 +289,9 @@ inline int fireHitscan(State& st, sim::World& world, Hooks& hooks, const Project
                 } else {
                     // Tough surface: spark chips without destroying occupancy.
                     st.last.aoeScale = impactAoeScale(def) * 0.5f;
-                    hooks.ricochet(ix, iy, iz, mat, Impact{dx, dy, dz, e * 0.35f, st.last.aoeScale});
+                    Impact ricImp = st.last;
+                    ricImp.energy = e * 0.35f;
+                    hooks.ricochet(ix, iy, iz, mat, ricImp);
                     energy = e;
                     break;
                 }
@@ -267,20 +307,24 @@ inline int fireHitscan(State& st, sim::World& world, Hooks& hooks, const Project
                 traveled = tMaxX;
                 tMaxX += tDeltaX;
                 ix += stepX;
+                lastStepAxis = 0;
             } else {
                 traveled = tMaxZ;
                 tMaxZ += tDeltaZ;
                 iz += stepZ;
+                lastStepAxis = 2;
             }
         } else {
             if (tMaxY < tMaxZ) {
                 traveled = tMaxY;
                 tMaxY += tDeltaY;
                 iy += stepY;
+                lastStepAxis = 1;
             } else {
                 traveled = tMaxZ;
                 tMaxZ += tDeltaZ;
                 iz += stepZ;
+                lastStepAxis = 2;
             }
         }
         if (traveled > maxDist) break;
@@ -362,6 +406,11 @@ inline void stepProjectiles(State& st, sim::World& world, Hooks& hooks, float dt
             float e = p.energy * effectMultiplier(p.def.effect, mat);
             st.last.dx = p.vx; st.last.dy = p.vy; st.last.dz = p.vz;
             st.last.energy = e;
+            float nx = 0, ny = 0, nz = 0;
+            faceNormalFromVelocity(p.vx, p.vy, p.vz, nx, ny, nz);
+            st.last.hitX = p.px; st.last.hitY = p.py; st.last.hitZ = p.pz;
+            st.last.nx = nx; st.last.ny = ny; st.last.nz = nz;
+            st.last.sub = computeSublatticeImpact(ix, iy, iz, p.px, p.py, p.pz, p.vx, p.vy, p.vz, nx, ny, nz, vs);
             if (resolveVoxelHit(mat, e, p.def.penetration)) {
                 destroyVoxel(st, world, hooks, ix, iy, iz);
                 applySplash(st, world, hooks, ix, iy, iz, p.def.splashRadius, p.energy, p.def);
@@ -369,17 +418,16 @@ inline void stepProjectiles(State& st, sim::World& world, Hooks& hooks, float dt
                 if (p.def.effect == "explosive" || p.energy < 0.05f) p.alive = false;
             } else {
                 // Matrix ricochet — bounce off without destroying occupancy.
-                float nx, ny, nz;
-                faceNormalFromVelocity(p.vx, p.vy, p.vz, nx, ny, nz);
                 const auto& mp = materialProps(mat);
                 ricochetVelocity(p.vx, p.vy, p.vz, nx, ny, nz,
                                  0.20f + (1.0f - mp.fragility) * 0.25f,
                                  0.30f + mp.damping * 0.3f);
                 p.energy = e * (1.0f - mp.damping * 0.5f);
                 st.last.aoeScale = impactAoeScale(p.def) * 0.55f;
+                Impact ricImp = st.last;
+                ricImp.energy = e * 0.4f;
                 // Chips fly along the incoming direction, not the bounce.
-                hooks.ricochet(ix, iy, iz, mat,
-                               Impact{st.last.dx, st.last.dy, st.last.dz, e * 0.4f, st.last.aoeScale});
+                hooks.ricochet(ix, iy, iz, mat, ricImp);
                 // Nudge out of cell to avoid re-hit same voxel
                 p.px += nx * vs * 0.6f;
                 p.py += ny * vs * 0.6f;
@@ -417,11 +465,12 @@ namespace detail {
 struct RecordingHooks final : Hooks {
     int destroyed = 0, ricochets = 0, sweeps = 0, damage = 0;
     int lastX = -1, lastY = -1, lastZ = -1;
+    SublatticeImpact lastSub{};
     ArmorZone sweepAnswer = ArmorZone::Count;
-    void voxelDestroyed(int x, int y, int z, sim::Block, MaterialId, const Impact&) override {
-        ++destroyed; lastX = x; lastY = y; lastZ = z;
+    void voxelDestroyed(int x, int y, int z, sim::Block, MaterialId, const Impact& imp) override {
+        ++destroyed; lastX = x; lastY = y; lastZ = z; lastSub = imp.sub;
     }
-    void ricochet(int, int, int, MaterialId, const Impact&) override { ++ricochets; }
+    void ricochet(int, int, int, MaterialId, const Impact& imp) override { ++ricochets; lastSub = imp.sub; }
     ArmorZone bodySweep(float, float, float, float, float, float, float) override {
         ++sweeps;
         return sweepAnswer;
@@ -461,7 +510,8 @@ inline SelfTestReport selfTest() {
         const int breaks = fireHitscan(st, w, h, def, 1.0f, detail::cellCentre(x), detail::cellCentre(y),
                                        detail::cellCentre(z), 0.0f, 0.0f, 1.0f);
         rep.hitscanBreaksSoft = breaks == 1 && h.destroyed == 1 && h.lastZ == z + 40 &&
-                                w.get(x, y, z + 40) == sim::Block::Air;
+                                w.get(x, y, z + 40) == sim::Block::Air &&
+                                h.lastSub.count == 1 && h.lastSub.units[0].sz == 0;
     }
     // 2. A round without the energy to break a girder chips it and stops.
     {

@@ -1,0 +1,25 @@
+{
+  "id": "railgun_energy",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "energy",
+  "hitscan": 1,
+  "fire_mode": "semi",
+  "ammo_id": "energy_pierce",
+  "stats": {
+    "damage": 48.0,
+    "impact": 35.0,
+    "recoil": 14.0,
+    "handling": 10.0,
+    "weight": 16.0,
+    "optic": 10.0
+  },
+  "parts": {
+    "barrel": 100,
+    "action": 103,
+    "bolt_chamber": 1,
+    "trigger": 1,
+    "grip_stock": 95,
+    "sight": 2
+  }
+}

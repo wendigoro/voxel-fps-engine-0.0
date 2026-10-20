@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // Visual degradation: 8x8x8 sub-voxel debris + matrix trajectory/ricochet.
 // Display/effects only — occupancy remains the cubic unit grid (VOXEL_SIZE).
 
@@ -95,6 +95,128 @@ inline constexpr int kHardMaxSpawnBurst = 120;
 inline constexpr float kDebrisMatId = rc::attr(rc::RenderClass::Debris);
 inline constexpr float kMuzzleMatId = rc::attr(rc::RenderClass::Muzzle);
 
+struct SublatticeUnit {
+    uint8_t sx = 0;
+    uint8_t sy = 0;
+    uint8_t sz = 0;
+};
+
+struct SublatticeImpact {
+    int count = 1;                      // 1 (direct <= 45 deg) or 2 (oblique > 45 deg)
+    SublatticeUnit units[2]{};         // impacted sublattice cells (0..7)
+    float cosTheta = 1.0f;             // cos(angle between ray and normal)
+    float hitX = 0, hitY = 0, hitZ = 0; // continuous world hit point
+    float nx = 0, ny = 0, nz = 0;      // struck face normal
+};
+
+// Returns the 1 or 2 impacted sublattice units (0..7 inside the unit voxel)
+// based on angle of impact:
+// - Direct impact (<= 45 deg incidence, cosTheta >= 0.7071): 1 sublattice unit at entry point.
+// - Oblique impact (> 45 deg incidence, cosTheta < 0.7071): 2 sublattice units along tangential graze.
+inline SublatticeImpact computeSublatticeImpact(int ix, int iy, int iz,
+                                               float hitX, float hitY, float hitZ,
+                                               float dx, float dy, float dz,
+                                               float nx, float ny, float nz,
+                                               float voxelSize) {
+    float dlen = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (dlen > 1e-6f) { dx /= dlen; dy /= dlen; dz /= dlen; }
+    else { dx = 0.0f; dy = 0.0f; dz = -1.0f; }
+
+    float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (nlen > 1e-6f) { nx /= nlen; ny /= nlen; nz /= nlen; }
+    else { nx = 0.0f; ny = 1.0f; nz = 0.0f; }
+
+    float rx = (hitX - static_cast<float>(ix) * voxelSize) / voxelSize;
+    float ry = (hitY - static_cast<float>(iy) * voxelSize) / voxelSize;
+    float rz = (hitZ - static_cast<float>(iz) * voxelSize) / voxelSize;
+
+    rx = std::clamp(rx, 0.0f, 0.9999f);
+    ry = std::clamp(ry, 0.0f, 0.9999f);
+    rz = std::clamp(rz, 0.0f, 0.9999f);
+
+    int sx0 = std::clamp(static_cast<int>(std::floor(rx * static_cast<float>(kDebrisSubDiv))), 0, kDebrisSubDiv - 1);
+    int sy0 = std::clamp(static_cast<int>(std::floor(ry * static_cast<float>(kDebrisSubDiv))), 0, kDebrisSubDiv - 1);
+    int sz0 = std::clamp(static_cast<int>(std::floor(rz * static_cast<float>(kDebrisSubDiv))), 0, kDebrisSubDiv - 1);
+
+    // Snap the entry coordinate along normal axis to the boundary face
+    if (nx > 0.5f) sx0 = kDebrisSubDiv - 1;
+    else if (nx < -0.5f) sx0 = 0;
+    if (ny > 0.5f) sy0 = kDebrisSubDiv - 1;
+    else if (ny < -0.5f) sy0 = 0;
+    if (nz > 0.5f) sz0 = kDebrisSubDiv - 1;
+    else if (nz < -0.5f) sz0 = 0;
+
+    // Angle of incidence with surface normal.
+    // Inbound direction points into the surface (dx*nx + dy*ny + dz*nz <= 0).
+    float dot = dx * nx + dy * ny + dz * nz;
+    float cosTheta = std::clamp(-dot, 0.0f, 1.0f);
+
+    SublatticeImpact imp{};
+    imp.cosTheta = cosTheta;
+    imp.hitX = hitX; imp.hitY = hitY; imp.hitZ = hitZ;
+    imp.nx = nx; imp.ny = ny; imp.nz = nz;
+    imp.units[0] = {static_cast<uint8_t>(sx0), static_cast<uint8_t>(sy0), static_cast<uint8_t>(sz0)};
+
+    // Direct / steep impact: angle <= 45 deg (cosTheta >= 1 / sqrt(2) ~= 0.7071f) -> 1 unit
+    if (cosTheta >= 0.7071f) {
+        imp.count = 1;
+        return imp;
+    }
+
+    // Oblique / glancing impact: angle > 45 deg -> 2 units
+    imp.count = 2;
+
+    // Tangential direction on surface: T = D - (D . N) * N = D + cosTheta * N
+    float tx = dx + cosTheta * nx;
+    float ty = dy + cosTheta * ny;
+    float tz = dz + cosTheta * nz;
+    float tlen = std::sqrt(tx * tx + ty * ty + tz * tz);
+    if (tlen > 1e-6f) { tx /= tlen; ty /= tlen; tz /= tlen; }
+    else {
+        if (std::fabs(nx) < 0.8f) { tx = 1.0f; ty = 0.0f; tz = 0.0f; }
+        else { tx = 0.0f; ty = 1.0f; tz = 0.0f; }
+    }
+
+    int stepSx = 0, stepSy = 0, stepSz = 0;
+    const float atx = std::fabs(tx), aty = std::fabs(ty), atz = std::fabs(tz);
+    if (atx >= aty && atx >= atz) {
+        stepSx = (tx > 0.0f) ? 1 : -1;
+    } else if (aty >= atx && aty >= atz) {
+        stepSy = (ty > 0.0f) ? 1 : -1;
+    } else {
+        stepSz = (tz > 0.0f) ? 1 : -1;
+    }
+
+    int sx1 = sx0 + stepSx;
+    int sy1 = sy0 + stepSy;
+    int sz1 = sz0 + stepSz;
+
+    // If stepping outside 0..7 on face, step inward along -N (sub-cell penetration)
+    if (sx1 < 0 || sx1 >= kDebrisSubDiv ||
+        sy1 < 0 || sy1 >= kDebrisSubDiv ||
+        sz1 < 0 || sz1 >= kDebrisSubDiv) {
+        sx1 = sx0 - static_cast<int>(std::round(nx));
+        sy1 = sy0 - static_cast<int>(std::round(ny));
+        sz1 = sz0 - static_cast<int>(std::round(nz));
+    }
+
+    sx1 = std::clamp(sx1, 0, kDebrisSubDiv - 1);
+    sy1 = std::clamp(sy1, 0, kDebrisSubDiv - 1);
+    sz1 = std::clamp(sz1, 0, kDebrisSubDiv - 1);
+
+    if (sx1 == sx0 && sy1 == sy0 && sz1 == sz0) {
+        if (sx0 > 0) sx1 = sx0 - 1;
+        else if (sx0 < kDebrisSubDiv - 1) sx1 = sx0 + 1;
+        else if (sy0 > 0) sy1 = sy0 - 1;
+        else if (sy0 < kDebrisSubDiv - 1) sy1 = sy0 + 1;
+        else if (sz0 > 0) sz1 = sz0 - 1;
+        else sz1 = sz0 + 1;
+    }
+
+    imp.units[1] = {static_cast<uint8_t>(sx1), static_cast<uint8_t>(sy1), static_cast<uint8_t>(sz1)};
+    return imp;
+}
+
 struct DebrisParticle {
     float px = 0, py = 0, pz = 0;
     float vx = 0, vy = 0, vz = 0;
@@ -104,6 +226,8 @@ struct DebrisParticle {
     float half = kDebrisSubSize * 0.5f * kDebrisVisualScale;
     MaterialId mat = MaterialId::Dirt;
     bool alive = false;
+    bool stationary = false;
+    bool emissive = false;
     int bounces = 0;
     uint8_t sx = 0, sy = 0, sz = 0; // sub-lattice cell (0..7)
 };
@@ -116,6 +240,9 @@ struct DebrisSystem {
     int ricochets = 0;
     int spawnBurstFrame = 0;
     int aliveCached = 0;
+    int sublatticeImpactsDirect = 0;
+    int sublatticeImpactsOblique = 0;
+    int sublatticeUnitsImpacted = 0;
     bool meshDirty = true;
     uint32_t rng = 0xA341316Cu;
 
@@ -125,6 +252,9 @@ struct DebrisSystem {
         spawnedTotal = 0;
         activePeak = 0;
         aliveCached = 0;
+        sublatticeImpactsDirect = 0;
+        sublatticeImpactsOblique = 0;
+        sublatticeUnitsImpacted = 0;
         meshDirty = true;
     }
 
@@ -158,22 +288,61 @@ struct DebrisSystem {
     void beginFrame() { spawnBurstFrame = 0; }
 
     DebrisParticle* allocParticle() {
+        DebrisParticle* p = nullptr;
         if (!freeList.empty()) {
             int idx = freeList.back();
             freeList.pop_back();
-            return &particles[static_cast<size_t>(idx)];
+            p = &particles[static_cast<size_t>(idx)];
+        } else if (static_cast<int>(particles.size()) < kMaxDebris) {
+            particles.emplace_back();
+            p = &particles.back();
+        } else {
+            // Buffer capacity reached: recycle oldest stationary particle (FIFO recycling)
+            for (size_t i = 0; i < particles.size(); ++i) {
+                if (particles[i].alive && particles[i].stationary) {
+                    p = &particles[i];
+                    break;
+                }
+            }
+            if (!p) {
+                // If all particles are dynamic/sparks, recycle the one with shortest remaining life
+                float minLife = 1e9f;
+                for (size_t i = 0; i < particles.size(); ++i) {
+                    if (particles[i].alive && particles[i].life < minLife) {
+                        minLife = particles[i].life;
+                        p = &particles[i];
+                    }
+                }
+            }
         }
-        if (static_cast<int>(particles.size()) >= kMaxDebris) return nullptr;
-        particles.emplace_back();
-        return &particles.back();
+        if (p) {
+            if (!p->alive) ++aliveCached;
+            if (aliveCached > activePeak) activePeak = aliveCached;
+            meshDirty = true;
+        }
+        return p;
     }
 
-    // Spawn visual 8x8x8-cell chips from a destroyed (or chipped) unit voxel.
-    void spawnFromVoxel(int ix, int iy, int iz, MaterialId mat,
-                        float impactDx, float impactDy, float impactDz,
-                        float energy, float voxelSize, float aoeScale = 1.0f) {
+    // Spawn sublattice impact effects: 1 or 2 impacted units depending on angle of impact.
+    // Creates spark flash cubes, stationary crater marks, and localized chip emission.
+    void spawnSublatticeImpact(int ix, int iy, int iz, MaterialId mat,
+                               const SublatticeImpact& sub,
+                               float energy, float voxelSize, float aoeScale = 1.0f) {
         if (mat == MaterialId::Air || mat == MaterialId::Water) return;
         if (spawnBurstFrame >= kHardMaxSpawnBurst) return;
+
+        SublatticeImpact effSub = sub;
+        if (effSub.count <= 0) {
+            float hitX = (static_cast<float>(ix) + 0.5f) * voxelSize;
+            float hitY = (static_cast<float>(iy) + 0.5f) * voxelSize;
+            float hitZ = (static_cast<float>(iz) + 0.5f) * voxelSize;
+            effSub = computeSublatticeImpact(ix, iy, iz, hitX, hitY, hitZ, 0, 0, -1, 0, 0, 1, voxelSize);
+        }
+
+        if (effSub.count == 1) ++sublatticeImpactsDirect;
+        else ++sublatticeImpactsOblique;
+        sublatticeUnitsImpacted += effSub.count;
+
         const auto& props = materialProps(mat);
         const float dens = std::max(0.15f, props.density);
         const float densFactor = 1.0f / std::sqrt(dens);
@@ -184,70 +353,145 @@ struct DebrisSystem {
         budget = std::min(budget, kHardMaxSpawnBurst - spawnBurstFrame);
         if (budget <= 0) return;
 
-        float ilen = std::sqrt(impactDx * impactDx + impactDy * impactDy + impactDz * impactDz);
-        if (ilen < 1e-6f) { impactDx = 0; impactDy = 1; impactDz = 0; ilen = 1; }
-        impactDx /= ilen; impactDy /= ilen; impactDz /= ilen;
-
         float cr, cg, cb;
         materialColor(mat, cr, cg, cb);
         const float massScale = std::max(0.25f, props.density * props.weight * 0.18f);
-        // World-scale speeds: chips must travel multiple unit voxels to read on camera.
         const float baseSpeed =
             (0.055f + energy * 0.0085f * (0.45f + props.fragility)) * densFactor * std::sqrt(aoe);
 
-        for (int n = 0; n < budget; ++n) {
-            DebrisParticle* slot = allocParticle();
-            if (!slot) break;
-            fillParticle(*slot, ix, iy, iz, mat, cr, cg, cb,
-                         impactDx, impactDy, impactDz,
-                         baseSpeed, massScale, props.fragility, voxelSize);
-            ++spawnedTotal;
-            ++spawnBurstFrame;
+        const int unitCount = std::clamp(effSub.count, 1, 2);
+        const float subSize = voxelSize / static_cast<float>(kDebrisSubDiv);
+
+        for (int u = 0; u < unitCount; ++u) {
+            const auto& su = effSub.units[u];
+
+            // 1. Impact Spark Flash (emissive, brief, bounces away from face)
+            if (spawnBurstFrame < kHardMaxSpawnBurst) {
+                DebrisParticle* spark = allocParticle();
+                if (spark) {
+                    spark->sx = su.sx; spark->sy = su.sy; spark->sz = su.sz;
+                    spark->px = (static_cast<float>(ix) + (su.sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nx * (subSize * 0.55f * kDebrisVisualScale);
+                    spark->py = (static_cast<float>(iy) + (su.sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.ny * (subSize * 0.55f * kDebrisVisualScale);
+                    spark->pz = (static_cast<float>(iz) + (su.sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nz * (subSize * 0.55f * kDebrisVisualScale);
+                    spark->vx = effSub.nx * 0.12f + frandSigned() * 0.05f;
+                    spark->vy = effSub.ny * 0.12f + frandSigned() * 0.05f + 0.04f;
+                    spark->vz = effSub.nz * 0.12f + frandSigned() * 0.05f;
+                    spark->life = 0.12f + frand() * 0.06f;
+                    spark->maxLife = spark->life;
+                    spark->cr = 1.0f; spark->cg = 0.92f; spark->cb = 0.65f;
+                    spark->half = subSize * 0.65f * kDebrisVisualScale;
+                    spark->mat = mat;
+                    spark->alive = true;
+                    spark->stationary = false;
+                    spark->emissive = true;
+                    spark->bounces = 0;
+                    ++spawnedTotal;
+                    ++spawnBurstFrame;
+                }
+            }
+
+            // 2. Surface Crater Dent Mark (stationary chipped dent cube at the sublattice unit)
+            // Offset outward along struck normal so it sits proud of the solid face without depth-buffer culling.
+            if (spawnBurstFrame < kHardMaxSpawnBurst) {
+                DebrisParticle* dent = allocParticle();
+                if (dent) {
+                    dent->sx = su.sx; dent->sy = su.sy; dent->sz = su.sz;
+                    const float normalOffset = subSize * 0.52f * kDebrisVisualScale;
+                    dent->px = (static_cast<float>(ix) + (su.sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nx * normalOffset;
+                    dent->py = (static_cast<float>(iy) + (su.sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.ny * normalOffset;
+                    dent->pz = (static_cast<float>(iz) + (su.sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + effSub.nz * normalOffset;
+                    dent->vx = 0.0f; dent->vy = 0.0f; dent->vz = 0.0f;
+                    dent->life = 3600.0f;
+                    dent->maxLife = 3600.0f;
+                    dent->cr = cr * 0.45f; dent->cg = cg * 0.45f; dent->cb = cb * 0.45f;
+                    dent->half = subSize * 0.50f * kDebrisVisualScale;
+                    dent->mat = mat;
+                    dent->alive = true;
+                    dent->stationary = true;
+                    dent->emissive = false;
+                    dent->bounces = 99;
+                    ++spawnedTotal;
+                    ++spawnBurstFrame;
+                }
+            }
+
+            // 3. Debris Chips originating from this specific impacted sublattice unit
+            int chipsForThisUnit = budget / unitCount;
+            if (u == 0) chipsForThisUnit += (budget % unitCount);
+            for (int c = 0; c < chipsForThisUnit; ++c) {
+                if (spawnBurstFrame >= kHardMaxSpawnBurst) break;
+                DebrisParticle* slot = allocParticle();
+                if (!slot) break;
+                fillSublatticeParticle(*slot, ix, iy, iz, su.sx, su.sy, su.sz, mat, cr, cg, cb,
+                                       effSub, baseSpeed, massScale, props.fragility, voxelSize);
+                ++spawnedTotal;
+                ++spawnBurstFrame;
+            }
         }
         meshDirty = true;
     }
 
-    void fillParticle(DebrisParticle& p, int ix, int iy, int iz, MaterialId mat,
-                      float cr, float cg, float cb,
-                      float idx, float idy, float idz,
-                      float baseSpeed, float massScale, float fragility,
-                      float voxelSize) {
-        // Snap chip center to the 8x8x8 sub-lattice inside the unit voxel.
-        const int sx = static_cast<int>(frand() * kDebrisSubDiv) % kDebrisSubDiv;
-        const int sy = static_cast<int>(frand() * kDebrisSubDiv) % kDebrisSubDiv;
-        const int sz = static_cast<int>(frand() * kDebrisSubDiv) % kDebrisSubDiv;
-        const float sub = voxelSize / static_cast<float>(kDebrisSubDiv);
-        p.sx = static_cast<uint8_t>(sx);
-        p.sy = static_cast<uint8_t>(sy);
-        p.sz = static_cast<uint8_t>(sz);
-        p.px = (static_cast<float>(ix) + (sx + 0.5f) / kDebrisSubDiv) * voxelSize;
-        p.py = (static_cast<float>(iy) + (sy + 0.5f) / kDebrisSubDiv) * voxelSize;
-        p.pz = (static_cast<float>(iz) + (sz + 0.5f) / kDebrisSubDiv) * voxelSize;
+    void fillSublatticeParticle(DebrisParticle& p, int ix, int iy, int iz,
+                                uint8_t sx, uint8_t sy, uint8_t sz, MaterialId mat,
+                                float cr, float cg, float cb,
+                                const SublatticeImpact& sub,
+                                float baseSpeed, float massScale, float fragility,
+                                float voxelSize) {
+        const float subSize = voxelSize / static_cast<float>(kDebrisSubDiv);
+        p.sx = sx; p.sy = sy; p.sz = sz;
+        // Start slightly proud of the face so chips are immediately clear of the solid wall
+        p.px = (static_cast<float>(ix) + (sx + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + sub.nx * (subSize * 0.5f * kDebrisVisualScale);
+        p.py = (static_cast<float>(iy) + (sy + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + sub.ny * (subSize * 0.5f * kDebrisVisualScale);
+        p.pz = (static_cast<float>(iz) + (sz + 0.5f) / static_cast<float>(kDebrisSubDiv)) * voxelSize + sub.nz * (subSize * 0.5f * kDebrisVisualScale);
 
-        // Explode opposite impact + lattice scatter (matrix-scaled).
-        Mat3 scatter = Mat3::scale(baseSpeed / std::max(0.25f, massScale));
-        float jx = -idx + frandSigned() * (0.55f + fragility);
-        float jy = -idy + frandSigned() * (0.55f + fragility) + 0.55f; // loft
-        float jz = -idz + frandSigned() * (0.55f + fragility);
-        float jlen = std::sqrt(jx * jx + jy * jy + jz * jz);
-        if (jlen > 1e-6f) { jx /= jlen; jy /= jlen; jz /= jlen; }
-        scatter.mulVec(jx, jy, jz, p.vx, p.vy, p.vz);
-        // Outward bias from sub-cell relative to unit center.
-        p.vx += (sx - 3.5f) * sub * 18.0f;
-        p.vy += (sy - 3.5f) * sub * 18.0f + baseSpeed * 0.55f;
-        p.vz += (sz - 3.5f) * sub * 18.0f;
+        float dirX, dirY, dirZ;
+        if (sub.count == 1) {
+            // Direct impact: rebound cone off surface normal + loft
+            dirX = sub.nx * 0.85f + frandSigned() * (0.45f + fragility);
+            dirY = sub.ny * 0.85f + frandSigned() * (0.45f + fragility) + 0.45f;
+            dirZ = sub.nz * 0.85f + frandSigned() * (0.45f + fragility);
+        } else {
+            // Oblique impact: graze spray along tangential direction + scatter
+            float gx = -sub.nx * 0.2f + (1.0f - std::fabs(sub.nx)) * frandSigned() * 0.8f;
+            float gy = -sub.ny * 0.2f + 0.40f;
+            float gz = -sub.nz * 0.2f + (1.0f - std::fabs(sub.nz)) * frandSigned() * 0.8f;
+            dirX = sub.nx * 0.45f + gx;
+            dirY = sub.ny * 0.45f + gy;
+            dirZ = sub.nz * 0.45f + gz;
+        }
+        float dlen = std::sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+        if (dlen > 1e-6f) { dirX /= dlen; dirY /= dlen; dirZ /= dlen; }
+        else { dirX = 0; dirY = 1.0f; dirZ = 0; }
+
+        Mat3 scatter = Mat3::scale(std::max(0.12f, baseSpeed * 1.8f) / std::max(0.25f, massScale));
+        scatter.mulVec(dirX, dirY, dirZ, p.vx, p.vy, p.vz);
 
         p.life = 0.70f + frand() * 1.35f + (1.0f - fragility) * 0.35f;
         p.maxLife = p.life;
-        // Slightly brighter than block albedo so chips pop against night lighting.
         p.cr = std::min(1.0f, cr * (1.05f + frand() * 0.35f));
         p.cg = std::min(1.0f, cg * (1.05f + frand() * 0.35f));
         p.cb = std::min(1.0f, cb * (1.05f + frand() * 0.35f));
-        // Cubic chip: half-extent of a multi-subcell cube (still lattice-centered).
-        p.half = sub * 0.5f * kDebrisVisualScale * (0.85f + frand() * 0.35f);
+        p.half = subSize * 0.5f * kDebrisVisualScale * (0.85f + frand() * 0.35f);
         p.mat = mat;
         p.alive = true;
+        p.stationary = false;
+        p.emissive = false;
         p.bounces = 0;
+    }
+
+    // Spawn visual chips from a unit voxel; wraps computeSublatticeImpact + spawnSublatticeImpact.
+    void spawnFromVoxel(int ix, int iy, int iz, MaterialId mat,
+                        float impactDx, float impactDy, float impactDz,
+                        float energy, float voxelSize, float aoeScale = 1.0f) {
+        float nx, ny, nz;
+        faceNormalFromVelocity(impactDx, impactDy, impactDz, nx, ny, nz);
+        float hitX = (static_cast<float>(ix) + 0.5f + nx * 0.5f) * voxelSize;
+        float hitY = (static_cast<float>(iy) + 0.5f + ny * 0.5f) * voxelSize;
+        float hitZ = (static_cast<float>(iz) + 0.5f + nz * 0.5f) * voxelSize;
+        SublatticeImpact sub = computeSublatticeImpact(ix, iy, iz, hitX, hitY, hitZ,
+                                                      impactDx, impactDy, impactDz,
+                                                      nx, ny, nz, voxelSize);
+        spawnSublatticeImpact(ix, iy, iz, mat, sub, energy, voxelSize, aoeScale);
     }
 
     int activeCount() const { return aliveCached; }
@@ -256,40 +500,48 @@ struct DebrisSystem {
         int active = 0;
         bool any = false;
         const float damp = std::max(0.0f, 1.0f - 0.35f * dt);
-for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
+        for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             DebrisParticle& p = particles[static_cast<size_t>(i)];
             if (!p.alive) continue;
             any = true;
-            const bool wasAirborne = p.py > p.half + 1e-5f;
-            // Integrate; only apply gravity while airborne so resting chips don't "re-hit".
-            if (wasAirborne) p.vy -= gravity * dt;
-            p.px += p.vx * dt;
-            p.py += p.vy * dt;
-            p.pz += p.vz * dt;
-            // Ground plane bounce (world y = 0)
-            if (p.py < p.half) {
-                p.py = p.half;
-                if (wasAirborne && p.vy < -0.01f) {
-                    ricochetVelocity(p.vx, p.vy, p.vz, 0, 1, 0, 0.28f, 0.42f);
-                    p.vx *= 0.82f; p.vz *= 0.82f;
-                    ++p.bounces;
-                    ++ricochets;
+            if (!p.stationary) {
+                const bool wasAirborne = p.py > p.half + 1e-5f;
+                // Integrate; only apply gravity while airborne so resting chips don't "re-hit".
+                if (wasAirborne) p.vy -= gravity * dt;
+                p.px += p.vx * dt;
+                p.py += p.vy * dt;
+                p.pz += p.vz * dt;
+                // Ground plane bounce (world y = 0)
+                if (p.py < p.half) {
+                    p.py = p.half;
+                    if (wasAirborne && p.vy < -0.01f) {
+                        ricochetVelocity(p.vx, p.vy, p.vz, 0, 1, 0, 0.28f, 0.42f);
+                        p.vx *= 0.82f; p.vz *= 0.82f;
+                        ++p.bounces;
+                        ++ricochets;
+                    } else {
+                        p.vy = 0.0f;
+                        p.vx *= 0.88f; p.vz *= 0.88f;
+                    }
+                    if (p.bounces > 5 || (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz) < 4e-6f) {
+                        p.vx = p.vy = p.vz = 0;
+                        p.stationary = true;
+                    }
                 } else {
-                    p.vy = 0.0f;
-                    p.vx *= 0.88f; p.vz *= 0.88f;
+                    // Air drag keeps chips from flying forever at high energy.
+                    p.vx *= damp; p.vy *= damp; p.vz *= damp;
                 }
-                if (p.bounces > 5 || (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz) < 4e-6f) {
-                    p.vx = p.vy = p.vz = 0;
-                }
-            } else {
-                // Air drag keeps chips from flying forever at high energy.
-                p.vx *= damp; p.vy *= damp; p.vz *= damp;
             }
-            p.life -= dt;
-            if (p.life <= 0.0f) {
-                p.alive = false;
-                freeList.push_back(i);
+            if (!p.stationary) {
+                p.life -= dt;
+                if (p.life <= 0.0f) {
+                    p.alive = false;
+                    freeList.push_back(i);
+                } else {
+                    ++active;
+                }
             } else {
+                // Stationary debris (sublattice crater dent marks & resting chips) stays rendered!
                 ++active;
             }
         }
@@ -321,7 +573,7 @@ inline void emitDebrisCube(const DebrisParticle& p, float matId, PushVert&& push
     const float z0 = p.pz - h, z1 = p.pz + h;
     const float fade = std::clamp(p.life / std::max(0.05f, p.maxLife), 0.22f, 1.0f);
     // Keep albedo bright while alive; fade only near end.
-    const float boost = 0.55f + 0.45f * fade;
+    const float boost = p.emissive ? 1.0f : (0.55f + 0.45f * fade);
     const float cr = p.cr * boost, cg = p.cg * boost, cb = p.cb * boost;
     auto quad = [&](float ax, float ay, float az, float bx, float by, float bz,
                     float cx, float cy, float cz, float dx, float dy, float dz,
@@ -364,4 +616,74 @@ inline void emitFlashCube(float px, float py, float pz, float half,
     quad(x0,y0,z1, x0,y0,z0, x1,y0,z0, x1,y0,z1,  0,-1,0);
     quad(x0,y0,z1, x1,y0,z1, x1,y1,z1, x0,y1,z1,  0,0,1);
     quad(x1,y0,z0, x0,y0,z0, x0,y1,z0, x1,y1,z0,  0,0,-1);
+}
+
+// Headless contract checks for sublattice impacts (1 or 2 units based on impact angle).
+inline bool sublatticeImpactSelfTest() {
+    const float vs = 0.001f;
+    // 1. Direct hit (normal impact, angle 0 deg, cosTheta = 1.0 >= 0.7071) -> 1 unit
+    {
+        SublatticeImpact sub = computeSublatticeImpact(10, 5, 20,
+            (10.0f + 0.5f) * vs, (5.0f + 0.5f) * vs, 20.0f * vs,
+            0.0f, 0.0f, 1.0f,
+            0.0f, 0.0f, -1.0f, vs);
+        if (sub.count != 1) return false;
+        if (sub.cosTheta < 0.999f) return false;
+        if (sub.units[0].sx >= kDebrisSubDiv || sub.units[0].sy >= kDebrisSubDiv || sub.units[0].sz >= kDebrisSubDiv)
+            return false;
+        if (sub.units[0].sz != 0) return false; // struck -Z face
+    }
+    // 2. Oblique hit (angle 60 deg, cosTheta = 0.5 < 0.7071) -> 2 units along tangent
+    {
+        SublatticeImpact sub = computeSublatticeImpact(10, 5, 20,
+            (10.0f + 0.35f) * vs, (5.0f + 0.5f) * vs, 20.0f * vs,
+            0.866025f, 0.0f, 0.5f,
+            0.0f, 0.0f, -1.0f, vs);
+        if (sub.count != 2) return false;
+        if (std::fabs(sub.cosTheta - 0.5f) > 0.01f) return false;
+        if (sub.units[0].sx >= kDebrisSubDiv || sub.units[0].sy >= kDebrisSubDiv || sub.units[0].sz >= kDebrisSubDiv)
+            return false;
+        if (sub.units[1].sx >= kDebrisSubDiv || sub.units[1].sy >= kDebrisSubDiv || sub.units[1].sz >= kDebrisSubDiv)
+            return false;
+        if (sub.units[0].sx == sub.units[1].sx &&
+            sub.units[0].sy == sub.units[1].sy &&
+            sub.units[0].sz == sub.units[1].sz)
+            return false; // units must be distinct
+        if (sub.units[1].sx != sub.units[0].sx + 1) return false; // stepped along +X tangent
+    }
+    // 3. Edge clamp test (oblique hit starting at boundary sx=7)
+    {
+        SublatticeImpact sub = computeSublatticeImpact(10, 5, 20,
+            (10.0f + 0.95f) * vs, (5.0f + 0.5f) * vs, 20.0f * vs,
+            0.866025f, 0.0f, 0.5f,
+            0.0f, 0.0f, -1.0f, vs);
+        if (sub.count != 2) return false;
+        if (sub.units[0].sx != 7) return false;
+        if (sub.units[1].sx >= kDebrisSubDiv || sub.units[1].sy >= kDebrisSubDiv || sub.units[1].sz >= kDebrisSubDiv)
+            return false;
+        if (sub.units[0].sx == sub.units[1].sx &&
+            sub.units[0].sy == sub.units[1].sy &&
+            sub.units[0].sz == sub.units[1].sz)
+            return false;
+    }
+    // 4. DebrisSystem spawnSublatticeImpact allocation & particle setup
+    {
+        DebrisSystem ds;
+        SublatticeImpact sub = computeSublatticeImpact(10, 5, 20,
+            (10.0f + 0.35f) * vs, (5.0f + 0.5f) * vs, 20.0f * vs,
+            0.866025f, 0.0f, 0.5f,
+            0.0f, 0.0f, -1.0f, vs);
+        ds.spawnSublatticeImpact(10, 5, 20, MaterialId::Concrete, sub, 15.0f, vs, 1.0f);
+        if (ds.particles.empty() || ds.spawnedTotal <= 0) return false;
+        if (ds.sublatticeImpactsOblique != 1) return false;
+        if (ds.sublatticeUnitsImpacted != 2) return false;
+        bool hasSpark = false;
+        bool hasDent = false;
+        for (const auto& p : ds.particles) {
+            if (p.alive && p.emissive) hasSpark = true;
+            if (p.alive && p.stationary) hasDent = true;
+        }
+        if (!hasSpark || !hasDent) return false;
+    }
+    return true;
 }

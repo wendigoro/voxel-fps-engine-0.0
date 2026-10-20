@@ -1,0 +1,25 @@
+{
+  "id": "smg_light",
+  "unit": 1,
+  "voxel_size": 0.001,
+  "caliber": "light",
+  "hitscan": 0,
+  "fire_mode": "auto",
+  "ammo_id": "light_hp",
+  "stats": {
+    "damage": 12.0,
+    "impact": 14.5,
+    "recoil": 10.5,
+    "handling": 16.5,
+    "weight": 8.0,
+    "optic": 2.0
+  },
+  "parts": {
+    "barrel": 18,
+    "action": 74,
+    "bolt_chamber": 3,
+    "trigger": 1,
+    "grip_stock": 46,
+    "sight": 4
+  }
+}

@@ -94,6 +94,10 @@ void main() {
     if (rc == RC_MUZZLE) {
         clip.z = clip.z * 0.98;
     }
+    // Debris cubes: slight depth bias toward camera so crater marks and chips don't z-fight with the world.
+    if (rc == RC_DEBRIS) {
+        clip.z = clip.z * 0.998;
+    }
 
     gl_Position = clip;
 }

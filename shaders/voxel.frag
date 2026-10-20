@@ -189,9 +189,9 @@ void main() {
     // shared World lighting path at the bottom.
     int rc = renderClass(fragMat);
 
-    // World pickups are real world objects, not overlay UI: they take the World
-    // lighting path (shadow rays, height AO, vignette) and sit in the scene.
-    if (rc == RC_WORLD_PICKUP) rc = RC_WORLD;
+    // World pickups and character models take the World lighting path
+    // (shadow rays, point lights, ambient, and height AO).
+    if (rc == RC_WORLD_PICKUP || rc == RC_CHARACTER) rc = RC_WORLD;
 
     // Surface layer: textured world cells (pickups carry no texture id).
     if (rc == RC_WORLD) base = texturedBase(base);

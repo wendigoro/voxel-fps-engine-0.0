@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import voxel.painter.grid.BlenderBridge;
 import voxel.painter.grid.Items;
 import voxel.painter.grid.MapEntities;
 import voxel.painter.grid.MaterialPalette;
@@ -258,18 +259,59 @@ public void newDocument(VoxDocument.Mode mode) {
         }
     }
 
-    public void bakeStarterWeapon() {
+    /**
+     * Fetches a 3D mesh object from a Blender project (.blend) and loads it into the editor.
+     */
+    public boolean fetchFromBlender(Path repoRoot, Path blendPath, String objectName) {
+        try {
+            if (repoRoot == null) repoRoot = ScriptRunner.resolveRepoRoot(null);
+            VoxDocument doc = BlenderBridge.fetchObject(repoRoot, blendPath, objectName);
+            setDocument(doc, null, false);
+            markDirty();
+            return true;
+        } catch (Exception e) {
+            System.err.println("[PainterModel] Blender fetch failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public void bakeWeapon(String weaponId) {
         if (document.mode != VoxDocument.Mode.WEAPON) {
             newDocument(VoxDocument.Mode.WEAPON);
             return;
         }
-        WeaponParts.paintStarterRifle(document.grid);
-        document.caliber = document.caliber == null ? "medium" : document.caliber;
-        document.ammoId = document.ammoId == null ? "medium_fmj" : document.ammoId;
-        document.fireMode = document.fireMode == null ? "semi" : document.fireMode;
+        document.grid.clear();
+        WeaponParts.paintWeapon(document.grid, weaponId);
+        if (weaponId != null) {
+            document.itemId = "weapon_" + weaponId;
+            if (weaponId.contains("light")) {
+                document.caliber = "light";
+                if (weaponId.contains("sidearm")) document.ammoId = "light_fmj";
+                else if (weaponId.contains("smg")) document.ammoId = "light_hp";
+                else if (weaponId.contains("shotgun")) document.ammoId = "light_ap";
+            } else if (weaponId.contains("heavy")) {
+                document.caliber = "heavy";
+                if (weaponId.contains("sniper")) document.ammoId = "heavy_fmj";
+                else if (weaponId.contains("cannon")) document.ammoId = "heavy_he";
+            } else if (weaponId.contains("energy")) {
+                document.caliber = "energy";
+                if (weaponId.contains("carbine")) document.ammoId = "energy_bolt";
+                else if (weaponId.contains("railgun")) document.ammoId = "energy_pierce";
+            } else {
+                document.caliber = "medium";
+                if (weaponId.contains("marksman")) document.ammoId = "medium_tracer";
+                else if (weaponId.contains("lmg")) document.ammoId = "medium_shred";
+                else document.ammoId = "medium_fmj";
+            }
+        }
         tools.activePart = WeaponParts.BARREL;
         markDirty();
         fireTools();
+        fireDoc();
+    }
+
+    public void bakeStarterWeapon() {
+        bakeWeapon("starter_rifle");
     }
 
     public void setItemId(String id) {
